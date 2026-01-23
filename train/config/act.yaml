@@ -1,0 +1,19 @@
+dataset:
+  repo_id: "Breno-de-Angelo/unitree-g1-dex3-1-pick-kettle-v3"
+
+output_dir: "/home/hercules/prometheus-vla/train/output/act"
+job_name: "act_v1"
+
+policy:
+  type: act
+  push_to_hub: false
+
+log_freq: 20
+eval_freq: 185
+save_freq: 370
+batch_size: 4
+steps: 29664
+
+wandb:
+  enable: true
+
