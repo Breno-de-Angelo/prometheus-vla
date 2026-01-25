@@ -1,0 +1,36 @@
+dataset:
+  repo_id: "Breno-de-Angelo/unitree-g1-dex3-1-pick-kettle-v3"
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22, 24, 25, 27, 29]
+
+val_dataset:
+  repo_id: "Breno-de-Angelo/unitree-g1-dex3-1-pick-kettle-v3"
+  episodes: [10, 16, 23, 13, 28, 26]
+
+output_dir: "/home/hercules/prometheus-vla/train/output/act_with_val"
+job_name: "act_v1"
+
+policy:
+  type: act
+  push_to_hub: false
+
+# train_episodes = 8813 frames
+# val_episodes = 2087 frames
+batch_size: 128
+
+# steps_per_epoch = train_episodes / batch_size
+# steps = steps_per_epoch * epochs
+# For 50 epochs, we need:
+# steps_per_epoch = 8813 / 128 = 68.85 -> 69
+# steps = 69 * 100 = 6900
+steps: 6900
+# Eval every epoch
+eval_freq: 69
+
+# Save every 5 epochs
+save_freq: 345
+
+# Log every 5 steps
+log_freq: 5
+
+wandb:
+  enable: true

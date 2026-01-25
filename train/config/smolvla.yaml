@@ -1,0 +1,19 @@
+dataset:
+  repo_id: "Breno-de-Angelo/unitree-g1-dex3-1-pick-kettle-v3"
+
+output_dir: "/home/hercules/prometheus-vla/train/output/smolvla"
+job_name: "smolvla_v1"
+
+policy:
+  type: smolvla
+  push_to_hub: false
+
+log_freq: 5
+eval_freq: 171
+save_freq: 171
+batch_size: 64
+steps: 852
+
+wandb:
+  enable: true
+
