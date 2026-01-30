@@ -3,13 +3,19 @@ name = "prometheus-vla"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
+    "flask>=3.1.2",
     "lerobot",
     "pandas>=2.3.3",
+    "plotly>=6.5.2",
     "pyarrow>=23.0.0",
+    "pyzmq>=27.1.0",
     "tqdm>=4.67.1",
+    "unitree-sdk2py",
+    "vuer>=0.0.79",
 ]
 
 [tool.uv.sources]
 lerobot = { path = "lerobot", editable = true }
+unitree-sdk2py = { path = "../prometheus/src/unitree_sdk2_python" }
