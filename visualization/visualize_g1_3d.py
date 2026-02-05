@@ -12,8 +12,11 @@ from vuer.schemas import Urdf, DefaultScene, Fog, AmbientLight, DirectionalLight
 from lerobot.robots.unitree_g1.unitree_g1_dex3 import UnitreeG1Dex3, UnitreeG1Dex3Config
 from lerobot.robots.unitree_g1.unitree_g1 import UnitreeG1
 
+# Get file path
+file_path = os.path.dirname(os.path.abspath(__file__))
+
 # Paths
-ASSETS_PATH = "/home/breno/I2CA/prometheus/src/xr_teleoperate/assets/g1"
+ASSETS_PATH = os.path.join(file_path, "../assets/g1")
 URDF_FILE = "g1_body29_hand14.urdf"
 
 # Global robot instance
