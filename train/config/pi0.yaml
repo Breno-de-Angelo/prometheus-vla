@@ -1,0 +1,25 @@
+dataset:
+  repo_id: "Breno-de-Angelo/unitree-g1-dex3-1-pick-kettle-v3"
+
+output_dir: "/home/hercules/prometheus-vla/train/output/pi0"
+job_name: "pi0"
+
+policy:
+  type: pi0
+  pretrained_path: lerobot/pi0_base
+  compile_model: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: false
+  push_to_hub: false
+
+log_freq: 5
+eval_freq: 171
+save_freq: 171
+batch_size: 32
+steps: 852
+
+wandb:
+  enable: true
+

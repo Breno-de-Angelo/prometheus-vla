@@ -19,113 +19,34 @@ from torch.optim import Optimizer
 sys.path.append(os.getcwd())
 
 # --- MONKEY PATCHES START ---
-import lerobot.datasets.lerobot_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-# Patch LeRobotDataset.__getitem__ to fix global indexing
-def custom_getitem(self, idx):
-    # Ensure dataset is loaded when we actually need to read from it
+# guarda o original
+_original_getitem = LeRobotDataset.__getitem__
+
+def patched_getitem(self, idx):
+    # garante que o dataset está carregado (opcional, mas seguro)
     self._ensure_hf_dataset_loaded()
-    
-    # --- PATCH: Map global index to local index if needed ---
-    if self._absolute_to_relative_idx is not None:
+
+    # --- SEU PATCH: mapear índice global → relativo ---
+    if getattr(self, "_absolute_to_relative_idx", None) is not None:
         if idx in self._absolute_to_relative_idx:
             idx = self._absolute_to_relative_idx[idx]
-    # --------------------------------------------------------
+    # --------------------------------------------------
 
-    item = self.hf_dataset[idx]
-    ep_idx = item["episode_index"].item()
-    # Use the absolute index from the dataset for delta timestamp calculations
-    abs_idx = item["index"].item()
+    # delega TODO o resto para o método original
+    return _original_getitem(self, idx)
 
-    query_indices = None
-    if self.delta_indices is not None:
-        query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
-        query_result = self._query_hf_dataset(query_indices)
-        item = {**item, **padding}
+# aplica o patch
+LeRobotDataset.__getitem__ = patched_getitem
 
-        # For video frames, we need to decode them from the video file
-        for vid_key, timestamps in self._get_query_timestamps(
-            item["timestamp"].item(), query_indices
-        ).items():
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            # We need to shift the timestamps to be relative to the beginning of the video file
-            # (video file starts at `video_from_timestamp`)
-            # Correct retrieval of timestamp from metadata
-            video_from_timestamp = self.meta.episodes[ep_idx][f"videos/{vid_key}/from_timestamp"]
-            # Note: query_timestamps are relative to the episode start.
-            # video_from_timestamp is the start of the episode in the video file.
-            # wait, confirm logic in original source:
-            # shifted_query_ts = [from_timestamp + ts for ts in query_ts]
-            # My current implementation was:
-            # shifted_query_ts = [ts - video_from_timestamp for ts in timestamps]
-            # Wait, let's re-read original _query_videos logic.
-            # item["timestamp"] is relative to episode start?
-            # query_timestamps = self._get_query_timestamps(...) -> returns timestamps relative to episode start (if using hf_dataset which has relative timestamps?)
-            # hf_dataset['timestamp'] are usually relative to episode start in lerobot?
-            # Let's check _get_query_timestamps.
-            # If they are relative to episode start, then to get position in video file:
-            # video_file_pos = from_timestamp_of_episode_in_video + timestamp_in_episode
-            # So it should be ADDED.
-            shifted_query_ts = [val + video_from_timestamp for val in timestamps]
-            frames = lerobot.datasets.lerobot_dataset.decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+# --- MONKEY PATCHES END ---
 
-        # For other keys (e.g. state, action), we can just retrieve them from the dataset directly
-        for key, val in query_result.items():
-            item[key] = val.squeeze(0)
-
-    if self.image_transforms is not None:
-        item = self.image_transforms(item)
-
-    return item
-
-LeRobotDataset.__getitem__ = custom_getitem
-
-# Patch ACTPolicy.forward to fix None KLD issue
-import lerobot.policies.act.modeling_act
-from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.utils.constants import ACTION, OBS_IMAGES
-
-# def custom_act_forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict]:
-#     """Run the batch through the model and compute the loss for training or validation."""
-#     if self.config.image_features:
-#         batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-#         batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
-
-#     actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
-
-#     l1_loss = (
-#         F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-#     ).mean()
-
-#     loss_dict = {"l1_loss": l1_loss.item()}
-    
-#     # --- PATCH: Check for None (validation mode) ---
-#     if self.config.use_vae and log_sigma_x2_hat is not None:
-#     # -----------------------------------------------
-#         # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
-#         # each dimension independently, we sum over the latent dimension to get the total
-#         # KL-divergence per batch element, then take the mean over the batch.
-#         # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
-#         mean_kld = (
-#             (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
-#         )
-#         loss_dict["kld_loss"] = mean_kld.item()
-#         loss = l1_loss + mean_kld * self.config.kl_weight
-#     else:
-#         loss = l1_loss
-
-#     return loss, loss_dict
-
-# ACTPolicy.forward = custom_act_forward
 
 from lerobot.configs.train import TrainPipelineConfig, DatasetConfig
 @dataclasses.dataclass
 class CustomTrainPipelineConfig(TrainPipelineConfig):
     val_dataset: DatasetConfig | None = None
-
-# --- MONKEY PATCHES END ---
 
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
@@ -535,7 +456,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             
             # Have to keep the policy in training mode because of style prediction
             # policy.eval()
-            policy.train()
+            # policy.train()
 
             val_loss_meter = VarianceMeter("val_loss", ":.3f")
             val_metrics = {} 
@@ -560,7 +481,10 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                                          if isinstance(l, torch.Tensor): l = l.item()
                                          val_metrics[k].update(l)
                                 else:
-                                    val = v.item() if isinstance(v, torch.Tensor) else v
+                                    if isinstance(v, torch.Tensor):
+                                        val = v.mean().item() if v.numel() > 1 else v.item()
+                                    else:
+                                        val = v
                                     val_metrics[k].update(val)
 
                     if accelerator.num_processes > 1:

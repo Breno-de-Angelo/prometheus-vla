@@ -1,0 +1,41 @@
+# 15 train episodes in the center of the desk
+# 15 train episodes close to the robot
+dataset:
+  repo_id: "Breno-de-Angelo/g1-white-table-only-rgb"
+  episodes: [11, 58, 16, 8, 14, 78, 59, 13, 60, 77, 7, 79, 56, 61, 9, 46, 65, 64, 50, 72, 54, 55, 43, 74, 44, 71, 63, 52, 48, 69]
+
+# 5 val episodes in the center of the desk
+# 5 val episodes close to the robot
+val_dataset:
+  repo_id: "Breno-de-Angelo/g1-white-table-only-rgb"
+  episodes: [2, 12, 5, 3, 82, 51, 62, 66, 73, 76]
+
+output_dir: "/home/hercules/prometheus-vla/train/output/act_white_table_high_kl"
+job_name: "act_white_table_high_kl"
+
+policy:
+  type: act
+  push_to_hub: false
+  kl_weight: 100
+
+# train_episodes = 8813 frames
+# val_episodes = 2087 frames
+batch_size: 128
+
+# steps_per_epoch = train_episodes / batch_size
+# steps = steps_per_epoch * epochs
+# For 50 epochs, we need:
+# steps_per_epoch = 6888 / 128 = 53.81 -> 54
+# steps = 54 * 100 = 5400
+steps: 5400
+# Eval every epoch
+eval_freq: 54
+
+# Save every 5 epochs
+save_freq: 270
+
+# Log every 5 steps
+log_freq: 5
+
+wandb:
+  enable: true

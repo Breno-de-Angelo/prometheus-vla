@@ -10,10 +10,9 @@ policy:
 
 log_freq: 20
 eval_freq: 185
-save_freq: 370
-batch_size: 4
-steps: 29664
+save_freq: 185
+batch_size: 128
+steps: 1854
 
 wandb:
   enable: true
-
