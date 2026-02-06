@@ -13,8 +13,8 @@ cd prometheus-vla
 conda create -n g1 python=3.10 pinocchio=3.1.0 numpy=1.26.4 -c conda-forge
 conda activate g1
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 2. Install dependencies (staged to avoid resolution issues)
+./install.sh
 ```
 
 ---
