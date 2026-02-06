@@ -9,11 +9,12 @@ VR teleoperation, training, and deployment for the Unitree G1 humanoid robot wit
 git clone --recurse-submodules https://github.com/Breno-de-Angelo/prometheus-vla
 cd prometheus-vla
 
-# Install dependencies
-uv sync
+# 1. Create Conda environment (Required for Pinocchio + CasADi bindings)
+conda create -n g1 python=3.10 pinocchio=3.1.0 numpy=1.26.4 -c conda-forge
+conda activate g1
 
-# Install optional G1 Dex3 dependencies
-uv pip install -e "lerobot[unitree_g1_dex3,televuer]"
+# 2. Install dependencies
+pip install -r requirements.txt
 ```
 
 ---
@@ -23,7 +24,7 @@ uv pip install -e "lerobot[unitree_g1_dex3,televuer]"
 Use Meta Quest 3 for demonstration collection:
 
 ```bash
-uv run lerobot-record \
+lerobot-record \
   --robot.type=unitree_g1_dex3 \
   --teleop.type=televuer \
   --teleop.use_hand_tracking=true \
@@ -44,13 +45,13 @@ uv run lerobot-record \
 
 ```bash
 # Create config in train/config/my_task.yaml, then:
-CUDA_VISIBLE_DEVICES=0 uv run lerobot-train --config train/config/my_task.yaml
+CUDA_VISIBLE_DEVICES=0 lerobot-train --config train/config/my_task.yaml
 ```
 
 ### Direct Command
 
 ```bash
-uv run lerobot-train \
+lerobot-train \
   --policy.type=act \
   --dataset.repo_id=your_user/g1_pick_kettle \
   --training.num_epochs=100 \
@@ -60,7 +61,7 @@ uv run lerobot-train \
 ### Background Training
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 nohup uv run lerobot-train \
+CUDA_VISIBLE_DEVICES=1 nohup lerobot-train \
   --config train/config/my_task.yaml \
   > train/log/my_task.log 2>&1 &
 
@@ -74,13 +75,13 @@ tail -f train/log/my_task.log
 
 ```bash
 # Local
-uv run lerobot-dataset-viz \
+lerobot-dataset-viz \
   --repo-id=your_user/g1_pick_kettle \
   --episode-index=0 \
   --display-compressed-images=true
 
 # Remote (stream to another machine)
-uv run lerobot-dataset-viz \
+lerobot-dataset-viz \
   --repo-id=your_user/g1_pick_kettle \
   --episode-index=0 \
   --mode=distant
@@ -96,13 +97,13 @@ See [visualization/README.md](visualization/README.md) for detailed setup.
 ### 2D Dashboard
 ```bash
 # Start robot servers first, then:
-uv run python visualization/visualize_g1.py
+python visualization/visualize_g1.py
 # Open http://localhost:5000
 ```
 
 ### 3D Viewer
 ```bash
-uv run python visualization/visualize_g1_3d.py
+python visualization/visualize_g1_3d.py
 # Open http://localhost:8012
 ```
 
@@ -113,7 +114,7 @@ uv run python visualization/visualize_g1_3d.py
 ### Local Inference
 
 ```bash
-uv run lerobot-record \
+lerobot-record \
   --robot.type=unitree_g1_dex3 \
   --policy.path=outputs/train/g1_act/checkpoints/last \
   --dataset.repo_id=your_user/g1_eval

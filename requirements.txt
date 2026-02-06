@@ -1,0 +1,10 @@
+numpy<2.0.0
+torch>=2.4.0
+diffusers>=0.30.0
+datasets==4.1.0
+cmake>=3.29.0
+av>=15.0.0
+git+https://github.com/unitreerobotics/unitree_sdk2_python.git
+flask
+vuer
+-e ./lerobot[unitree_g1_dex3,televuer,intelrealsense]
