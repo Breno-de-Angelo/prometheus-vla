@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "flask>=3.1.2",
-    "lerobot",
+    "lerobot[unitree_g1_dex3,televuer,intelrealsense]",
     "vuer>=0.1.1",
 ]
 
