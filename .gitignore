@@ -12,3 +12,4 @@ wheels/
 train/log
 train/output
 models
+logs/
