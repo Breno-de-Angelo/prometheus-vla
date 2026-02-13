@@ -13,3 +13,5 @@ train/log
 train/output
 models
 logs/
+.vscode/
+outputs/
