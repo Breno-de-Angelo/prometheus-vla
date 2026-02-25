@@ -35,7 +35,7 @@ sudo chmod -R 777 /Dados
 lerobot-record \
   --robot.type=unitree_g1_dex3 \
   --robot.is_simulation=true \
-  --teleop.type=joystick_g1_Arms \
+  --teleop.type=joystick_g1_arms \
   --dataset.repo_id=Seu_Usuario/g1_pick_kettle \
   --dataset.root=/Dados/Prometheus-datasets/ \
   --dataset.push_to_hub=false \
