@@ -35,7 +35,7 @@ sudo chmod -R 777 /Dados
 lerobot-record \
   --robot.type=unitree_g1_dex3 \
   --robot.is_simulation=true \
-  --teleop.type=JoystickG1Arms \
+  --teleop.type=joystick_g1_Arms \
   --dataset.repo_id=Seu_Usuario/g1_pick_kettle \
   --dataset.root=/Dados/Prometheus-datasets/ \
   --dataset.push_to_hub=false \
@@ -43,6 +43,8 @@ lerobot-record \
   --play_sounds=false
 
 ```
+
+### Lembrando de iniciar o ambiente vitual g1 ```conda activate g1```
 
 ## Explicação de cada parâmetro
 
@@ -64,7 +66,7 @@ Define se está usando:
 
 ---
 
-### 🎮 ```--teleop.type=JoystickG1Arms```
+### 🎮 ```--teleop.type=joystick_g1_arms```
 
 Define o teleoperador utilizado.
 
@@ -149,117 +151,129 @@ fps = 60
 ---
 
 ## Mapeamento Completo do Controle
-## 🎯 ***Analógicos***
+
+### 🎯 ***Analógicos***
 
 | Controle | Função padrão | Com LB/RB pressionado |
 |----------|---------------|-----------------------|
 | Analógico Esquerdo | Ombro esquerdo | Pulso esquerdo |
 | Analógico Direito | Ombro direito | Pulso direito |
 
-🦾 Braço Esquerdo
+### 🦾 Braço Esquerdo
 
-🎮 Sem pressionar LB:
+### 🎮 Sem pressionar LB:
 
-LS Y → Shoulder Pitch
+- LS Y → Shoulder Pitch
 
-LS X → Shoulder Roll
+- LS X → Shoulder Roll
 
-D-Pad ↑↓ → Cotovelo
+- D-Pad ↑↓ → Cotovelo
 
-D-Pad ←→ → Shoulder Yaw
+- D-Pad ←→ → Shoulder Yaw
 
-🎮 Pressionando LB:
+### 🎮 Pressionando LB:
 
-LS Y → Wrist Pitch
+- LS Y → Wrist Pitch
 
-LS X → Wrist Roll
+- LS X → Wrist Roll
 
-🦾 Braço Direito
-🎮 Sem pressionar RB:
+### 🦾 Braço Direito
+### 🎮 Sem pressionar RB:
 
-RS Y → Shoulder Pitch
+- RS Y → Shoulder Pitch
 
-RS X → Shoulder Roll
+- RS X → Shoulder Roll
 
-Y/A → Cotovelo
+- Y/A → Cotovelo
 
-X/B → Shoulder Yaw
+- X/B → Shoulder Yaw
 
-🎮 Pressionando RB:
+### 🎮 Pressionando RB:
 
-RS Y → Wrist Pitch
+- RS Y → Wrist Pitch
 
-RS X → Wrist Roll
+- RS X → Wrist Roll
 
-✋ Controle das Mãos (Dex3)
-Controle	Função
-LT	Fecha mão esquerda
-RT	Fecha mão direita
+### ✋ Controle das Mãos (Dex3)
+| Controle | Função |
+|----------|--------|
+| LT | Fecha mão esquerda |
+| RT | Fecha mão direita |
 
 Se o gatilho passar de 0.0 → mão fecha
 Caso contrário → mão aberta
 
-🔄 Lógica Interna do Controle
+## 🔄 Lógica Interna do Controle
 
 O código:
 
-Lê os eixos do joystick
+1. Lê os eixos do joystick
 
-Aplica deadzone
+2. Aplica deadzone
 
-Multiplica pelo speed
+3. Multiplica pelo speed
 
-Soma na posição atual da junta
+4. Soma na posição atual da junta
 
-Envia todas as juntas como RobotAction
+5. Envia todas as juntas como RobotAction
 
+```bash
 self.body_joints["kLeftShoulderPitch.q"] += ls_y * self.config.speed
+```
 
 Ou seja:
 
-Movimento é incremental, não absoluto.
+```Movimento é incremental, não absoluto.```
 
-📊 Estrutura do Dataset Gerado
+### 📊 Estrutura do Dataset Gerado
 
 Cada episódio conterá:
 
-Observações
+- Observações
 
-Ações (todas as juntas do braço + mãos)
+- Ações (todas as juntas do braço + mãos)
 
-Instrução textual
+- Instrução textual
 
-Timestamp
+- Timestamp
 
 Formato compatível com treinamento de VLA.
 
-🛑 Como parar a gravação
+### 🛑 Como parar a gravação
 
 Pressione:
 
+```bash
 CTRL + C
+```
 
 O dataset será finalizado corretamente.
 
-🧪 Fluxo Completo de Uso
+---
 
-1️⃣ Criar pasta /Dados
-2️⃣ Dar permissão 777
-3️⃣ Conectar joystick
-4️⃣ Rodar comando lerobot-record
-5️⃣ Executar movimentos
-6️⃣ Encerrar com CTRL+C
+## 🧪 Fluxo Completo de Uso
 
-🧠 Observações Importantes
+- 1️⃣ Criar pasta /Dados
+- 2️⃣ Dar permissão 777
+- 3️⃣ Conectar joystick
+- 4️⃣ Rodar comando lerobot-record
+- 5️⃣ Executar movimentos
+- 6️⃣ Encerrar com CTRL+C
 
-Sempre centralize o robô antes de iniciar
+---
 
-Teste o joystick com:
+### 🧠 Observações Importantes
 
+- Sempre centralize o robô antes de iniciar
+
+- Teste o joystick com:
+
+```bash
 jstest /dev/input/js0
+```
 
-Se aparecer erro de joystick:
+- Se aparecer erro de joystick:
 
-Verifique se o pygame detecta controle
+    - Verifique se o pygame detecta controle
 
-Verifique permissões de /dev/input
+    - Verifique permissões de /dev/input
