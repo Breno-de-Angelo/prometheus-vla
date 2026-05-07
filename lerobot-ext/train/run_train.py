@@ -74,6 +74,15 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     #   "depth_only" — PointNet only                               [pi05-depth ablation]
     # Ignored when depth_fusion=False or policy is not pi05.
     fusion_mode: str = "full"
+    # Feature key in the LeRobot batch that carries the depth map. Default
+    # matches our cup3 setup; override per dataset:
+    #   CALVIN          -> "observation.depths.static"
+    #   LIBERO+depth    -> "observation.images.image_depth"
+    depth_key: str = "observation.images.head_camera_depth"
+    # Multiplier applied to depth values to obtain meters. Default 2.0 matches
+    # the cup3 ZMQ pipeline ([0,1] mapped to [0,2m]). For datasets that already
+    # store depth in meters (CALVIN, LIBERO+depth via binhng), set 1.0.
+    depth_scale: float = 2.0
 
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
@@ -280,7 +289,13 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         if cfg.fusion_mode == "depth_only":
             from .pi05_depth_injector import inject_pi05_depth
 
-            inject_pi05_depth(policy, device=_device, load_injected_from=injected_ckpt)
+            inject_pi05_depth(
+                policy,
+                device=_device,
+                load_injected_from=injected_ckpt,
+                depth_key=cfg.depth_key,
+                depth_scale=cfg.depth_scale,
+            )
         elif cfg.fusion_mode == "full":
             from .pi05_d_injector import inject_pi05_d
 

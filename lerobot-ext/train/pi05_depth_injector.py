@@ -19,7 +19,10 @@ import torch
 from train.depth_encoder import PointNetEncoder, depth_to_pointcloud
 
 
-DEPTH_KEY = "observation.images.head_camera_depth"
+# Default for the cup3 setup (G1 head camera). Override via inject_pi05_depth(..., depth_key=...)
+# for other datasets — e.g. CALVIN uses "observation.depths.static",
+# LIBERO+depth (binhng) uses "observation.images.image_depth".
+DEFAULT_DEPTH_KEY = "observation.images.head_camera_depth"
 LEFT_PRESSURE_KEY = "observation.left_hand_pressure"
 RIGHT_PRESSURE_KEY = "observation.right_hand_pressure"
 
@@ -41,9 +44,29 @@ def _load_injected_weights(policy, checkpoint_dir):
     return len(injected)
 
 
-def inject_pi05_depth(policy, device, camera_intrinsics=None, load_injected_from=None):
-    """Acopla PointNet ao PI05 e injeta um único token extra (depth) no prefixo."""
-    print("\n[INJECAO PI05-DEPTH]: Ativando fusao 3D (PointNet) sem tato para PI05...")
+def inject_pi05_depth(
+    policy,
+    device,
+    camera_intrinsics=None,
+    load_injected_from=None,
+    depth_key: str = DEFAULT_DEPTH_KEY,
+    depth_scale: float = 2.0,
+):
+    """Acopla PointNet ao PI05 e injeta um único token extra (depth) no prefixo.
+
+    Args:
+        depth_key: feature name in the LeRobot batch dict carrying the depth map
+            (H, W) or (B, H, W). Default `DEFAULT_DEPTH_KEY` matches our cup3
+            setup; pass another string for CALVIN / LIBERO+depth / etc.
+        depth_scale: multiplier applied to depth values to obtain meters. Default
+            2.0 matches the cup3 ZMQ hack ([0,1] tensor mapped to [0,2m]). For
+            datasets that already store depth in meters (CALVIN, LIBERO+depth via
+            binhng), pass 1.0.
+    """
+    print(
+        f"\n[INJECAO PI05-DEPTH]: Ativando fusao 3D (PointNet) sem tato "
+        f"(depth_key={depth_key!r}, depth_scale={depth_scale})..."
+    )
 
     hidden_size = _vlm_hidden_size(policy)
 
@@ -85,7 +108,7 @@ def inject_pi05_depth(policy, device, camera_intrinsics=None, load_injected_from
     original_predict = policy.predict_action_chunk
 
     def _compute_extra_tokens(self, batch):
-        depth = batch.pop(DEPTH_KEY, None)
+        depth = batch.pop(depth_key, None)
         # Drop pressure keys silently if present; they are not used here but a
         # co-loaded dataset may still carry them.
         left = batch.pop(LEFT_PRESSURE_KEY, None)
@@ -93,7 +116,9 @@ def inject_pi05_depth(policy, device, camera_intrinsics=None, load_injected_from
 
         tokens = []
         if depth is not None:
-            pc = depth_to_pointcloud(depth.float(), self.camera_intrinsics)
+            pc = depth_to_pointcloud(
+                depth.float(), self.camera_intrinsics, depth_scale=depth_scale
+            )
             depth_tok = self.pointnet(pc).unsqueeze(1)
             tokens.append(depth_tok)
 
@@ -109,7 +134,7 @@ def inject_pi05_depth(policy, device, camera_intrinsics=None, load_injected_from
     def _restore_batch(batch, saved):
         depth, left, right = saved
         if depth is not None:
-            batch[DEPTH_KEY] = depth
+            batch[depth_key] = depth
         if left is not None:
             batch[LEFT_PRESSURE_KEY] = left
         if right is not None:
@@ -117,14 +142,14 @@ def inject_pi05_depth(policy, device, camera_intrinsics=None, load_injected_from
 
     def _run_with_extras(self, runner, batch, *args, **kwargs):
         extras, saved = _compute_extra_tokens(self, batch)
-        removed_feat = self.config.input_features.pop(DEPTH_KEY, None)
+        removed_feat = self.config.input_features.pop(depth_key, None)
         try:
             self.model._extra_prefix_embs = extras
             out = runner(batch, *args, **kwargs)
         finally:
             self.model._extra_prefix_embs = None
             if removed_feat is not None:
-                self.config.input_features[DEPTH_KEY] = removed_feat
+                self.config.input_features[depth_key] = removed_feat
             _restore_batch(batch, saved)
         return out
 
