@@ -18,6 +18,14 @@ from torch.optim import Optimizer
 # Add current directory to path to ensure we can import train.utils
 sys.path.append(os.getcwd())
 
+# Force-load lerobot-ext custom policies (pi05depth, act_depth) so their
+# @PreTrainedConfig.register_subclass(...) decorators fire before train() reads
+# the YAML's `policy.type`.  Without this, draccus rejects `type: pi05depth`.
+try:
+    import policies as _lerobot_ext_policies  # noqa: F401  (lerobot-ext/policies pkg)
+except Exception as _e:  # pragma: no cover
+    print(f"[run_train] note: could not import lerobot-ext policies ({_e}); pi05depth will be unavailable.")
+
 # --- MONKEY PATCHES START ---
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -37,8 +45,26 @@ def patched_getitem(self, idx):
     # delega TODO o resto para o método original
     return _original_getitem(self, idx)
 
-# aplica o patch
-LeRobotDataset.__getitem__ = patched_getitem
+# Image-transform patch: aplica image_transforms APENAS em keys de RGB
+# (observation.images.* sem "depth" no nome). Sem isso, torchvision v2 tenta
+# rodar color-jitter / affine no tensor float32 de depth e quebra com
+# NotImplementedError (ou pior — destrói a geometria silenciosamente).
+def patched_getitem_rgb_only_transforms(self, idx):
+    orig_transforms = self.image_transforms
+    self.image_transforms = None
+    try:
+        item = patched_getitem(self, idx)
+    finally:
+        self.image_transforms = orig_transforms
+
+    if orig_transforms is not None:
+        for key in list(item.keys()):
+            if key.startswith("observation.images.") and "depth" not in key and torch.is_tensor(item[key]):
+                item[key] = orig_transforms(item[key])
+
+    return item
+
+LeRobotDataset.__getitem__ = patched_getitem_rgb_only_transforms
 
 # --- MONKEY PATCHES END ---
 

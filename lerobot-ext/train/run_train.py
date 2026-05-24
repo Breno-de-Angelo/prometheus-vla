@@ -48,7 +48,25 @@ def patched_getitem_rgb_only_transforms(self, idx):
     orig_transforms = self.image_transforms
     self.image_transforms = None
     try:
-        item = patched_getitem(self, idx)
+        # Skip sporadically-undecodable video frames (AV1 decode failures in the merged
+        # dataset) instead of crashing the whole run: retry with another random index.
+        import random
+        tries = 0
+        while True:
+            try:
+                item = patched_getitem(self, idx)
+                break
+            except Exception as e:
+                tries += 1
+                msg = str(e)
+                is_decode = (
+                    e.__class__.__name__ in ("InvalidDataError", "FFmpegError")
+                    or "Invalid data" in msg or "avcodec" in msg or "decod" in msg.lower()
+                )
+                if not is_decode or tries > 12:
+                    raise
+                logging.warning(f"[getitem] skipping undecodable frame idx={idx} ({e.__class__.__name__}); retry {tries}")
+                idx = random.randint(0, len(self) - 1)
     finally:
         self.image_transforms = orig_transforms
 

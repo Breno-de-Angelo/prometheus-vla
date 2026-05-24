@@ -1,0 +1,15 @@
+robot:
+  type: unitree_g1_dex3
+  control_mode: "upper_body"
+
+teleop:
+  type: joystick_g1_arms
+
+dataset:
+  repo_id: Mrwlker/pick_up_the_cup_v4
+  root: "/Dados/Prometheus-datasets/"
+  push_to_hub: false
+  single_task: "Pick up the cup"
+  vcodec: "h264"
+
+play_sounds: false

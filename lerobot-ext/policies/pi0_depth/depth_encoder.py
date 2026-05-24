@@ -22,8 +22,20 @@ class PointNetEncoder(nn.Module):
         x = F.relu(self.fc1(x))
         return self.fc2(x) # [Batch, output_dim]
 
-def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024):
-    """Reverte o Hack ZMQ e projeta os pixels no espaço 3D real"""
+def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024, depth_scale: float = 1.0):
+    """Projeta pixels de depth no espaço 3D (point cloud).
+
+    Args:
+        depth_tensor: shape (B, H, W) ou (B, 1, H, W). Tensor de profundidade.
+        intrinsics: dict com fx, fy, cx, cy.
+        num_points: nº de pontos amostrados pra alimentar a PointNet.
+        depth_scale: multiplicador para converter os valores do tensor em
+            METROS reais. Casos:
+                - CALVIN / LIBERO+depth (binhng) já estão em metros → 1.0 (default)
+                - cup3 (ZMQ hack [0,1] = [0,2m] no robô real) → 2.0
+    """
+    if depth_tensor.dim() == 3:
+        depth_tensor = depth_tensor.unsqueeze(1)  # (B, H, W) → (B, 1, H, W)
     B, C, H, W = depth_tensor.shape
     device = depth_tensor.device
 
@@ -32,9 +44,8 @@ def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024):
     grid_x = grid_x.float().unsqueeze(0).expand(B, -1, -1)
     grid_y = grid_y.float().unsqueeze(0).expand(B, -1, -1)
 
-    # 2. REVERSÃO MATEMÁTICA DO SEU HACK ZMQ (Recupera metros reais!)
-    # O tensor chega entre 0 e 1. Como 1.0 = 2000mm (2 metros), multiplicamos por 2.0.
-    z = depth_tensor[:, 0, :, :] * 2.0 
+    # 2. Converte valores do depth tensor pra metros (depende do dataset; ver docstring).
+    z = depth_tensor[:, 0, :, :] * depth_scale
     
     # 3. Projeção Pinhole 3D
     fx, fy, cx, cy = intrinsics['fx'], intrinsics['fy'], intrinsics['cx'], intrinsics['cy']

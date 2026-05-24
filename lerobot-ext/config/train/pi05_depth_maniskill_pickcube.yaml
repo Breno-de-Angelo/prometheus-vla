@@ -1,0 +1,91 @@
+# pi05-depth on ManiSkill3 PickCube-v1 (RGB + Depth/PointNet + state).
+#
+# Paired with pi05_vanilla_maniskill_pickcube.yaml for the depth ablation.
+#
+# Depth is stored under `observation.depths.base_camera` (CALVIN-style key).
+# pi05depth's _preprocess_images detects "depth" in the key name and routes
+# it to depth_to_pointcloud(...). camera_intrinsics here are the rendered
+# 224x224 frame's intrinsics (ManiSkill default fx=fy=cx=cy=64 at 128x128
+# scaled by 224/128 = 1.75). Depth is in METERS (converter divides ManiSkill's
+# int16 mm by 1000), so depth_to_pointcloud uses depth_scale=1.0 (default).
+
+dataset:
+  repo_id: local/maniskill_pickcube_v1
+  root: /data/huggingface-models/lerobot/local/maniskill_pickcube_v1
+  episodes: null
+
+val_dataset:
+  repo_id: local/maniskill_pickcube_v1
+  root: /data/huggingface-models/lerobot/local/maniskill_pickcube_v1
+  episodes: null
+
+output_dir: /home/hercules/prometheus-vla/train/output/pi05_depth_maniskill_pickcube
+job_name: pi05_depth_maniskill_pickcube
+
+policy:
+  type: pi05depth
+  pretrained_path: lerobot/pi05_base   # bootstrap PaliGemma+expert; PointNet stays from-scratch
+  push_to_hub: false
+
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  image_resolution: [224, 224]
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  gradient_checkpointing: true
+  compile_model: false
+
+  max_state_dim: 32      # pi05 default; dataset state (18) is padded internally
+  max_action_dim: 32     # pi05 default; dataset action (8) is padded internally
+
+  use_depth_3d: true
+  use_pressure: false
+  pointnet_num_points: 1024
+  camera_intrinsics:
+    fx: 112.0
+    fy: 112.0
+    cx: 112.0
+    cy: 112.0
+
+  input_features:
+    observation.images.base_camera:
+      type: VISUAL
+      shape: [3, 224, 224]
+    observation.depths.base_camera:
+      type: VISUAL
+      shape: [1, 224, 224]
+    observation.state:
+      type: STATE
+      shape: [18]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [8]
+
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  optimizer_lr: 2.5e-5
+  optimizer_weight_decay: 0.01
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+
+# Note: pi05depth self-injects depth via modeling_pi05.py — no runtime injector
+# needed.  depth_fusion/depth_key/depth_scale (consumed by lerobot-ext run_train
+# with type=='pi05') are NOT in train/run_train.py's CustomTrainPipelineConfig,
+# so we omit them here and rely on the policy class to do the routing.
+
+steps: 15000
+batch_size: 4
+num_workers: 8
+log_freq: 50
+save_freq: 2000
+save_checkpoint: true
+eval_freq: 1000
+
+wandb:
+  enable: true
+  project: prometheus_maniskill
