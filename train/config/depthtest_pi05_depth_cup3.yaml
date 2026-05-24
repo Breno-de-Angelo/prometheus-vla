@@ -1,0 +1,49 @@
+# DEPTH SMOKE-TEST ("ver se funciona") — pi05 + depth fusion, on cup3.
+# Tag "depthtest" in the name/prefix to identify it. Runs on a fully-idle GPU; the vanilla
+# uni_lf pretrain keeps running untouched on GPU 0.
+#
+# Why cup3 and not the uni_lf data: the merged 7-pick Unitree set is RGB-only, so depth_fusion
+# there is a no-op (degrades to vanilla). cup3 has real depth (head_camera_depth, 3ch z16) — the
+# exact encoding the fusion code (PointNet) expects. Short run (1000 steps) just to confirm the
+# depth path trains end-to-end (injector active, depth decoded, loss sane).
+
+dataset:
+  repo_id: "Mrwlker/pick_up_the_cup3"
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21]
+  video_backend: pyav   # torchcodec is broken in ms3 (libtorchcodec/ffmpeg load error)
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+val_dataset:
+  repo_id: "Mrwlker/pick_up_the_cup3"
+  episodes: [10, 16, 22, 23, 24]
+  video_backend: pyav
+
+output_dir: "/home/hercules/prometheus-vla/train/output/depthtest_pi05_depth_cup3"
+job_name: "depthtest_pi05_depth_cup3"
+
+policy:
+  type: pi05
+  pretrained_path: lerobot/pi05_base
+  compile_model: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  push_to_hub: false
+
+depth_fusion: true
+fusion_mode: depth_only   # PointNet depth token (no pressure) — exercises the depth path
+
+tolerance_s: 0.01
+
+log_freq: 10
+eval_freq: 500
+save_freq: 500
+batch_size: 16
+steps: 1000               # smoke test — just confirm the depth path trains
+
+wandb:
+  enable: true

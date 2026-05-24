@@ -1,0 +1,61 @@
+# pi05_depth_uni_lf — Unitree-pretrain step of the DEPTH ablation lineage (leak-free).
+#
+# Option A: start from lerobot/pi05_base and pretrain a pi05 on a cup/glass-relevant
+# Unitree Dex3 grasp dataset, then fine-tune on cup3 (where depth+tactile are turned
+# back ON) via the cup3 depth fine-tune yaml.
+#
+# NOTE on the name: this pretrain is necessarily depth/tactile-OFF, because the Unitree
+# G1_Dex3 datasets are RGB-only (no depth, no pressure). So mechanically this pretrain is
+# identical to a vanilla Unitree pretrain — the "depth" in the name marks the lineage;
+# depth/tactile only kick in at the cup3 fine-tune stage. Consequence: one pretrain ckpt
+# can feed BOTH the vanilla and depth cup3 fine-tunes — no need to pretrain twice.
+#
+# Dataset: 7 Unitree G1_Dex3 single-pick tasks merged into one (cotraining), ~1410 eps /
+# ~1.2M frames, built by train/merge_picks7.py via aggregate_datasets(). All share HWC
+# cam_left_high [480,640,3] + 28-dim state/action with the same Dex3 joint layout as cup3;
+# cam_left_high is remapped to the head_camera view pi05 expects. (ObjectPlacement/GraspSquare
+# excluded: they store CHW [3,480,640], incompatible to merge.) The overnight orchestrator
+# (train/run_uni_lf_overnight.sh) overrides batch_size with a 48->32->24->16 OOM fallback.
+
+dataset:
+  repo_id: "lewislf/G1_Dex3_picks7_uni"
+  root: "/data/huggingface-models/lerobot/lewislf/G1_Dex3_picks7_uni"
+  video_backend: pyav   # torchcodec is broken in the ms3 env (libtorchcodec/ffmpeg load error); pyav decodes the AV1 videos fine
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+# Rename Unitree's left-high view to the name pi05 expects; joint naming matches cup3
+# by position, so observation.state / action need no remap.
+rename_map:
+  "observation.images.cam_left_high": "observation.images.head_camera"
+
+output_dir: "/home/hercules/prometheus-vla/train/output/pi05_depth_uni_lf"
+job_name: "pi05_depth_uni_lf"
+
+policy:
+  type: pi05
+  pretrained_path: lerobot/pi05_base
+  compile_model: true   # torch.compile -> ~much faster steps (one-time compile on first step)
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  push_to_hub: false
+
+depth_fusion: false   # Option A: skip inject_pi05_d entirely (no PointNet, no pressure_proj)
+
+# Merged-dataset timestamps are float32, so at large t the nearest-frame distance hits the default
+# tolerance 1e-4 exactly -> hard assert crashes the dataloader (seen on cam_right_high, which pi05
+# doesn't even use). 0.01s << half-frame period (0.0167s), so no wrong-frame risk.
+tolerance_s: 0.01
+
+log_freq: 20
+eval_freq: 1000
+save_freq: 1000
+batch_size: 16
+steps: 30000          # 30k for parity with the calvin pretrains; save/eval every 1k to pick best
+
+wandb:
+  enable: true
