@@ -1,63 +1,78 @@
 #!/usr/bin/env python
 """
-Training Entry Point V3 (Arquitetura Nativa com Registry)
-Carrega o YAML, lê o __init__.py (que registra o actdepth) e chama o treinamento.
+Training Entry Point V3 — Universal
+Funciona com qualquer type: (actdepth, pi05depth, ou qualquer outro registrado)
 """
 
 import sys
 import os
 
-# 1. Garante que o Python enxergue as pastas locais
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-# =====================================================================
-# 2. O PULO DO GATO: A MÁGICA DO __init__.py
-# Ao fazer este import, o Python lê o seu __init__.py.
-# O __init__.py faz o import do ACTConfig, que por sua vez ativa o
-# decorador @PreTrainedConfig.register_subclass("actdepth").
-# =====================================================================
+# Registra TODAS as políticas de uma vez
 try:
-    # IMPORTANTE: Se o seu __init__.py estiver dentro de uma pasta chamada
-    # 'policies', troque a linha abaixo para 'import policies'.
-    # Se estiver dentro da pasta 'train', use 'import train'.
-    import policies  # <- Ajuste para o nome da pasta do seu __init__.py
-    #print("[INFO]: Registro nativo 'actdepth' carregado com sucesso via __init__.py!")
+    import policies  # ativa todos os @register_subclass do __init__.py
 except ImportError as e:
-    print(f"\n[ERRO DE IMPORTAÇÃO]: Falha ao ler o seu __init__.py: {e}")
+    print(f"[ERRO]: Falha ao registrar políticas: {e}")
     sys.exit(1)
 
-# =====================================================================
-# 3. MOTOR DE TREINAMENTO OFICIAL
-# Não injetamos nada, apenas chamamos o fluxo padrão do seu run_train.
-# =====================================================================
-try:
-    from train.run_train import main as run_train_main
-except ImportError as e:
-    print(f"\n[ERRO]: Motor de treino (run_train.py) não encontrado: {e}")
-    sys.exit(1)
+# Lê o type do YAML para decidir qual motor usar
+import yaml
+
+def get_policy_type(config_path: str) -> str:
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    return cfg.get("policy", {}).get("type", "")
 
 def display_help():
     print("\n" + "="*70)
-    print("LEROBOT TRAINING INTERFACE - NATIVO (V3)")
+    print("LEROBOT TRAINING — UNIVERSAL (V3)")
     print("="*70)
     print("USO:")
-    print("  python init_lerobot_train_v3.py --config_path=<CAMINHO_PARA_O_YAML>\n")
+    print("  python init_lerobot_train_v3.py --config_path=<YAML>\n")
+    print("Tipos suportados: actdepth, pi05depth")
+    print("="*70 + "\n")
 
 if __name__ == "__main__":
-    # Verifica se o usuário pediu ajuda ou esqueceu o config
-    if any(flag in sys.argv for flag in ["-h", "--help"]) or len(sys.argv) < 2:
-        display_help()
-        sys.exit(0 if "-h" in sys.argv else 1)
+    cli_args = sys.argv[:]
 
-    print("[INFO]: Iniciando LeRobot Train Pipeline...")
-    
-    # O motor 'run_train_main' vai ler o sys.argv nativamente, achar o seu YAML,
-    # ler "type: actdepth" e procurar no registro. Como o __init__.py já 
-    # cadastrou ele, a mágica acontece sozinha!
+    if any(f in cli_args for f in ["-h", "--help"]):
+        display_help()
+        sys.exit(0)
+
+    config_arg = next((a for a in cli_args if "--config_path" in a), None)
+    if not config_arg:
+        print("[ERRO]: --config_path obrigatório. Use -h para ajuda.")
+        sys.exit(1)
+
+    # Extrai o caminho do YAML
+    config_path = config_arg.split("=", 1)[-1]
+
+    # Descobre o tipo e carrega o motor certo
+    policy_type = get_policy_type(config_path)
+    print(f"[INFO]: Detectado policy.type = '{policy_type}'")
+
+    if policy_type == "actdepth":
+        from policies.act_depth.run_train import main as run_train_main
+        print("[INFO]: Usando motor ACT-D...")
+
+    elif policy_type == "pi05depth":
+        from policies.pi0_depth.run_train import main as run_train_main
+        print("[INFO]: Usando motor PI05-Depth...")
+
+    else:
+        # Fallback: tenta o motor genérico do LeRobot diretamente
+        print(f"[AVISO]: Tipo '{policy_type}' sem motor dedicado — usando motor genérico LeRobot.")
+        from lerobot.scripts.lerobot_train import main as run_train_main
+
     try:
         sys.exit(run_train_main())
     except KeyboardInterrupt:
-        print("\n[SISTEMA]: Treinamento cancelado pelo usuário.")
+        print("\n[SISTEMA]: Treinamento encerrado pelo usuário.")
         sys.exit(0)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

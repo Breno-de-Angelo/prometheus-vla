@@ -1,10 +1,27 @@
 # ==========================================================
-# 1. DATASET DE TREINAMENTO 
+# PI05-Depth — Configuração de Treinamento (Improved)
+#
+# NOVIDADES NESTA VERSÃO:
+#   1. scene_uncertainty_threshold: gate de incerteza Monte Carlo
+#      (o PI05 usa Flow Matching, não VAE — incerteza estimada por variância
+#      entre múltiplos denoising passes com ruídos diferentes)
+#   2. n_samples_uncertainty: quantas amostras para estimar incerteza
+#      (auto-ajustado para 3 se threshold > 0)
+#   3. neutral_position: injetada automaticamente pelo run_train via
+#      UnitreeG1Config.default_positions + normalização pelas stats do dataset
+#   4. save_best_checkpoint / Ctrl+C: mesmo mecanismo do ACT-D
+#   5. Validação de consistência depth/pressure no __post_init__
+# ==========================================================
+
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
 # ==========================================================
 dataset:
   repo_id: Mrwlker/pick_up_the_cup_2026-04-30
   root: meu_dataset/pick_up_the_cup_2026-04-30
   episodes: [1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21]
+
 
 # ==========================================================
 # 2. DATASET DE VALIDAÇÃO
@@ -14,47 +31,67 @@ val_dataset:
   root: meu_dataset/pick_up_the_cup_2026-04-30
   episodes: [7, 9, 18, 19]
 
+
 # ==========================================================
-# 3. ARQUITETURA DA IA (Vision-Language-Action: PI05-Depth)
+# 3. ARQUITETURA DA IA (PI05-Depth)
 # ==========================================================
 policy:
-  type: pi05depth  # Nova arquitetura registrada
+  type: pi05depth
   repo_id: Mrwlker/pick_up_the_cup_pi05_nodepth
   push_to_hub: false
-  
-  # --------------------------------------------------------
-  # PARÂMETROS OBRIGATÓRIOS DO PI05
-  # --------------------------------------------------------
-  # Modelos base que compõem o cérebro
-  paligemma_variant: "gemma_2b"        # O cérebro VLM principal (Visão e Linguagem)
-  action_expert_variant: "gemma_300m"  # O especialista motor (AdaRMS)
-  
-  # Resolução exigida pelo SigLIP do PaliGemma (quadrada). 
-  # O código original redimensiona os 480x640 com preenchimento (pad) para não distorcer.
-  image_resolution: [224, 224]
 
-  # O PI05 padroniza tensores internamente, precisamos dizer o tamanho máximo real
+  # ── Modelos base ────────────────────────────────────────
+  paligemma_variant: "gemma_2b"
+  action_expert_variant: "gemma_300m"
+  image_resolution: [224, 224]
   max_state_dim: 28
   max_action_dim: 28
-  
-  # Ativação dos Módulos ACT-D Customizados
+
+  # ── ACT-D: Nuvem de Pontos 3D ──────────────────────────
+  # false = depth comentado abaixo, consistente
   use_depth_3d: false
-  use_pressure: false  # Deixei falso pois estão comentados nas features
-  # --------------------------------------------------------
-  
+
+  # ── ACT-D: Tato / Pressão ──────────────────────────────
+  use_pressure: false
+
+  # ── Scene Uncertainty Gate ──────────────────────────────
+  # O PI05 estima incerteza rodando n_samples_uncertainty
+  # denoising passes com ruídos iniciais diferentes.
+  # O prefix (VLM + câmera) é computado UMA VEZ com KV-cache;
+  # apenas o Gemma expert roda n vezes — custo razoável.
+  #
+  # Valores guia para o G1 pegando copos:
+  #   0.0  → gate desligado (baseline, sem custo)
+  #   0.10 → boa largada (ativa em alta incerteza)
+  #   0.05 → mais conservador, retorno mais frequente
+  #
+  # n_samples_uncertainty: auto-ajustado para 3 se threshold > 0
+  # Coloque explicitamente 5 se quiser mais precisão.
+  scene_uncertainty_threshold: 0.0
+  n_samples_uncertainty: 1
+
   input_features:
     observation.images.head_camera:
       type: VISUAL
       shape: [3, 480, 640]
-    #observation.images.head_camera_depth:
-    #  type: VISUAL
-    #  shape: [3, 480, 640]
-      
-    # Mantido em 28 para bater com o Parquet!
+
+    # Depth: descomente E mude use_depth_3d para true para ativar
+    # observation.images.head_camera_depth:
+    #   type: VISUAL
+    #   shape: [3, 480, 640]
+
     observation.state:
       type: STATE
-      shape: [28] 
-      
+      shape: [28]
+
+    # Pressão: descomente E mude use_pressure para true para ativar
+    # observation.left_hand_pressure:
+    #   type: STATE
+    #   shape: [33]
+    # observation.right_hand_pressure:
+    #   type: STATE
+    #   shape: [33]
+
   output_features:
     action:
       type: ACTION
@@ -63,35 +100,65 @@ policy:
   chunk_size: 100
   n_action_steps: 100
   n_obs_steps: 1
-  
-  # --------------------------------------------------------
-  # HIPERPARÂMETROS DE TREINO (Flow Matching + PaliGemma)
-  # --------------------------------------------------------
-  # Substitui o kl_weight e dropout do ACT antigo.
-  optimizer_lr: 2.5e-5               # Taxa de aprendizado padrão do PI05
-  optimizer_weight_decay: 0.01       # Regularização nativa do VLM
-  scheduler_warmup_steps: 1000       # Aquece a rede devagar para não destruir os pesos pré-treinados
-  scheduler_decay_steps: 30000       # Decaimento do cosseno
+
+  # ── Hiperparâmetros Flow Matching ───────────────────────
+  optimizer_lr: 2.5e-5
+  optimizer_weight_decay: 0.01
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+
 
 # ==========================================================
-# 4. CONFIGURAÇÕES DE TREINAMENTO (Para 2x A100)
+# 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
 output_dir: "train_output/pick_up_the_cup_pi05_nodepth"
-steps: 5000          
+steps: 5000
 
-# Batch Size: Como o PI05 carrega LLMs (Gemma 2B + 300M), ele consome BEM mais VRAM que o ACT.
-# Um batch de 4 por GPU (8 no total) é um ótimo ponto de partida para as A100.
-batch_size: 8       
+batch_size: 8
 num_workers: 0
-log_freq: 200         
-save_freq: 1000      
+log_freq: 200
+save_freq: 1000
 save_checkpoint: true
+
+# ── Best-Val Checkpoint ────────────────────────────────────
+# Salva em 'output_dir/best_val_checkpoint/' sempre que val_loss melhora.
+# Funciona igual ao ACT-D — sem precisar ativar nada manualmente.
+save_best_checkpoint: true
+
+# ── Curriculum de Posição Neutra ───────────────────────────
+# Peso do loss sintético que ensina "quando incerto → neutro".
+# 0.0 = desligado. 0.3 = 30% do loss normal vai para o curriculum.
+# O neutro vem do UnitreeG1Config.default_positions normalizado
+# pelas stats["action"] do dataset — mesma lógica do ACT-D.
+neutral_position_loss_weight: 0.3
+
 
 # ==========================================================
 # 5. AVALIAÇÃO E LOGS
 # ==========================================================
-eval_freq: 200       
+eval_freq: 200
 
 wandb:
-  enable: true       
+  enable: true
   project: prometheus_g1
+
+
+# ==========================================================
+# DIFERENÇA DO UNCERTAINTY GATE: ACT-D vs PI05
+# ==========================================================
+#
+# ACT-D (VAE):
+#   Incerteza = mean(exp(log_sigma / 2))
+#   log_sigma vem do encoder VAE — disponível em 1 forward pass
+#   Custo: zero (já computado durante select_action)
+#
+# PI05 (Flow Matching):
+#   Não há VAE nem log_sigma.
+#   Incerteza = std(resultado_1, resultado_2, ..., resultado_n)
+#   com n ruídos iniciais diferentes mas mesmo prefix (KV-cache)
+#   Custo: n × forward pass do Gemma expert (suffix)
+#          prefix (VLM, câmera) computado 1× com KV-cache
+#   Com n=3: ~3× mais lento no denoising, mas prefix (80% do custo) só 1×
+#
+# Recomendação: comece com threshold=0.0 (desligado) e ative depois
+# de verificar que o treinamento básico convergiu.
