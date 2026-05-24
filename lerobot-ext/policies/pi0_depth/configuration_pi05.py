@@ -1,18 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed under the Apache License, Version 2.0.
 
 from dataclasses import dataclass, field
 
@@ -31,17 +20,16 @@ DEFAULT_IMAGE_SIZE = 224
 class PI05DEPTHConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
-    dtype: str = "float32"  # Options: "bfloat16", "float32"
+    dtype: str = "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
-    n_action_steps: int = 50  # Number of action steps to execute
+    chunk_size: int = 50
+    n_action_steps: int = 50
 
-    # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    # Flow matching parameters: see openpi `PI0Pytorch`
+    # Flow matching
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
     time_sampling_beta_beta: float = 1.0
@@ -50,109 +38,131 @@ class PI05DEPTHConfig(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
 
-    # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
-    image_resolution: tuple[int, int] = (
-        DEFAULT_IMAGE_SIZE,
-        DEFAULT_IMAGE_SIZE,
-    )  # see openpi `preprocessing_pytorch.py`
-
-    # Add empty images. Used to add empty cameras when no image features are present.
+    image_resolution: tuple[int, int] = (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)
     empty_cameras: int = 0
+    tokenizer_max_length: int = 200
 
-    tokenizer_max_length: int = 200  # see openpi `__post_init__`
-
-    # ==========================================
-    # Configurações ACT-D (Geometria 3D)
-    # ==========================================
+    # ── ACT-D: Geometria 3D ──────────────────────────────────────────────────
     use_depth_3d: bool = True
     pointnet_num_points: int = 1024
     camera_intrinsics: dict = field(
         default_factory=lambda: {'fx': 600.0, 'fy': 600.0, 'cx': 320.0, 'cy': 240.0}
     )
 
-    # ==========================================
-    # Configurações ACT-D (Tato/Pressão)
-    # ==========================================
+    # ── ACT-D: Tato / Pressão ────────────────────────────────────────────────
     use_pressure: bool = True
-    pressure_feature_dim: int = 66  # Ex: 33 (esq) + 33 (dir)
+    pressure_feature_dim: int = 66
+
+    # ── Scene Uncertainty Gate ───────────────────────────────────────────────
+    # O PI05 usa Flow Matching (não VAE), então não há log_sigma.
+    # A incerteza é estimada rodando n_samples_uncertainty denoising passes com
+    # ruídos iniciais diferentes e medindo a variância entre os resultados.
+    # O prefix (VLM + SigLIP) é computado UMA vez com KV-cache; só o suffix
+    # (Gemma expert) roda n vezes — custo razoável.
+    #
+    # scene_uncertainty_threshold: limiar do std médio das ações.
+    #   0.0  → gate desligado (padrão — sem custo extra)
+    #   0.05 → ativa com incerteza baixa (mais conservador)
+    #   0.10 → boa partida para o G1
+    #   0.20 → só em cenários muito incertos
+    #
+    # n_samples_uncertainty: quantas amostras usar para estimar incerteza.
+    #   1  → sem estimativa (gate desligado mesmo que threshold > 0)
+    #   3  → bom custo-benefício (ativado automaticamente se threshold > 0)
+    #   5  → mais preciso, ~5× mais lento no suffix
+    scene_uncertainty_threshold: float = 0.0
+    n_samples_uncertainty: int = 1  # auto-ajustado para 3 se threshold > 0
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.QUANTILES,  # Pi0.5 uses quantiles for state
-            "ACTION": NormalizationMode.QUANTILES,  # Pi0.5 uses quantiles for action
+            "STATE": NormalizationMode.QUANTILES,
+            "ACTION": NormalizationMode.QUANTILES,
         }
     )
 
-    # Training settings
-    gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
-    compile_model: bool = False  # Whether to use torch.compile for model optimization
-    compile_mode: str = "max-autotune"  # Torch compile mode
-    device: str | None = None  # Device to use for the model (None = auto-detect)
+    gradient_checkpointing: bool = False
+    compile_model: bool = False
+    compile_mode: str = "max-autotune"
+    device: str | None = None
 
-    # Finetuning settings
-    freeze_vision_encoder: bool = False  # Freeze only the vision encoder
-    train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    freeze_vision_encoder: bool = False
+    train_expert_only: bool = False
 
-    # Optimizer settings: see openpi `AdamW`
-    optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
+    optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
 
-    # Scheduler settings: see openpi `CosineDecaySchedule`
-    # Note: These will auto-scale if --steps < scheduler_decay_steps
-    # For example, --steps=3000 will scale warmup to 100 and decay to 3000
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    tokenizer_max_length: int = 200  # see openpi `__post_init__`
-
     def __post_init__(self):
         super().__post_init__()
 
-        # Validate configuration
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
-
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
-
         if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
-
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
+        # ── Validação de consistência depth/pressure ──────────────────────────
+        # (Mesma lógica do ACTConfig — detecta YAML inconsistente antes de treinar)
+        has_depth = any(
+            "depth" in k.lower() for k in self.input_features
+        )
+        if self.use_depth_3d and not has_depth:
+            raise ValueError(
+                "use_depth_3d=True mas nenhuma feature com 'depth' no nome está em "
+                "input_features. Adicione a feature ou coloque use_depth_3d=False."
+            )
+        if not self.use_depth_3d and has_depth:
+            import warnings
+            warnings.warn(
+                "use_depth_3d=False mas uma feature de depth está em input_features. "
+                "A câmera será carregada mas ignorada — considere remover do YAML.",
+                stacklevel=2,
+            )
+
+        has_pressure = (
+            "observation.left_hand_pressure" in self.input_features
+            or "observation.right_hand_pressure" in self.input_features
+        )
+        if self.use_pressure and not has_pressure:
+            raise ValueError(
+                "use_pressure=True mas as features de pressão não estão em input_features."
+            )
+
+        # Auto-ajusta n_samples se threshold foi setado mas amostras esquecidas
+        if self.scene_uncertainty_threshold > 0 and self.n_samples_uncertainty <= 1:
+            self.n_samples_uncertainty = 3
+
     def validate_features(self) -> None:
-        """Validate and set up input/output features."""
         for i in range(self.empty_cameras):
             key = OBS_IMAGES + f".empty_camera_{i}"
-            empty_camera = PolicyFeature(
+            self.input_features[key] = PolicyFeature(
                 type=FeatureType.VISUAL,
-                shape=(3, *self.image_resolution),  # Use configured image resolution
+                shape=(3, *self.image_resolution),
             )
-            self.input_features[key] = empty_camera
-
         if OBS_STATE not in self.input_features:
-            state_feature = PolicyFeature(
+            self.input_features[OBS_STATE] = PolicyFeature(
                 type=FeatureType.STATE,
-                shape=(self.max_state_dim,),  # Padded to max_state_dim
+                shape=(self.max_state_dim,),
             )
-            self.input_features[OBS_STATE] = state_feature
-
         if ACTION not in self.output_features:
-            action_feature = PolicyFeature(
+            self.output_features[ACTION] = PolicyFeature(
                 type=FeatureType.ACTION,
-                shape=(self.max_action_dim,),  # Padded to max_action_dim
+                shape=(self.max_action_dim,),
             )
-            self.output_features[ACTION] = action_feature
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
