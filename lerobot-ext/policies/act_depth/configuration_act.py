@@ -98,6 +98,8 @@ class ACTConfig(PreTrainedConfig):
     use_pressure: bool = True
     pressure_feature_dim: int = 66  # Ex: 33 (left) + 33 (right)
     pressure_hidden_dim: int = 256
+
+    scene_uncertainty_threshold: float = 0.0
     # ==========================================
 
     normalization_mapping: dict[str, NormalizationMode] = field(

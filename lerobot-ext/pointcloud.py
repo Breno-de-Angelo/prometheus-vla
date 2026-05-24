@@ -85,7 +85,7 @@ while cap.isOpened():
     depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
 
     # 5000 pontos para a visualização ficar densa e bonita original é 1024, mas para o player 3D podemos usar mais pontos!
-    nuvem_tensor = depth_to_pointcloud(depth_tensor, intrinsics, num_points=8000)
+    nuvem_tensor = depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024)
 
     pontos_numpy = nuvem_tensor[0].transpose(0, 1).cpu().numpy()
     
