@@ -67,12 +67,12 @@ policy:
   #
   # n_samples_uncertainty: auto-ajustado para 3 se threshold > 0
   # Coloque explicitamente 5 se quiser mais precisão.
-  scene_uncertainty_threshold: 0.0   # ← mude para 0.10 para ativar
-ra:
-      type: VISUAL  n_samples_uncertainty: 1           # ← auto-vira 3 se threshold > 0
+  scene_uncertainty_threshold: 0.0
+  n_samples_uncertainty: 1
 
   input_features:
-    observation.images.head_came
+    observation.images.head_camera:
+      type: VISUAL
       shape: [3, 480, 640]
 
     # Depth: descomente E mude use_depth_3d para true para ativar

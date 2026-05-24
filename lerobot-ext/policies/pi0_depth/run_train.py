@@ -60,9 +60,10 @@ def patched_getitem_rgb_only_transforms(self, idx):
 LeRobotDataset.__getitem__ = patched_getitem_rgb_only_transforms
 # ─────────────────────────────────────────────────────────────
 
-from .configuration_pi05 import PI05DepthConfig
-from .modeling_pi05 import PI05DepthPolicy
 from .processor_pi05 import make_pi05depth_pre_post_processors as make_pi05_pre_post_processors
+
+from .configuration_pi05 import PI05DEPTHConfig
+from .modeling_pi05 import PI05DEPTHPolicy
 
 from lerobot.configs.train import TrainPipelineConfig, DatasetConfig
 
