@@ -114,7 +114,7 @@ policy:
 output_dir: "train_output/pick_up_the_cup_pi05_nodepth"
 steps: 5000
 
-batch_size: 8
+batch_size: 4
 num_workers: 0
 log_freq: 200
 save_freq: 1000
