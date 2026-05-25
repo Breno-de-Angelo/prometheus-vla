@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Replay da trajetoria de pega (gravada por `pick_from_grasp.py --record`) pelo MESMO
-canal que a VLA usa: ActionSenderZMQ -> ZMQ 6001 -> ActionReceiver -> sim (Mori).
+canal que a VLA usa: ActionSenderZMQ -> ZMQ 6001 -> ActionReceiver -> sim.
 
 E uma "VLA falsa": em vez da saida do modelo pi05d, stream-a a nossa trajetoria
 conhecida-boa. Como ja conhecemos o resultado dessas acoes (o copo e pego e devolvido),
@@ -18,7 +18,7 @@ IMPORTANTE - escopo das acoes (nosso pick NAO e so braco):
 Uso:
   # LOCAL (smoke test, sim na mesma maquina):
   python pickup_experiments/replay_via_sender.py --traj pickup_experiments/pick_trajectory.json --remote 127.0.0.1
-  # de ATENAS (rede real) apontando pro Mori:
+  # da máquina de treino (rede real) apontando pro simulador:
   python pickup_experiments/replay_via_sender.py --traj pick_trajectory.json --remote 192.168.15.111
 """
 import argparse
@@ -56,7 +56,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--traj", required=True, help="JSON gravado por pick_from_grasp.py --record")
     ap.add_argument("--remote", default="127.0.0.1",
-                    help="IP do sim (Mori). Local=127.0.0.1; de Atenas->Mori=192.168.15.111")
+                    help="IP do sim. Local=127.0.0.1; rede real=192.168.15.111")
     ap.add_argument("--port", type=int, default=6001)
     ap.add_argument("--arm-only", action="store_true",
                     help="manda SO o braco (15-28), como o pi05d de hoje -> copo NAO sera pego")
@@ -72,6 +72,14 @@ def main():
 
     sender = ActionSenderZMQ(args.remote, port=args.port, verbose=False)
     time.sleep(0.5)
+    # O sender do branch integ NAO tem reset_cup (pin do copo, so-sim). So passa esse kwarg se a
+    # assinatura suportar -> roda em qualquer branch. Sem suporte: braco/mao se movem (testa o
+    # transporte), mas o copo NAO e pinado, entao no COMPLETO o copo nao fica seguro (esperado).
+    import inspect
+    supports_reset = "reset_cup" in inspect.signature(sender.send_action).parameters
+    if not supports_reset:
+        print("[replay] AVISO: sender sem reset_cup (branch integ) -> sem pin do copo. "
+              "Transporte e exercitado; no COMPLETO o copo nao sera segurado.")
     dt = 1.0 / hz
     sent = 0
     try:
@@ -82,11 +90,12 @@ def main():
                 rh_idx = lh_idx = {}
             if args.no_hand:
                 rh_idx = lh_idx = {}
-            reset = bool(fr.get("reset_cup")) and not args.no_cup_reset and not args.arm_only
-            sender.send_action(ad, body_motor_indices=body_idx,
-                               left_hand_indices=lh_idx or None,
-                               right_hand_indices=rh_idx or None,
-                               reset_cup=reset)
+            kw = dict(body_motor_indices=body_idx,
+                      left_hand_indices=lh_idx or None,
+                      right_hand_indices=rh_idx or None)
+            if supports_reset:
+                kw["reset_cup"] = bool(fr.get("reset_cup")) and not args.no_cup_reset and not args.arm_only
+            sender.send_action(ad, **kw)
             sent += 1
             time.sleep(dt)
             if k % 200 == 0:
