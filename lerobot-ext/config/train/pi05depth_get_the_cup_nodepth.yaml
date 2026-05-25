@@ -97,15 +97,20 @@ policy:
       type: ACTION
       shape: [28]
 
-  chunk_size: 100
-  n_action_steps: 100
+  chunk_size: 50
+  n_action_steps: 50
   n_obs_steps: 1
 
   # ── Hiperparâmetros Flow Matching ───────────────────────
-  optimizer_lr: 2.5e-5
+  optimizer_lr: 5e-5
   optimizer_weight_decay: 0.01
-  scheduler_warmup_steps: 1000
-  scheduler_decay_steps: 30000
+  scheduler_warmup_steps: 200
+  scheduler_decay_steps: 4800
+
+
+
+  train_expert_only: true        # ← ADICIONE ISSO
+  freeze_vision_encoder: true    # ← E ISSO
 
 
 # ==========================================================
@@ -116,7 +121,7 @@ steps: 5000
 
 batch_size: 4
 num_workers: 0
-log_freq: 200
+log_freq: 100
 save_freq: 1000
 save_checkpoint: true
 
@@ -130,13 +135,13 @@ save_best_checkpoint: false
 # 0.0 = desligado. 0.3 = 30% do loss normal vai para o curriculum.
 # O neutro vem do UnitreeG1Config.default_positions normalizado
 # pelas stats["action"] do dataset — mesma lógica do ACT-D.
-neutral_position_loss_weight: 0.3
+neutral_position_loss_weight: 0.0
 
 
 # ==========================================================
 # 5. AVALIAÇÃO E LOGS
 # ==========================================================
-eval_freq: 200
+eval_freq: 100
 
 wandb:
   enable: true

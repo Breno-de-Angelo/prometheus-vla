@@ -1046,8 +1046,15 @@ class PI05DEPTHPolicy(PreTrainedPolicy):
         # Trunca para a dimensão real da ação
         losses = losses[:, :, : self._original_action_dim]
 
+        loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu()  # [action_dim]
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            # Cada dimensão vira uma chave escalar: loss_per_dim/0, /1, ...
+            # O WandBLogger só aceita scalars — listas causam o WARNING que você viu.
+            **{f"loss_per_dim/{i}": v.item() for i, v in enumerate(loss_per_dim)},
+            # Resumo estatístico útil para monitorar evolução geral
+            "loss_per_dim_mean": loss_per_dim.mean().item(),
+            "loss_per_dim_max": loss_per_dim.max().item(),
+            "loss_per_dim_min": loss_per_dim.min().item(),
         }
 
         if reduction == "none":
