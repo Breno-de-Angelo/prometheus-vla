@@ -59,7 +59,10 @@ def main():
     task_description = "Pick up the cup"
     checkpoint_dir = None
 
+    fusion_none = False
     for arg in sys.argv:
+        if arg in ["--fusion=none", "--vanilla", "--no-fusion"]:
+            fusion_none = True
         if arg in ["--sim", "--simulation=true"]:
             is_sim = True
             print("[INFO]: Modo SIMULAÇÃO ativado (--sim)")
@@ -115,12 +118,12 @@ def main():
                     got_frame = True
                     break
             except TimeoutError:
-                print(f"   ...sem frame ainda ({int(deadline - time.time())}s restantes) — o run_sim.py do Mori está publicando a câmera em :{cam_port}?")
+                print(f"   ...sem frame ainda ({int(deadline - time.time())}s restantes) — o run_sim.py do simulador está publicando a câmera em :{cam_port}?")
             except Exception as e:
                 print(f"   ...erro lendo frame: {e}")
                 time.sleep(0.5)
         if not got_frame:
-            print("[ABORT] Simulador não enviou frame. No Mori: confira que o run_sim.py está rodando, a janela do MuJoCo está ativa/avançando, e que imprimiu 'Cameras ... → ZMQ port 5555'.")
+            print("[ABORT] Simulador não enviou frame. No simulador: confira que o run_sim.py está rodando, a janela do MuJoCo está ativa/avançando, e que imprimiu 'Cameras ... → ZMQ port 5555'.")
             zmq_cam_rgb.disconnect()
             zmq_cam_depth.disconnect()
             sys.exit(1)
@@ -130,7 +133,11 @@ def main():
     # =================================================================
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"⏳ Carregando PI05-D de: {checkpoint_dir}")
-    policy = load_pi05_d(checkpoint_dir, device)
+    if fusion_none:
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+        policy = PI05Policy.from_pretrained(checkpoint_dir, strict=False).to(device).eval()
+    else:
+        policy = load_pi05_d(checkpoint_dir, device)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy.config, pretrained_path=checkpoint_dir
     )
@@ -161,7 +168,7 @@ def main():
 
     # Preparar mapeamento de índices de motores (para modo distribuído)
     from robot.unitree_g1.g1_utils import G1_29_JointArmIndex
-    # CORREÇÃO (Mori, commit 104a9e3): usar o VALOR do enum (índice real do motor:
+    # CORREÇÃO (commit 104a9e3): usar o VALOR do enum (índice real do motor:
     # ombro dir = 22), não a posição do enumerate (que daria 0-13 e mandaria o
     # braço pros motores da perna/quadril — por isso o braço não se mexia).
     body_motor_indices = {m.name: int(m.value) for m in G1_29_JointArmIndex}
@@ -216,7 +223,8 @@ def main():
                     obs["head_camera_depth"] = np.stack([depth_u8, depth_u8, depth_u8], axis=-1)
 
             # 4. MONTAR BATCH DE IMAGENS
-            for cam_name in ["head_camera", "head_camera_depth"]:
+            _cam_list = ["head_camera"] if fusion_none else ["head_camera", "head_camera_depth"]
+            for cam_name in _cam_list:
                 img = obs.get(cam_name, np.zeros((480, 640, 3), dtype=np.uint8))
                 img_tensor = torch.from_numpy(img).permute(2, 0, 1).float().to(device) / 255.0
                 batch[f"observation.images.{cam_name}"] = img_tensor.unsqueeze(0)
@@ -270,7 +278,7 @@ def main():
 
             if debug_mode:
                 valores_formatados = " | ".join([f"{v:.2f}" for v in action_dict.values()])
-                print(f"\r🤖 IA -> [{valores_formatados}]", end="", flush=True)
+                print(f"\rIA -> [{valores_formatados}]", end="", flush=True)
 
             if action_sender:
                 # Modo distribuído: braços (kp=150/kd=5 p/ vencer a gravidade do MuJoCo) + mãos Dex3

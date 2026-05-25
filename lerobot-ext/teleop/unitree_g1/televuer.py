@@ -212,6 +212,6 @@ class VuerTeleop(Teleoperator):
         for i, name in enumerate(RIGHT_HAND_NAMES):
             robot_action[name] = float(right_grasp * RIGHT_HAND_CLOSED_TARGETS[i])
 
-        #print(f"🤖 ENVIADO PRO MUJOCO | Ombro L: {robot_action['kLeftShoulderPitch.q']:.2f}, Cotovelo L: {robot_action['kLeftElbow.q']:.2f}")
+        #print(f"ENVIADO PRO MUJOCO | Ombro L: {robot_action['kLeftShoulderPitch.q']:.2f}, Cotovelo L: {robot_action['kLeftElbow.q']:.2f}")
 
         return robot_action

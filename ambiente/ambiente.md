@@ -130,7 +130,7 @@ Agora você tem o ambiente funcionando exatamente como no PC original:
 
 Ambiente restaurado com sucesso, pronto para uso em:
 
-* 🤖 Prometheus-VLA
+* Prometheus-VLA
 * 🧪 Simulação com Unitree G1
 
 ---

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Inferência pi05-D na Atenas -> simulador MuJoCo do Mori (modo distribuído via ZMQ).
-# Uso: bash run_atenas_sim.sh   (suba o run_sim.py no Mori ANTES)
+# Inferência pi05-D na máquina de treino -> simulador MuJoCo (modo distribuído via ZMQ).
+# Uso: bash run_atenas_sim.sh   (suba o run_sim.py no simulador ANTES)
 set -e
 
 source /home/hercules/miniconda3/etc/profile.d/conda.sh

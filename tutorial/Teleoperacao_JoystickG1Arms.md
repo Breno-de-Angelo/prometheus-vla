@@ -48,7 +48,7 @@ lerobot-record \
 
 ## Explicação de cada parâmetro
 
-### 🤖 ```--robot.type=unitree_g1_dex3```
+### ```--robot.type=unitree_g1_dex3```
 
 Define o tipo do robô.
 

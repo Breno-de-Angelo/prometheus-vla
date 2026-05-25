@@ -1,5 +1,5 @@
 """
-Enviador de ações via ZMQ para simulador remoto (Mori).
+Enviador de ações via ZMQ para simulador remoto.
 Usado por scripts de inferência em modo distribuído.
 """
 import zmq
@@ -13,7 +13,7 @@ class ActionSenderZMQ:
     def __init__(self, remote_ip: str, port: int = 6001, verbose: bool = False):
         """
         Args:
-            remote_ip: IP do simulador remoto (Mori)
+            remote_ip: IP do simulador remoto
             port: porta ZMQ (default: 6001)
             verbose: se True, printa debug logs
         """

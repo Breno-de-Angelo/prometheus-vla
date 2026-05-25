@@ -75,7 +75,7 @@ echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' > $CONDA_PREFIX
 </div>
 
 <div class="box">
-<h2>🤖 4. Instalar PyTorch (CUDA 12.1)</h2>
+<h2>4. Instalar PyTorch (CUDA 12.1)</h2>
 <pre><code>pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121</code></pre>
 </div>
 

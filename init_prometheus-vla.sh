@@ -21,7 +21,7 @@ cleanup() {
 # Prepara a armadilha para o sinal de interrupção (SIGINT)
 trap cleanup SIGINT
 
-echo "🤖 Iniciando infraestrutura do Prometheus VLA..."
+echo "Iniciando infraestrutura do Prometheus VLA..."
 
 # 4. Inicia o Servidor da Câmera (RealSense) em background (&)
 python $PROJECT_DIR/full_realsenser_server.py &

@@ -272,6 +272,6 @@ class VuerTeleop(Teleoperator):
             action_data["left_trigger_value"] = 10.0 - self.tvuer.left_controller_trigger_value * 10
             action_data["right_trigger_value"] = 10.0 - self.tvuer.right_controller_trigger_value * 10
     
-        print(f"🤖 ENVIANDO PRO ROBÔ | X: {action_data['left_arm_pose'][0, 3]:.3f}, Y: {action_data['left_arm_pose'][1, 3]:.3f}, Z: {action_data['left_arm_pose'][2, 3]:.3f}")
+        print(f"ENVIANDO PRO ROBÔ | X: {action_data['left_arm_pose'][0, 3]:.3f}, Y: {action_data['left_arm_pose'][1, 3]:.3f}, Z: {action_data['left_arm_pose'][2, 3]:.3f}")
             
         return action_data
