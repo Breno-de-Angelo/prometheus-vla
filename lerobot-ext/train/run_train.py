@@ -19,6 +19,9 @@ from torch.optim import Optimizer
 # Add current directory to path to ensure we can import train.utils
 sys.path.append(os.getcwd())
 
+# Registra os tipos de policy customizados (actdepth, PI05DEPTH) no draccus.
+import policies  # noqa: E402,F401
+
 # --- MONKEY PATCHES START ---
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -673,6 +676,16 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     logging.info(f"  symlinked best -> {checkpoint_dir.name}")
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+
+                # Salva apenas 'best' + 'last'
+                import shutil
+                ckpt_root = checkpoint_dir.parent
+                keep = {os.path.realpath(ckpt_root / lk) for lk in ("best", "last")
+                        if (ckpt_root / lk).is_symlink()}
+                for d in ckpt_root.iterdir():
+                    if d.is_dir() and d.name.isdigit() and os.path.realpath(d) not in keep:
+                        shutil.rmtree(d, ignore_errors=True)
+                        logging.info(f"  podado checkpoint intermediario: {d.name}")
 
             accelerator.wait_for_everyone()
 

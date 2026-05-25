@@ -1,0 +1,47 @@
+# Finetune pi05-D full fusion (depth+tatil) no dataset do copo MERGEADO
+# (cup_2026-04-30 + cup3), a partir do pretrain HE-depth. Splits excluem os 2
+# episodios degenerados do cup3 (merged 23 = 1 frame, merged 47 = 8 frames).
+# Salva apenas best + last.
+dataset:
+  repo_id: "lewislf/pick_up_the_cup_merged"
+  root: "/data/huggingface-models/lerobot/lewislf/pick_up_the_cup_merged"
+  episodes: [0,1,2,3,4,5,6,8,10,11,12,13,14,15,16,17,20,21,22,24,25,26,27,28,29,30,31,32,34,35,36,37,38,40,41,42,43,44]
+  video_backend: pyav
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+val_dataset:
+  repo_id: "lewislf/pick_up_the_cup_merged"
+  root: "/data/huggingface-models/lerobot/lewislf/pick_up_the_cup_merged"
+  episodes: [7, 9, 18, 19, 33, 39, 45, 46]
+  video_backend: pyav
+
+output_dir: "/home/hercules/prometheus-vla/train/output/he_then_cup_merged_finetune"
+job_name: "he_then_cup_merged_finetune"
+
+policy:
+  type: pi05
+  pretrained_path: /home/hercules/prometheus-vla/train/output/he_pretrain_depth/checkpoints/last/pretrained_model
+  compile_model: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  push_to_hub: false
+  scheduler_warmup_steps: 200
+  scheduler_decay_steps: 50000
+
+depth_fusion: true
+fusion_mode: full
+
+tolerance_s: 0.01
+log_freq: 10
+eval_freq: 500
+save_freq: 500
+batch_size: 32
+steps: 50000
+
+wandb:
+  enable: true

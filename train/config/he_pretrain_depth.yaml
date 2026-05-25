@@ -1,0 +1,38 @@
+# AUTOPILOT etapa 1: pi05-D depth_only pretrain no HE destilado (lewislf/G1_Dex3_HE_depth),
+# partindo do pretrain vanilla G1 (uni_lf `last`). Lançado por run_he_autopilot.sh quando o
+# distill termina. fusion_mode=depth_only (o tactil do HE e incompativel -> entra so no finetune cup3).
+# __VANILLA_PRETRAINED__ e substituido pelo orquestrador (vanilla last/pretrained_model no momento do launch).
+dataset:
+  repo_id: "lewislf/G1_Dex3_HE_depth"
+  root: "/data/huggingface-models/lerobot/lewislf/G1_Dex3_HE_depth"
+  video_backend: pyav
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+output_dir: "/home/hercules/prometheus-vla/train/output/he_pretrain_depth"
+job_name: "he_pretrain_depth"
+
+policy:
+  type: pi05
+  pretrained_path: __VANILLA_PRETRAINED__
+  compile_model: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  push_to_hub: false
+
+depth_fusion: true
+fusion_mode: depth_only   # HE so tem depth utilizavel (tactil incompativel) -> PointNet apenas
+
+tolerance_s: 0.01
+log_freq: 20
+eval_freq: 0              # sem val_dataset no pretrain (mais rapido)
+save_freq: 1000
+batch_size: 32
+steps: 2000
+
+wandb:
+  enable: true

@@ -1,0 +1,45 @@
+# AUTOPILOT etapa 2: finetune FULL (depth+tactil) no cup3, a partir do pretrain HE-depth (etapa 1).
+# O PointNet vem treinado do HE; o pressure_proj e inicializado do zero e aprende aqui (HE nao tinha
+# tactil utilizavel). load_state_dict(strict=False) torna esse depth_only->full seguro.
+# __HE_PRETRAIN_PRETRAINED__ e substituido pelo orquestrador (he_pretrain_depth last/pretrained_model).
+dataset:
+  repo_id: "Mrwlker/pick_up_the_cup3"
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21]
+  video_backend: pyav
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+val_dataset:
+  repo_id: "Mrwlker/pick_up_the_cup3"
+  episodes: [10, 16, 22, 23, 24]
+  video_backend: pyav
+
+output_dir: "/home/hercules/prometheus-vla/train/output/he_then_cup3_finetune"
+job_name: "he_then_cup3_finetune"
+
+policy:
+  type: pi05
+  pretrained_path: __HE_PRETRAIN_PRETRAINED__
+  compile_model: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  push_to_hub: false
+  scheduler_warmup_steps: 200      # era 1000 (herdado do pretrain 30k); curto p/ finetune
+  scheduler_decay_steps: 10000     # casa com steps -> o LR de fato recoze dentro do run
+
+depth_fusion: true
+fusion_mode: full         # depth (PointNet, transferido) + tactil (pressure_proj, novo)
+
+tolerance_s: 0.01
+log_freq: 10
+eval_freq: 500            # val_action_mse no cup3 -> e o numero que diz "ficou melhor?"
+save_freq: 500
+batch_size: 32
+steps: 10000
+
+wandb:
+  enable: true
