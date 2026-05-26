@@ -5,8 +5,10 @@ import sys
 import time
 import torch
 import cv2
+import zmq
 import numpy as np
 from safetensors.torch import load_file
+from Scripts_Prometheus_int.sim.sensor_utils import SensorClient, ImageUtils
 
 # =====================================================================
 # 1. ATIVAÇÃO DO REGISTRO NATIVO ('actdepth')
@@ -81,28 +83,22 @@ def main():
             debug_mode = True
             print("[INFO]: Modo DEBUG ativado. Logs adicionais serão exibidos.")
             
-
     if not is_sim:
         print("[INFO]: Modo ROBÔ REAL ativado")
 
     # =================================================================
-    # SETUP DAS CÂMERAS (Fake Video ou Stream Real do Robô via Rede)
+    # SETUP DAS CÂMERAS (Fake Video ou Stream Real do Robô via ZMQ)
     # =================================================================
     fake_img_rgb = None
     fake_cap = None
-    
-    stream_cap_rgb = None
-    stream_cap_depth = None
+    stream_client = None
 
     if cam_robot_ip:
-        # ATENÇÃO: Se o seu stream usar RTSP, basta trocar de http:// para rtsp://
-        # Aqui assumo rotas genéricas /rgb e /depth. Ajuste conforme sua API no Unitree.
-        rgb_url = f"http://{cam_robot_ip}:{cam_port}/rgb"
-        depth_url = f"http://{cam_robot_ip}:{cam_port}/depth"
-        
-        stream_cap_rgb = cv2.VideoCapture(rgb_url)
-        stream_cap_depth = cv2.VideoCapture(depth_url)
-        print(f"📡 Conectando ao stream de Câmeras em {cam_robot_ip}:{cam_port}...")
+        # Inicializa a conexão ZMQ APENAS UMA VEZ aqui no setup
+        stream_client = SensorClient()
+        # Assumindo que o método seja connect. Ajuste se for start_client()
+        stream_client.start_client(server_ip=cam_robot_ip, port=int(cam_port))
+        print(f"📡 Conectando ao ZMQ SensorServer em tcp://{cam_robot_ip}:{cam_port}...")
         
     elif fake_video_path:
         if not os.path.exists(fake_video_path):
@@ -121,8 +117,58 @@ def main():
     # INICIALIZAÇÃO DO MODELO E ROBÔ
     # =================================================================
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_dir = "train_output/pick_up_the_cup_nodepth-260511/checkpoints/010000/pretrained_model" 
+    checkpoint_dir = "train_output/pick_up_the_cup_nodepth-260524/best_val_checkpoint/pretrained_model" 
     policy = load_native_policy(checkpoint_dir, device)
+
+    # ─────────────────────────────────────────────────────────
+    # ATIVA O SCENE UNCERTAINTY GATE
+    # ─────────────────────────────────────────────────────────
+    threshold = 0.5
+    policy.config.scene_uncertainty_threshold = threshold
+    print(f"✅ Uncertainty Gate ativado com threshold = {threshold}")
+
+    # ─────────────────────────────────────────────────────────
+    # GARANTE QUE O BUFFER neutral_position EXISTA
+    # ─────────────────────────────────────────────────────────
+    if not hasattr(policy, 'neutral_position'):
+        action_dim = list(policy.config.output_features.values())[0].shape[0]
+        policy.register_buffer('neutral_position', torch.zeros(action_dim, device=device))
+        print("⚠️ Buffer 'neutral_position' não existia no checkpoint. Criado com zeros.")
+    else:
+        print("✅ Buffer 'neutral_position' já existe no modelo.")
+
+    # ─────────────────────────────────────────────────────────
+    # TENTA RECALCULAR A POSIÇÃO NEUTRA (se houver estatísticas)
+    # ─────────────────────────────────────────────────────────
+    stats_path = os.path.join(checkpoint_dir, "dataset_stats.pt")
+    if os.path.exists(stats_path):
+        stats = torch.load(stats_path, map_location=device)
+        if "action" in stats:
+            try:
+                from policies.act_depth.neutral_position import compute_neutral_position
+                from robot.unitree_g1.config_unitree_g1 import UnitreeG1Config
+
+                robot_cfg = UnitreeG1Config()
+                action_stats = stats["action"]
+                neutral_norm = compute_neutral_position(
+                    robot_config=robot_cfg,
+                    action_stats=action_stats,
+                    action_dim=action_dim,
+                    device=device
+                )
+                policy.neutral_position.copy_(neutral_norm)
+                print("✅ Posição neutra recalculada com base nas estatísticas do dataset.")
+            except Exception as e:
+                print(f"⚠️ Falha ao recalcular posição neutra: {e}. Usando valor atual.")
+        else:
+            print("⚠️ dataset_stats.pt não contém 'action'. Mantendo neutral_position atual.")
+    else:
+        print("ℹ️ dataset_stats.pt não encontrado. Mantendo neutral_position atual (possivelmente zeros).")
+        # Opcional: define um valor padrão conhecido (exemplo: todas as juntas em 0.0 rad normalizado)
+        # policy.neutral_position.fill_(0.0)
+
+    # Agora você pode acessar policy.neutral_position com segurança
+    print(f"   Neutral_position (primeiros 5 valores): {policy.neutral_position[:5].cpu().numpy()}")
     
     print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim})...")
     g1_config = UnitreeG1Dex3Config(
@@ -165,26 +211,24 @@ def main():
             batch["observation.state"] = torch.tensor(state_vector).float().to(device).unsqueeze(0)
 
             # =========================================================
-            # 2. INJEÇÃO DE CÂMERAS (Stream de Rede, Fake ou Nativa)
+            # 2. INJEÇÃO DE CÂMERAS (Stream de Rede via ZMQ ou Fake)
             # =========================================================
-            if stream_cap_rgb is not None and stream_cap_depth is not None:
-                # Substitui tudo pelo que vem da rede
-                ret_rgb, frame_rgb = stream_cap_rgb.read()
-                ret_depth, frame_depth = stream_cap_depth.read()
+            if stream_client is not None:
+                # Recebe o pacote JSON via ZMQ em tempo real
+                msg = stream_client.receive_message() 
                 
-                if ret_rgb:
-                    obs["head_camera"] = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
-                
-                if ret_depth:
-                    # Se vier como RGB (3 canais), converte para tons de cinza (1 canal)
-                    if len(frame_depth.shape) == 3:
-                        frame_depth = cv2.cvtColor(frame_depth, cv2.COLOR_BGR2GRAY)
+                if msg and "images" in msg:
+                    # Desempacota as imagens usando seu Utils
+                    frame_rgb = ImageUtils.decode_image(msg["images"]["head_camera"])
+                    frame_depth = ImageUtils.decode_image(msg["images"]["head_camera_depth"])
                     
-                    # Garante que tenha 3 dimensões (H, W, 1) para o permute não quebrar depois
-                    if len(frame_depth.shape) == 2:
-                        frame_depth = np.expand_dims(frame_depth, axis=-1)
+                    # O servidor já enviou o RGB convertido, então não precisa converter de novo
+                    obs["head_camera"] = frame_rgb
                         
                     obs["head_camera_depth"] = frame_depth
+                else:
+                    # Opcional: lidar com falha de frame do ZMQ se necessário
+                    pass
 
             elif fake_cap is not None:
                 # Modo de vídeo simulado
@@ -199,11 +243,26 @@ def main():
             # 3. PROCESSAMENTO FINAL DAS IMAGENS PRO TENSOR
             # =========================================================
             for cam_name in ["head_camera", "head_camera_depth"]:
+                if cam_name not in obs and cam_name != "head_camera":
+                    continue
+                
                 if cam_name == "head_camera" and fake_img_rgb is not None:
-                    h_real, w_real = obs[cam_name].shape[:2]
+                    h_real, w_real = obs.get(cam_name, fake_img_rgb).shape[:2]
                     img = cv2.resize(fake_img_rgb, (w_real, h_real))
                 else:
-                    img = obs[cam_name]
+                    img = obs.get(cam_name)
+                    if img is None:
+                        continue
+
+                # --- FIX DEFINITIVO DOS CANAIS DO DEPTH ---
+                if cam_name == "head_camera_depth":
+                    # Se tiver 2 dimensões (ex: 480x640), adiciona o eixo do canal (480x640x1)
+                    if len(img.shape) == 2:
+                        img = np.expand_dims(img, axis=-1)
+                    # Se tiver 1 canal, triplica para 3 canais (480x640x3) para a ResNet aceitar
+                    if img.shape[2] == 1:
+                        img = np.repeat(img, 3, axis=-1)
+                # ------------------------------------------
 
                 # 📺 Exibição da janela (Apenas RGB para facilitar)
                 if cam_name == "head_camera":
@@ -245,10 +304,10 @@ def main():
     finally:
         if fake_cap is not None:
             fake_cap.release()
-        if stream_cap_rgb is not None:
-            stream_cap_rgb.release()
-        if stream_cap_depth is not None:
-            stream_cap_depth.release()
+            
+        if stream_client is not None:
+            # Encerra o cliente ZMQ corretamente usando o método nativo da classe
+            stream_client.stop_client()
             
         robot.disconnect()
         cv2.destroyAllWindows()
