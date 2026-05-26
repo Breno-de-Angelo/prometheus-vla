@@ -123,12 +123,12 @@ batch_size: 4
 num_workers: 0
 log_freq: 100
 save_freq: 1000
-save_checkpoint: true
+save_checkpoint: false
 
 # ── Best-Val Checkpoint ────────────────────────────────────
 # Salva em 'output_dir/best_val_checkpoint/' sempre que val_loss melhora.
 # Funciona igual ao ACT-D — sem precisar ativar nada manualmente.
-save_best_checkpoint: false
+save_best_checkpoint: true
 
 # ── Curriculum de Posição Neutra ───────────────────────────
 # Peso do loss sintético que ensina "quando incerto → neutro".
