@@ -14,18 +14,6 @@
 # 1. DATASET DE TREINAMENTO
 # ==========================================================
 dataset:
-  image_transforms:
-    enable: true
-    max_num_transforms: 1 # Reduzido para 1, pois só usaremos o ColorJitter
-    tfs:
-      ColorJitter:
-        type: ColorJitter
-        weight: 1.0
-        kwargs:
-          brightness: [0.8, 1.2] # Simula ambiente mais claro/escuro
-          contrast: [0.8, 1.2]   # Simula câmera com mais/menos contraste
-          saturation: [0.5, 1.5] # Cores mais vivas ou mais opacas
-          hue: [-0.05, 0.05]     # Leve mudança no tom das cores
   #image_transforms:
   #  enable: true
   #  max_num_transforms: 3
@@ -67,7 +55,7 @@ val_dataset:
 # ==========================================================
 policy:
   type: actdepth
-  repo_id: Mrwlker/ppick_up_the_cup_depth
+  repo_id: Mrwlker/pick_up_the_cup_depth
   push_to_hub: false
 
   input_features:
@@ -175,12 +163,17 @@ policy:
   # BLINDAGEM 2: Regularização do Transformer
   dropout: 0.2              # Padrão é 0.1. Aumentamos para forçar a rede a ignorar ruídos.
   optimizer_weight_decay: 1e-3 # Pune a rede se ela der pesos gigantescos para um único pixel.
+<<<<<<< HEAD:lerobot-ext/config/train/train_get_cup_depth.yaml
   kl_weight: 2.0           # Força a distribuição do VAE a ficar mais suave e generalista.
 >>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
+=======
+  kl_weight: 15.0           # Força a distribuição do VAE a ficar mais suave e generalista.
+>>>>>>> parent of 5c07ebd... ajsute pi05depth:lerobot-ext/config/train/train_get_kettle.yaml
 
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO (Para 2x A100)
 # ==========================================================
+<<<<<<< HEAD:lerobot-ext/config/train/train_get_cup_depth.yaml
 <<<<<<< HEAD
 output_dir: "train_output/pick_up_the_cup_depth-260512"
 steps: 100000
@@ -207,14 +200,18 @@ neutral_position_loss_weight: 0.3
 =======
 output_dir: "train_output/pick_up_the_cup_depth-260505"
 steps: 1000          
+=======
+output_dir: "train_output/pick_up_the_cup_depth-2026-04-30"
+steps: 5000          
+>>>>>>> parent of 5c07ebd... ajsute pi05depth:lerobot-ext/config/train/train_get_kettle.yaml
 
 # BLINDAGEM 3: Batch Size Dinâmico
 # Como usaremos 2 GPUs, o LeRobot multiplica esse número por 2.
 # 32 x 2 GPUs = 64 (Tamanho perfeito para aprender sem decorar o dataset de 4k frames)
-batch_size: 128       
+batch_size: 64       
 num_workers: 10
 log_freq: 200         
-save_freq: 500      
+save_freq: 1000      
 save_checkpoint: true
 >>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
 

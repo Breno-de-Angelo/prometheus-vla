@@ -293,27 +293,6 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
 
-<<<<<<< HEAD
-        self.paligemma = PaliGemmaForConditionalGeneration(vlm_config_hf)
-
-        expert_config_hf = CONFIG_MAPPING["gemma"]()
-        expert_config_hf.hidden_size = action_expert_config.width
-        expert_config_hf.intermediate_size = action_expert_config.mlp_dim
-        expert_config_hf.num_attention_heads = action_expert_config.num_heads
-        expert_config_hf.head_dim = action_expert_config.head_dim
-        expert_config_hf.num_hidden_layers = action_expert_config.depth
-        expert_config_hf.num_key_value_heads = action_expert_config.num_kv_heads
-        expert_config_hf.hidden_activation = "gelu_pytorch_tanh"
-        expert_config_hf.torch_dtype = "float32"
-        expert_config_hf.vocab_size = 257152
-        expert_config_hf.use_adarms = use_adarms[1]
-        expert_config_hf.adarms_cond_dim = action_expert_config.width if use_adarms[1] else None
-
-        self.gemma_expert = GemmaForCausalLM(expert_config_hf)
-
-        if freeze_vision_encoder:
-            for param in self.paligemma.vision_tower.parameters():
-=======
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
@@ -348,7 +327,6 @@ class PaliGemmaWithExpertModel(nn.Module):
             vision_tower = self.paligemma.vision_tower if hasattr(self.paligemma, "vision_tower") else self.paligemma.model.vision_tower
             vision_tower.eval()
             for param in vision_tower.parameters():
->>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
                 param.requires_grad = False
 
         if train_expert_only:
@@ -370,6 +348,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
+<<<<<<< HEAD
         # Verifica a versão da arquitetura do PaliGemma (compatibilidade transformers >= 4.52)
         if hasattr(self.paligemma, "vision_tower"):
             vision_tower = self.paligemma.vision_tower
@@ -386,6 +365,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         image_features = projector(image_features)
         
         return image_features
+=======
+        return self.paligemma.model.get_image_features(image)
+>>>>>>> parent of 5c07ebd... ajsute pi05depth
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
@@ -651,10 +633,15 @@ class PI05Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+<<<<<<< HEAD
     def forward(
         self, images, img_masks, tokens, masks, actions,
         noise=None, time=None, depth_images=None, pressure_tensor=None
     ) -> Tensor:
+=======
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, depth_images=None) -> Tensor:
+        """Do a full training forward pass and compute the loss."""
+>>>>>>> parent of 5c07ebd... ajsute pi05depth
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
         if time is None:
@@ -665,8 +652,12 @@ class PI05Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+<<<<<<< HEAD
             images, img_masks, tokens, masks,
             depth_images=depth_images, pressure_tensor=pressure_tensor,
+=======
+            images, img_masks, tokens, masks, depth_images=depth_images
+>>>>>>> parent of 5c07ebd... ajsute pi05depth
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
