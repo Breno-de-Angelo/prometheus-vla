@@ -27,7 +27,7 @@ class ActionSenderZMQ:
 
         print(f"[ActionSenderZMQ] Conectado a {remote_ip}:{port}")
 
-    def send_action(self, action_dict: dict, body_motor_indices=None, left_hand_indices=None, right_hand_indices=None, reset_cup: bool = False):
+    def send_action(self, action_dict: dict, body_motor_indices=None, left_hand_indices=None, right_hand_indices=None):
         """
         Envia ação para simulador remoto.
 
@@ -36,7 +36,6 @@ class ActionSenderZMQ:
             body_motor_indices: dict mapeando nome do motor → índice (ex: {"shoulder_pitch": 0, ...})
             left_hand_indices: dict mapeando nome do motor da mão esquerda → índice
             right_hand_indices: dict mapeando nome do motor da mão direita → índice
-            reset_cup: se True, injeta {"reset_cup": true} no payload (SÓ no sim — reseta/pina o copo).
         """
         try:
             payload = {}
@@ -88,10 +87,6 @@ class ActionSenderZMQ:
                         })
                 if right_hand:
                     payload["right_hand"] = right_hand
-
-            # reset/pin do copo (sim-only): a VLA real nunca seta isso
-            if reset_cup:
-                payload["reset_cup"] = True
 
             if payload:
                 self.sock.send_string(json.dumps(payload))

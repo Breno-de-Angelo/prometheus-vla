@@ -108,7 +108,7 @@ class DefaultEnv:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model,
                     self.mj_data,
-                    key_callback=self.viewer_key_callback,
+                    key_callback=self.elastic_band.MujuocoKeyCallback,
                     show_left_ui=False,
                     show_right_ui=False,
                 )
@@ -130,23 +130,6 @@ class DefaultEnv:
             self.viewer.cam.elevation = -30  # Vertical tilt in degrees
             self.viewer.cam.distance = 2.0  # Distance from camera to target
             self.viewer.cam.lookat = np.array([0, 0, 0.5])  # Point the camera is looking at
-
-            # opt-in: desenha uma nuvem de pontos (depth real) salva em POINTCLOUD_NPZ
-            import os as _os
-            _pcd = _os.environ.get("POINTCLOUD_NPZ")
-            if _pcd and _os.path.exists(_pcd):
-                _d = np.load(_pcd)
-                _P, _C = _d["P"], _d["C"]
-                _n = 0
-                for _i in range(min(len(_P), self.viewer.user_scn.maxgeom)):
-                    _g = self.viewer.user_scn.geoms[_n]
-                    _rgba = np.array([_C[_i][0], _C[_i][1], _C[_i][2], 1.0], np.float32)
-                    mujoco.mjv_initGeom(_g, mujoco.mjtGeom.mjGEOM_SPHERE,
-                                        np.array([0.005, 0, 0]), _P[_i].astype(np.float64),
-                                        np.eye(3).flatten(), _rgba)
-                    _n += 1
-                self.viewer.user_scn.ngeom = _n
-                print(f"[base_sim] nuvem de pontos: {_n} esferas de {_pcd}")
 
         # Note that the actuator order is the same as the joint order in the mujoco model.
         self.body_joint_index = []
@@ -274,23 +257,19 @@ class DefaultEnv:
                         )
                     )
                 else:
-                    q_target = self.unitree_bridge.low_cmd.motor_cmd[i].q
-                    q_current = self.mj_data.qpos[self.body_joint_index[i] + 7 - 1]
-                    dq_target = self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                    dq_current = self.mj_data.qvel[self.body_joint_index[i] + 6 - 1]
-                    kp = self.unitree_bridge.low_cmd.motor_cmd[i].kp
-                    kd = self.unitree_bridge.low_cmd.motor_cmd[i].kd
-                    tau = self.unitree_bridge.low_cmd.motor_cmd[i].tau
-
-                    body_torques[i] = tau + kp * (q_target - q_current) + kd * (dq_target - dq_current)
-
-                    if not hasattr(self, '_torque_debug_counter'):
-                        self._torque_debug_counter = 0
-                    if self._torque_debug_counter % 50 == 0 and i == 0:
-                        print(f"[compute_body_torques] Motor {i}: q_target={q_target:.4f}, q_current={q_current:.4f}, "
-                              f"dq_target={dq_target:.4f}, dq_current={dq_current:.4f}, "
-                              f"kp={kp:.1f}, kd={kd:.1f}, tau={tau:.4f}, torque={body_torques[i]:.4f}")
-                    self._torque_debug_counter = (self._torque_debug_counter + 1) % 1000
+                    body_torques[i] = (
+                        self.unitree_bridge.low_cmd.motor_cmd[i].tau
+                        + self.unitree_bridge.low_cmd.motor_cmd[i].kp
+                        * (
+                            self.unitree_bridge.low_cmd.motor_cmd[i].q
+                            - self.mj_data.qpos[self.body_joint_index[i] + 7 - 1]
+                        )
+                        + self.unitree_bridge.low_cmd.motor_cmd[i].kd
+                        * (
+                            self.unitree_bridge.low_cmd.motor_cmd[i].dq
+                            - self.mj_data.qvel[self.body_joint_index[i] + 6 - 1]
+                        )
+                    )
         return body_torques
 
     def compute_hand_torques(self) -> np.ndarray:
@@ -450,12 +429,6 @@ class DefaultEnv:
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 
-        if not hasattr(self, '_ctrl_debug_counter'):
-            self._ctrl_debug_counter = 0
-        if self._ctrl_debug_counter % 50 == 0:
-            print(f"[step_sim] body_torques[0:3]={body_torques[0:3]}, self.torques[0:3]={self.torques[0:3]}")
-        self._ctrl_debug_counter = (self._ctrl_debug_counter + 1) % 1000
-
         if self.config["FREE_BASE"]:
             self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
         else:
@@ -613,115 +586,6 @@ class DefaultEnv:
 
         return render_caches
 
-    def _cup_addr(self):
-        jid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "junta_livre_bloco")
-        if jid < 0:
-            return None, None
-        return self.mj_model.jnt_qposadr[jid], self.mj_model.jnt_dofadr[jid]
-
-    def _ensure_cup_home(self, a):
-        # home = [x, y, z] e yaw de spawn (do qpos0)
-        if not hasattr(self, "_cup_home"):
-            import math
-            self._cup_home = list(self.mj_model.qpos0[a:a + 3])
-            qw, _, _, qz = self.mj_model.qpos0[a + 3:a + 7]
-            self._cup_yaw = 2.0 * math.atan2(qz, qw)   # yaw do quat de spawn
-
-    def _apply_cup(self):
-        a, dof = self._cup_addr()
-        if a is None:
-            return
-        self._ensure_cup_home(a)
-        import math
-        c, s2 = math.cos(self._cup_yaw / 2), math.sin(self._cup_yaw / 2)
-        self.mj_data.qpos[a:a + 3] = self._cup_home
-        self.mj_data.qpos[a + 3:a + 7] = [c, 0.0, 0.0, s2]   # em pe + yaw
-        self.mj_data.qvel[dof:dof + 6] = 0
-        print(f"[caneca] pos=[{self._cup_home[0]:.3f},{self._cup_home[1]:.3f},{self._cup_home[2]:.3f}] "
-              f"yaw={math.degrees(self._cup_yaw):.0f}deg")
-
-    def reset_cup(self):
-        """Reseta a caneca pra 'home' (X/Y/yaw ajustaveis), SEMPRE em pe e parada."""
-        self._apply_cup()
-
-    def move_cup(self, dx=0.0, dy=0.0, dz=0.0, dyaw=0.0):
-        a, _ = self._cup_addr()
-        if a is None:
-            return
-        self._ensure_cup_home(a)
-        self._cup_home[0] += dx; self._cup_home[1] += dy; self._cup_home[2] += dz
-        self._cup_yaw += dyaw
-        self._apply_cup()
-
-    def set_grip(self, dfrac):
-        """Fecha/abre a mao direita GRADUALMENTE (frac 0=aberta .. 1=fechada)."""
-        if not hasattr(self, "_grip"):
-            self._grip = 0.0
-        self._grip = float(np.clip(self._grip + dfrac, 0.0, 1.0))
-        CLOSE = [0.0, -1.2, -1.2, 1.2, 1.2, 1.2, 1.2]   # fecha menos (pinca, nao curla/escava)
-        b = getattr(self, "unitree_bridge", None)
-        if b is not None and getattr(b, "right_hand_cmd", None) is not None:
-            for i in range(7):
-                if i < len(b.right_hand_cmd.motor_cmd):
-                    b.right_hand_cmd.motor_cmd[i].q = CLOSE[i] * self._grip
-                    b.right_hand_cmd.motor_cmd[i].kp = 35.0   # meio-termo: segura sem ejetar
-                    b.right_hand_cmd.motor_cmd[i].kd = 1.2
-                    b.right_hand_cmd.motor_cmd[i].tau = 0.0
-        print(f"[mao] grip={self._grip:.2f}")
-
-    def dump_state(self):
-        """Captura a pose atual do braco direito + copo num JSON (pra autorar a pega)."""
-        import json as _json
-        RA = ["right_shoulder_pitch_joint", "right_shoulder_roll_joint",
-              "right_shoulder_yaw_joint", "right_elbow_joint",
-              "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"]
-        arm = {}
-        for nm in RA:
-            jid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, nm)
-            if jid >= 0:
-                arm[nm] = float(self.mj_data.qpos[self.mj_model.jnt_qposadr[jid]])
-        a, _ = self._cup_addr()
-        cup = [float(x) for x in self.mj_data.qpos[a:a + 7]] if a is not None else None
-        palm = None
-        pid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "right_hand_palm_link")
-        if pid < 0:
-            pid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "right_hand_middle_1_link")
-        if pid >= 0:
-            palm = [float(x) for x in self.mj_data.xpos[pid]]
-        out = {"arm": arm, "cup_qpos": cup, "hand_world": palm,
-               "grip": getattr(self, "_grip", 0.0)}
-        with open("/tmp/grasp_state.json", "w") as f:
-            _json.dump(out, f, indent=2)
-        print(f"[CAPTURA] salvo /tmp/grasp_state.json | braco={ {k: round(v,3) for k,v in arm.items()} } "
-              f"| copo={[round(x,3) for x in cup[:3]] if cup else None} grip={out['grip']:.2f}")
-
-    def reset_all(self):
-        """Reseta a pose do ROBO e da caneca, e abre a mao."""
-        self.reset()
-        self.reset_cup()
-        self._grip = 0.0
-        self.set_grip(0.0)
-        print("[reset] robo + caneca resetados, mao aberta")
-
-    def viewer_key_callback(self, key):
-        """Faixa elastica (7/8/9) + mover caneca (setas/IJKL) + girar (O/P) + reset (R)."""
-        if self.elastic_band is not None:
-            self.elastic_band.MujuocoKeyCallback(key)
-        s = 0.01
-        # setas: UP=265 (+X), DOWN=264 (-X), LEFT=263 (+Y), RIGHT=262 (-Y); idem I/K/J/L
-        if key in (265, 73):   self.move_cup(dx=+s)
-        elif key in (264, 75): self.move_cup(dx=-s)
-        elif key in (263, 74): self.move_cup(dy=+s)
-        elif key in (262, 76): self.move_cup(dy=-s)
-        elif key == 79:        self.move_cup(dyaw=+0.15)   # O: gira a caneca +
-        elif key == 80:        self.move_cup(dyaw=-0.15)   # P: gira a caneca -
-        elif key == 78:        self.move_cup(dz=+0.005)    # N: sobe a caneca (Z)
-        elif key == 77:        self.move_cup(dz=-0.005)    # M: desce a caneca (Z)
-        elif key == 70:        self.set_grip(+0.1)         # F: fecha a mao um pouco
-        elif key == 71:        self.set_grip(-0.1)         # G: abre a mao um pouco
-        elif key == 84:        self.dump_state()           # T: captura pose do braco+copo
-        elif key in (82, 32):  self.reset_all()             # R ou Espaco: reseta robo + caneca
-
     def handle_keyboard_button(self, key):
         if self.elastic_band is not None:
             self.elastic_band.handle_keyboard_button(key)
@@ -732,20 +596,6 @@ class DefaultEnv:
             self.update_viewer_camera()
         if key in ["up", "down", "left", "right"]:
             self.apply_perturbation(key)
-        # mover a caneca (free joint "junta_livre_bloco"): i/k = X frente/tras, j/l = Y lados
-        if key in ["i", "k", "j", "l"]:
-            try:
-                jid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "junta_livre_bloco")
-                a = self.mj_model.jnt_qposadr[jid]
-                step = 0.01
-                if key == "i": self.mj_data.qpos[a] += step
-                elif key == "k": self.mj_data.qpos[a] -= step
-                elif key == "j": self.mj_data.qpos[a + 1] += step
-                elif key == "l": self.mj_data.qpos[a + 1] -= step
-                self.mj_data.qvel[self.mj_model.jnt_dofadr[jid]:self.mj_model.jnt_dofadr[jid] + 6] = 0
-                print(f"[caneca] pos = [{self.mj_data.qpos[a]:.3f}, {self.mj_data.qpos[a+1]:.3f}, {self.mj_data.qpos[a+2]:.3f}]")
-            except Exception as e:
-                print("erro movendo caneca:", e)
 
     def check_fall(self):
         """Check if the robot has fallen"""
@@ -902,18 +752,6 @@ class BaseSimulator:
     def reset(self):
         """Reset the simulation. Can be overridden by subclasses."""
         self.sim_env.reset()
-
-    # --- delegacao p/ o ambiente: controle do copo via ZMQ (ActionReceiver) ---
-    # Sem isso, ActionReceiver chama self.simulator.reset_cup() e estoura
-    # "'BaseSimulator' object has no attribute 'reset_cup'" (o copo nunca reseta).
-    def reset_cup(self):
-        self.sim_env.reset_cup()
-
-    def move_cup(self, dx=0.0, dy=0.0, dz=0.0, dyaw=0.0):
-        self.sim_env.move_cup(dx, dy, dz, dyaw)
-
-    def reset_all(self):
-        self.sim_env.reset_all()
 
     def close(self):
         """Close the simulation. Can be overridden by subclasses."""
