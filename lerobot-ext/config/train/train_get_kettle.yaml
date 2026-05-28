@@ -208,8 +208,8 @@ steps: 5000
 # BLINDAGEM 3: Batch Size Dinâmico
 # Como usaremos 2 GPUs, o LeRobot multiplica esse número por 2.
 # 32 x 2 GPUs = 64 (Tamanho perfeito para aprender sem decorar o dataset de 4k frames)
-batch_size: 64       
-num_workers: 10
+batch_size: 4       
+num_workers: 2
 log_freq: 200         
 save_freq: 1000      
 save_checkpoint: true
