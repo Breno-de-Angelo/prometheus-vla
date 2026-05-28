@@ -719,14 +719,6 @@ class PI05Pytorch(nn.Module):
         n_samples_for_uncertainty: int = 1,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> tuple[Tensor, float]:
-        """
-        Executa o denoising e retorna (ações, incerteza_estimada).
-
-        n_samples_for_uncertainty > 1: amostra múltiplos ruídos iniciais e
-        usa a variância entre eles como proxy de incerteza do modelo.
-        Custo: n_samples_for_uncertainty × forward passes do suffix (o prefix
-        é computado uma só vez com KV-cache, então o custo é pequeno).
-        """
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -734,35 +726,12 @@ class PI05Pytorch(nn.Module):
         device = tokens.device
         actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
 
-        # ── Prefixo: computado uma vez (KV-cache) ────────────────────────────
+        # ── Prefixo: computado EM CADA DENOISE STEP (sem cache) ────────────────────
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, tokens, masks,
             depth_images=depth_images, pressure_tensor=pressure_tensor,
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        _get_lm(self.paligemma_with_expert.paligemma).config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-        )
-
-        # ---------------------------------------------------------
-        # FIX: Impede que o HuggingFace modifique o cache in-place 
-        # a cada passo do loop de inferência (Bug do DynamicCache).
-        # ---------------------------------------------------------
-        if past_key_values is not None and not isinstance(past_key_values, tuple):
-            if hasattr(past_key_values, "key_cache"):
-                past_key_values = tuple((k, v) for k, v in zip(past_key_values.key_cache, past_key_values.value_cache))
-            elif hasattr(past_key_values, "to_legacy_cache"):
-                past_key_values = past_key_values.to_legacy_cache()
-        # ---------------------------------------------------------
-
+        
         dt = -1.0 / num_steps
 
         # ── Denoising (potencialmente múltiplas amostras) ─────────────────────
@@ -779,87 +748,61 @@ class PI05Pytorch(nn.Module):
                 time = 1.0 + step * dt
                 time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
-                def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                    return self.denoise_step(
-                        prefix_pad_masks=prefix_pad_masks,
-                        past_key_values=past_key_values,
-                        x_t=input_x_t,
-                        timestep=current_timestep,
-                    )
-
-                if self._rtc_enabled():
-                    inference_delay = kwargs.get("inference_delay")
-                    prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                    execution_horizon = kwargs.get("execution_horizon")
-                    v_t = self.rtc_processor.denoise_step(
-                        x_t=x_t,
-                        prev_chunk_left_over=prev_chunk_left_over,
-                        inference_delay=inference_delay,
-                        time=time,
-                        original_denoise_step_partial=denoise_step_partial_call,
-                        execution_horizon=execution_horizon,
-                    )
-                else:
-                    v_t = denoise_step_partial_call(x_t)
+                # ✅ FIX: Passe os prefix embs diretamente (sem cache)
+                v_t = self.denoise_step(
+                    prefix_embs=prefix_embs,
+                    prefix_pad_masks=prefix_pad_masks,
+                    prefix_att_masks=prefix_att_masks,
+                    x_t=x_t,
+                    timestep=time_tensor,
+                )
 
                 x_t = x_t + dt * v_t
-
-                if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                    self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
             all_results.append(x_t)
 
         # ── Incerteza estimada pela variância entre amostras ──────────────────
         if n_runs > 1:
-            stacked = torch.stack(all_results, dim=0)   # [n_runs, B, chunk, action_dim]
+            stacked = torch.stack(all_results, dim=0)
             uncertainty = stacked.std(dim=0).mean().item()
-            actions = stacked.mean(dim=0)               # média das amostras = menos ruído
+            actions = stacked.mean(dim=0)
         else:
             uncertainty = 0.0
             actions = all_results[0]
 
         return actions, uncertainty
 
-    def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
+    def denoise_step(self, prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, timestep):
+        """Denoise sem cache — recomputa prefix cada vez (mais simples, mais seguro)."""
+        
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
-        # ✅ FIX: Recalcula o tamanho real do prefix a cada denoise_step
-        # O cache pode ter tamanho diferente se transformers o redimensionou
-        if past_key_values is not None and len(past_key_values) > 0:
-            first_cache_layer = past_key_values[0]
-            if isinstance(first_cache_layer, tuple) and len(first_cache_layer) >= 1:
-                actual_prefix_len = first_cache_layer[0].shape[-2]
-            else:
-                actual_prefix_len = prefix_len
-        else:
-            actual_prefix_len = prefix_len
+        # ✅ SIMPLES: combina prefix + suffix diretamente
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :actual_prefix_len].expand(batch_size, suffix_len, actual_prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks[:, :actual_prefix_len], dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        _get_lm(self.paligemma_with_expert.paligemma).config._attn_implementation = "eager"
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
 
+        # ✅ Recomputa prefix + suffix em um só forward (sem cache)
         outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
+            attention_mask=att_2d_masks_4d,
             position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            past_key_values=None,  # ← SEM CACHE
+            inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
         )
 
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size:].to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PI05DEPTHPolicy — com neutral position gate e best-val support
