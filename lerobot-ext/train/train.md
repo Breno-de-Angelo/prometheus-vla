@@ -50,7 +50,7 @@ Com a rede neural mutante pronta na memória, o `run_train.py` assume o controle
 4. **Avaliação (Prova Surpresa):** A cada 500 passos, o script pausa o treinamento e puxa o `val_dataset` (episódios 8 e 9 que a IA nunca viu). Ele tenta prever os movimentos e calcula o `val_loss`. Isso é crucial para garantir que a IA está aprendendo a *generalizar* a física do mundo, e não apenas "decorando" as imagens.
 
 ## 5. Resumo do Fluxo de Execução (O que acontece quando você dá o Play)
-1. Você digita: `python init_lerobot_train_v2.py --config_path=config/train/train_push_cup.yaml`
+1. Você digita: `python init_lerobot_train_v3.py --config_path=config/train/train_push_cup.yaml`
 2. O script carrega as ferramentas da versão do LeRobot e localiza o seu dataset no HD.
 3. O PyTorch cria a matriz do ACT básico na GPU.
 4. O `act_d_injector` entra em cena, acopla a PointNet 3D, a rede de Pressão e altera as rotas de conexão interna.

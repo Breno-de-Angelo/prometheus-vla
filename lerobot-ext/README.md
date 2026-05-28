@@ -79,11 +79,11 @@ python run_g1_server.py</code></pre>
 <p>
   Com os servidores rodando, vá para o seu <b>Terminal 3</b>. O comando padrão para iniciar a malha de controle via VR é:
 </p>
-<pre><code>python init_lerobot_teleoparate.py --config_path=config/teleoperate_televuer.yaml --sim</code></pre>
+<pre><code>python init_lerobot_teleoparate_v2.py --config_path=config/teleoperate_televuer.yaml --sim</code></pre>
 
 <h3>Entendendo os Parâmetros:</h3>
 <ul>
-  <li><b><code>init_lerobot_teleoparate.py</code>:</b> Este script atua como um wrapper (envolucro). Ele pré-carrega os módulos customizados (<code>robot.unitree_g1</code> e <code>teleop.unitree_g1</code>) no LeRobot antes de dar a partida.</li>
+  <li><b><code>init_lerobot_teleoparate_v2.py</code>:</b> Este script atua como um wrapper (envolucro). Ele pré-carrega os módulos customizados (<code>robot.unitree_g1</code> e <code>teleop.unitree_g1</code>) no LeRobot antes de dar a partida.</li>
   <li><b><code>--config_path=config/teleoperate_televuer.yaml</code>:</b> Aponta para a configuração estruturada. Neste arquivo, definimos que o robô usa mãos <code>dex3</code> e que a interface de teleoperação será a <code>xr_g1_arm</code> (que integra o headset via Vuer com <code>input_mode: "hand"</code>).</li>
   <li><b><code>--sim</code>:</b> Uma flag customizada de segurança. O script intercepta essa flag e a traduz dinamicamente para <code>--robot.is_simulation=true</code> e <code>--teleop.is_simulation=true</code>. Isso garante que, durante os testes de software, os comandos não enviem torque real para os motores físicos do G1.</li>
 </ul>
