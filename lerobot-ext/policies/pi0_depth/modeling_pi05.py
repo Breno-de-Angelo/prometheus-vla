@@ -293,6 +293,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
 
+<<<<<<< HEAD
         self.paligemma = PaliGemmaForConditionalGeneration(vlm_config_hf)
 
         expert_config_hf = CONFIG_MAPPING["gemma"]()
@@ -312,17 +313,83 @@ class PaliGemmaWithExpertModel(nn.Module):
 
         if freeze_vision_encoder:
             for param in self.paligemma.vision_tower.parameters():
+=======
+        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+        self.gemma_expert.model.embed_tokens = None
+
+        self.to_bfloat16_for_selected_params(precision)
+        self._set_requires_grad()
+
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+        if precision == "bfloat16":
+            self.to(dtype=torch.bfloat16)
+        elif precision == "float32":
+            self.to(dtype=torch.float32)
+            return
+        else:
+            raise ValueError(f"Invalid precision: {precision}")
+
+        params_to_keep_float32 = [
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
+            "input_layernorm",
+            "post_attention_layernorm",
+            "model.norm",
+        ]
+
+        for name, param in self.named_parameters():
+            if any(selector in name for selector in params_to_keep_float32):
+                param.data = param.data.to(dtype=torch.float32)
+
+    def _set_requires_grad(self):
+        if self.freeze_vision_encoder:
+            vision_tower = self.paligemma.vision_tower if hasattr(self.paligemma, "vision_tower") else self.paligemma.model.vision_tower
+            vision_tower.eval()
+            for param in vision_tower.parameters():
+>>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
                 param.requires_grad = False
 
         if train_expert_only:
             for param in self.paligemma.parameters():
                 param.requires_grad = False
 
+<<<<<<< HEAD
     def embed_image(self, image):
         return self.paligemma.get_image_features(pixel_values=image)
 
     def embed_language_tokens(self, tokens):
         return self.paligemma.language_model.get_input_embeddings()(tokens)
+=======
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_vision_encoder:
+            self.paligemma.vision_tower.eval()
+        if self.train_expert_only:
+            self.paligemma.eval()
+
+    def embed_image(self, image: torch.Tensor):
+        # Verifica a versão da arquitetura do PaliGemma (compatibilidade transformers >= 4.52)
+        if hasattr(self.paligemma, "vision_tower"):
+            vision_tower = self.paligemma.vision_tower
+            projector = self.paligemma.multi_modal_projector
+        else:
+            vision_tower = self.paligemma.model.vision_tower
+            projector = self.paligemma.model.multi_modal_projector
+            
+        # 1. Extrai as saídas do encoder de visão
+        vision_outputs = vision_tower(image)
+        image_features = vision_outputs.last_hidden_state
+        
+        # 2. Passa as características pelo projetor multimodal
+        image_features = projector(image_features)
+        
+        return image_features
+
+    def embed_language_tokens(self, tokens: torch.Tensor):
+        return self.paligemma.language_model.embed_tokens(tokens)
+>>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
 
     def forward(
         self,

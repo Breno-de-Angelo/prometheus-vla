@@ -16,19 +16,40 @@
 dataset:
   image_transforms:
     enable: true
-    max_num_transforms: 1
+    max_num_transforms: 1 # Reduzido para 1, pois só usaremos o ColorJitter
     tfs:
       ColorJitter:
         type: ColorJitter
         weight: 1.0
         kwargs:
-          brightness: [0.8, 1.2]
-          contrast: [0.8, 1.2]
-          saturation: [0.5, 1.5]
-          hue: [-0.05, 0.05]
+          brightness: [0.8, 1.2] # Simula ambiente mais claro/escuro
+          contrast: [0.8, 1.2]   # Simula câmera com mais/menos contraste
+          saturation: [0.5, 1.5] # Cores mais vivas ou mais opacas
+          hue: [-0.05, 0.05]     # Leve mudança no tom das cores
+  #image_transforms:
+  #  enable: true
+  #  max_num_transforms: 3
+  #  tfs:
+  #    ColorJitter:
+  #      type: ColorJitter
+  #      weight: 1.0
+  #      kwargs:
+  #        brightness: [0.8, 1.2]
+  #        contrast: [0.8, 1.2]
+  #        saturation: [0.5, 1.5]
+  #        hue: [-0.05, 0.05]
+  #    # BLINDAGEM 1: Translação e Rotação Aleatória
+  #    # Desloca a câmera 5% pros lados e gira 5 graus a cada frame. 
+  #    # Isso impede a IA de decorar a coordenada exata da xícara na tela!
+  #    RandomAffine:
+  #      type: RandomAffine
+  #      weight: 1.0
+  #      kwargs:
+ #         degrees: [-5.0, 5.0]
+ #         translate: [0.05, 0.05]
 
-  repo_id: Mrwlker/pick_up_the_cup_2026-04-30
-  root: meu_dataset/pick_up_the_cup_2026-04-30
+  repo_id: Mrwlker/pick_up_the_cup3
+  root: meu_dataset/pick_up_the_cup3
   episodes: [1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21]
 
 
@@ -36,8 +57,8 @@ dataset:
 # 2. DATASET DE VALIDAÇÃO
 # ==========================================================
 val_dataset:
-  repo_id: Mrwlker/pick_up_the_cup_2026-04-30
-  root: meu_dataset/pick_up_the_cup_2026-04-30
+  repo_id: Mrwlker/pick_up_the_cup3
+  root: meu_dataset/pick_up_the_cup3
   episodes: [7, 9, 18, 19]
 
 
@@ -46,13 +67,14 @@ val_dataset:
 # ==========================================================
 policy:
   type: actdepth
-  repo_id: Mrwlker/pick_up_the_cup_depth
+  repo_id: Mrwlker/ppick_up_the_cup_depth
   push_to_hub: false
 
   input_features:
     observation.images.head_camera:
       type: VISUAL
       shape: [3, 480, 640]
+<<<<<<< HEAD
 
     # Depth: processado pela PointNet, NÃO vai para a ResNet
     observation.images.head_camera_depth:
@@ -71,14 +93,34 @@ policy:
       type: STATE
       shape: [33]
 
+=======
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [3, 480, 640]
+      
+    # CORREÇÃO: Mantido em 28 para bater com o Parquet!
+    observation.state:
+      type: STATE
+      shape: [28] 
+      
+    # Pressões Dex3
+    #observation.left_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+    #observation.right_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+      
+>>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
   output_features:
     action:
       type: ACTION
-      shape: [28]
+      shape: [28] # CORREÇÃO: Mantido em 28 para bater com o Parquet!
 
   chunk_size: 100
   n_action_steps: 100
   n_obs_steps: 1
+<<<<<<< HEAD
   use_amp: true
 
   # ── ACT-D: Nuvem de Pontos 3D ──────────────────────────
@@ -127,10 +169,19 @@ policy:
   vision_backbone: resnet18
   pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
 
+=======
+  use_amp: true 
+  
+  # BLINDAGEM 2: Regularização do Transformer
+  dropout: 0.2              # Padrão é 0.1. Aumentamos para forçar a rede a ignorar ruídos.
+  optimizer_weight_decay: 1e-3 # Pune a rede se ela der pesos gigantescos para um único pixel.
+  kl_weight: 2.0           # Força a distribuição do VAE a ficar mais suave e generalista.
+>>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
 
 # ==========================================================
-# 4. CONFIGURAÇÕES DE TREINAMENTO
+# 4. CONFIGURAÇÕES DE TREINAMENTO (Para 2x A100)
 # ==========================================================
+<<<<<<< HEAD
 output_dir: "train_output/pick_up_the_cup_depth-260512"
 steps: 100000
 
@@ -153,6 +204,19 @@ save_best_checkpoint: true
 # Coloque 0.0 para desabilitar.
 neutral_position_loss_weight: 0.3
 
+=======
+output_dir: "train_output/pick_up_the_cup_depth-260505"
+steps: 1000          
+
+# BLINDAGEM 3: Batch Size Dinâmico
+# Como usaremos 2 GPUs, o LeRobot multiplica esse número por 2.
+# 32 x 2 GPUs = 64 (Tamanho perfeito para aprender sem decorar o dataset de 4k frames)
+batch_size: 128       
+num_workers: 10
+log_freq: 200         
+save_freq: 500      
+save_checkpoint: true
+>>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
 
 # ==========================================================
 # 5. AVALIAÇÃO E LOGS

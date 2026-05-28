@@ -15,16 +15,16 @@ dataset:
           saturation: [0.5, 1.5]
           hue: [-0.05, 0.05]
 
-  repo_id: Mrwlker/pick_up_the_cup_2026-04-30
-  root: meu_dataset/pick_up_the_cup_2026-04-30
+  repo_id: Mrwlker/pick_up_the_cup3
+  root: meu_dataset/pick_up_the_cup3
   episodes: [1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21]
 
 # ==========================================================
 # 2. DATASET DE VALIDAÇÃO
 # ==========================================================
 val_dataset:
-  repo_id: Mrwlker/pick_up_the_cup_2026-04-30
-  root: meu_dataset/pick_up_the_cup_2026-04-30
+  repo_id: Mrwlker/pick_up_the_cup3
+  root: meu_dataset/pick_up_the_cup3
   episodes: [7, 9, 18, 19]
 
 # ==========================================================
@@ -70,19 +70,19 @@ policy:
   # BLINDAGENS CONTRA OVERFITTING (MANTIDAS!)
   dropout: 0.2                 
   optimizer_weight_decay: 1e-3 
-  kl_weight: 1.0              
+  kl_weight: 10.0              
 
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_nodepth-260511"
-steps: 100000       
+output_dir: "train_output/pick_up_the_cup_nodepth-260505"
+steps: 1000          
 
 # O Batch Size menor (32) força a rede a generalizar.
-batch_size: 256       
+batch_size: 32       
 num_workers: 10
 log_freq: 200         
-save_freq: 10000      
+save_freq: 200      
 save_checkpoint: true
 
 # ==========================================================
