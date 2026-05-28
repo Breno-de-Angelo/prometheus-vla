@@ -110,7 +110,7 @@ class CameraViewer:
 
 def main():
     parser = argparse.ArgumentParser(description="Live camera viewer for MuJoCo simulator")
-    parser.add_argument("--host", type=str, default="192.168.123.164", help="Simulator host address")
+    parser.add_argument("--host", type=str, default="localhost", help="Simulator host address")
     parser.add_argument("--port", type=int, default=5555, help="ZMQ port")
     args = parser.parse_args()
     
