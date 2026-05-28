@@ -437,7 +437,7 @@ def main():
                 ).to(device)
 
                 # chave exata que o select_action do PI05 espera
-                batch["observation.language.tokens"] = tokens["input_ids"]
+                batch["observation.language.tokens"] = tokens["input_ids"].bool()
                 batch["observation.language.attention_mask"] = tokens["attention_mask"]
                 batch.pop("task", None)
                 batch.pop("input_ids", None)
