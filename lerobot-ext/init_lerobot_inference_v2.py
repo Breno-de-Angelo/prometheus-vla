@@ -54,46 +54,25 @@ from lerobot.configs.policies import PreTrainedConfig
 # 2. LOADER UNIVERSAL — detecta o tipo pelo config.json do checkpoint
 # ─────────────────────────────────────────────────────────────────────
 def load_policy(checkpoint_dir: str, device: torch.device):
+    """
+    Carrega qualquer política registrada a partir do checkpoint_dir.
+    Detecta o tipo automaticamente via PreTrainedConfig.from_pretrained().
+    Funciona com actdepth, pi05depth, e qualquer outro tipo registrado.
+    """
     print(f"⏳ Carregando política de: {checkpoint_dir}")
 
+    # Lê o config.json e instancia a subclasse correta automaticamente
     config = PreTrainedConfig.from_pretrained(checkpoint_dir)
     policy_type = getattr(config, "type", "desconhecido")
     print(f"   Tipo detectado: {policy_type}")
 
-    from safetensors.torch import load_file
-    import importlib
-
-    # LeRobot 0.4.4: make_policy() exige ds_meta — não serve para inferência.
-    # Instanciamos a classe diretamente a partir da config.
-    _POLICY_CLASS_MAP = {
-        "actdepth":  ("policies.act_depth.modeling_act_depth", "ACTDepthPolicy"),
-        "pi05depth": ("policies.pi0_depth.modeling_pi05",      "PI05DEPTHPolicy"),
-    }
-
-    if policy_type in _POLICY_CLASS_MAP:
-        module_path, class_name = _POLICY_CLASS_MAP[policy_type]
-        module = importlib.import_module(module_path)
-        PolicyClass = getattr(module, class_name)
-        policy = PolicyClass(config)
-        print(f"   Instanciado: {module_path}.{class_name}")
-    else:
-        raise ValueError(f"Tipo '{policy_type}' não mapeado. Adicione em _POLICY_CLASS_MAP.")
-
-    # Carrega os pesos
-    model_file = os.path.join(checkpoint_dir, "model.safetensors")
-    if not os.path.exists(model_file):
-        raise FileNotFoundError(f"model.safetensors não encontrado em {checkpoint_dir}")
-
-    state_dict = load_file(model_file)
-    missing, unexpected = policy.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"   ⚠️  {len(missing)} pesos ausentes (esperado com train_expert_only=True)")
-    if unexpected:
-        print(f"   ⚠️  {len(unexpected)} pesos inesperados")
+    # Instancia a política correta via factory do LeRobot
+    from lerobot.policies.factory import make_policy
+    policy = make_policy(cfg=config, pretrained_path=checkpoint_dir)
 
     policy.eval()
     policy.to(device)
-    print(f"✅ Política '{policy_type}' carregada!")
+    print(f"✅ Política '{policy_type}' carregada com sucesso!")
     return policy, policy_type
 
 
@@ -316,6 +295,8 @@ def main():
     # ── Preprocessor (PI05 precisa de normalização + tokenização) ────
     preprocessor = None
     postprocessor = None
+    if policy_type == "pi05depth":
+        preprocessor, postprocessor = load_pi05_preprocessor(checkpoint_dir, policy)
 
     # ── Câmeras ───────────────────────────────────────────────────────
     stream_client, fake_cap, fake_img_rgb = setup_cameras(
@@ -326,7 +307,6 @@ def main():
     from robot.unitree_g1.unitree_g1_dex3 import UnitreeG1Dex3, UnitreeG1Dex3Config
     print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim})...")
     g1_config = UnitreeG1Dex3Config(
-        #robot_ip="10.9.8.73",
         robot_ip="192.168.123.164",
         control_mode="upper_body",
         is_simulation=is_sim,
@@ -390,55 +370,11 @@ def main():
                 has_depth=has_depth,
                 has_pressure=has_pressure,
             )
-            # 5. Tokenização manual para PI05
-            #    O preprocessor do treino é para dataloader — não use aqui.
-            #    O select_action do PI05 já normaliza internamente.
-            #    Só precisamos garantir a task string no formato correto.
-            # 5. Tokenização manual para PI05
-            if policy_type == "pi05depth":
-                if not hasattr(policy, "_inference_tokenizer"):
-                    from transformers import AutoTokenizer
-                    policy._inference_tokenizer = AutoTokenizer.from_pretrained(
-                        "google/paligemma-3b-pt-224"
-                    )
-                tokenizer = policy._inference_tokenizer
-                task_str = "pick up the cup"
 
-                # Normaliza estado para [-1, 1] antes de discretizar
-                state_raw = batch["observation.state"].squeeze(0).cpu().numpy()
-                stats_path = os.path.join(checkpoint_dir, "dataset_stats.pt")
-                if not hasattr(policy, "_state_stats") and os.path.exists(stats_path):
-                    _stats = torch.load(stats_path, map_location="cpu")
-                    policy._state_stats = _stats.get("observation.state", None)
-
-                if hasattr(policy, "_state_stats") and policy._state_stats is not None:
-                    q01 = policy._state_stats["q01"].numpy()
-                    q99 = policy._state_stats["q99"].numpy()
-                    state_raw = np.clip(
-                        2.0 * (state_raw - q01) / (q99 - q01 + 1e-8) - 1.0,
-                        -1.0, 1.0,
-                    )
-
-                discretized = np.digitize(
-                    state_raw, bins=np.linspace(-1, 1, 257)[:-1]
-                ) - 1
-                state_str = " ".join(map(str, discretized))
-                full_prompt = f"Task: {task_str}, State: {state_str};\nAction: "
-
-                tokens = tokenizer(
-                    full_prompt,
-                    return_tensors="pt",
-                    max_length=200,
-                    padding="max_length",
-                    truncation=True,
-                ).to(device)
-
-                # chave exata que o select_action do PI05 espera
-                batch["observation.language.tokens"] = tokens["input_ids"]
-                batch["observation.language.attention_mask"] = tokens["attention_mask"]
-                batch.pop("task", None)
-                batch.pop("input_ids", None)
-                batch.pop("attention_mask", None)
+            # 5. Preprocessor do PI05 (normalização + tokenização)
+            #    O ACT-D já tem normalização interna no select_action
+            if preprocessor is not None:
+                batch = preprocessor(batch)
 
             # 6. Inferência
             with torch.inference_mode():
@@ -447,6 +383,9 @@ def main():
                 ):
                     action = policy.select_action(batch)
 
+            # 7. Pós-processamento PI05 (desnormaliza)
+            if postprocessor is not None:
+                action = postprocessor(action)
 
             # 8. Executa no robô
             action_numpy = action.squeeze(0).cpu().numpy()
