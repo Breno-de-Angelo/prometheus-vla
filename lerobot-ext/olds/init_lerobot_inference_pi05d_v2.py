@@ -29,9 +29,6 @@ from lerobot.policies.factory import make_pre_post_processors
 # Import pi05-D loader
 from train.inference_pi05_d import load_pi05_d
 
-# Import action sender para modo distribuído
-from action_sender_zmq import ActionSenderZMQ
-
 
 def main():
     # =================================================================
@@ -97,14 +94,6 @@ def main():
         stream_cap_depth = cv2.VideoCapture(depth_url)
         print(f"📡 Conectando ao stream em {cam_robot_ip}:{cam_port}...")
 
-        # Testa conexão
-        ret_rgb, _ = stream_cap_rgb.read()
-        ret_depth, _ = stream_cap_depth.read()
-        if ret_rgb and ret_depth:
-            print(f"✅ CONECTADO! Recebendo streams de {cam_robot_ip}:{cam_port}")
-        else:
-            print(f"⚠️ Tentando conectar... (timeout esperado até Mori publicar)")
-
     # =================================================================
     # LOAD PI05-D POLICY
     # =================================================================
@@ -117,48 +106,27 @@ def main():
     print("✅ PI05-D carregado com sucesso!")
 
     # =================================================================
-    # CONECTAR AO ROBÔ (OU INICIALIZAR ACTION SENDER PARA MODO DISTRIBUÍDO)
+    # CONECTAR AO ROBÔ
     # =================================================================
-    action_sender = None
-    if cam_robot_ip and is_sim:
-        # Modo distribuído: enviar ações via ZMQ para o simulador remoto
-        print(f"⏳ Inicializando action sender para {cam_robot_ip}:6001...")
-        action_sender = ActionSenderZMQ(cam_robot_ip, port=6001, verbose=False)
-        print("✅ Action sender inicializado!")
-        # Não precisa conectar ao robô local
-        robot = None
-    else:
-        # Modo local ou robô real: conectar normalmente
-        print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim})...")
-        g1_config = UnitreeG1Dex3Config(
-            robot_ip="192.168.123.164",
-            control_mode="upper_body",
-            is_simulation=is_sim
-        )
-        robot = UnitreeG1Dex3(g1_config)
-        robot.connect()
-        print("✅ Robô Conectado!")
-
-    # Preparar mapeamento de índices de motores (para modo distribuído)
-    from lerobot.robots.unitree_g1.g1_utils import G1_29_JointArmIndex
-    body_motor_indices = {}
-    for idx, motor_enum in enumerate(G1_29_JointArmIndex):
-        body_motor_indices[motor_enum.name] = idx
+    print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim})...")
+    g1_config = UnitreeG1Dex3Config(
+        robot_ip="192.168.123.164",
+        control_mode="upper_body",
+        is_simulation=is_sim
+    )
+    robot = UnitreeG1Dex3(g1_config)
+    robot.connect()
+    print("✅ Robô Conectado!")
 
     print("\n🚀 INFERÊNCIA PI05-D ATIVA: O Robô irá se mover sozinho!")
     print("📺 Uma janela será aberta para você acompanhar a visão da IA.\n")
 
-    first_frame = True
     try:
         while True:
             start_t = time.perf_counter()
-            if robot:
-                obs = robot.get_observation()
-                if not obs:
-                    continue
-            else:
-                # Modo distribuído: criar obs vazio
-                obs = {}
+            obs = robot.get_observation()
+            if not obs:
+                continue
 
             batch = {}
 
@@ -173,10 +141,6 @@ def main():
             if stream_cap_rgb is not None and stream_cap_depth is not None:
                 ret_rgb, frame_rgb = stream_cap_rgb.read()
                 ret_depth, frame_depth = stream_cap_depth.read()
-
-                if first_frame and (ret_rgb or ret_depth):
-                    print(f"🎬 PRIMEIRA IMAGEM RECEBIDA! Frames chegando de {cam_robot_ip}:{cam_port}")
-                    first_frame = False
 
                 if ret_rgb:
                     obs["head_camera"] = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
@@ -197,14 +161,11 @@ def main():
                     else:
                         img = np.zeros((480, 640, 3), dtype=np.uint8)
 
-                # Exibição (RGB só) - skip se sem display
+                # Exibição (RGB só)
                 if cam_name == "head_camera":
-                    try:
-                        img_bgr_display = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                        cv2.imshow("Visao da IA - Head Camera", img_bgr_display)
-                        cv2.waitKey(1)
-                    except cv2.error:
-                        pass  # Sem display (servidor)
+                    img_bgr_display = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    cv2.imshow("Visao da IA - Head Camera", img_bgr_display)
+                    cv2.waitKey(1)
 
                 img_tensor = torch.from_numpy(img).permute(2, 0, 1).float().to(device) / 255.0
                 batch[f"observation.images.{cam_name}"] = img_tensor.unsqueeze(0)
@@ -247,12 +208,7 @@ def main():
                 valores_formatados = " | ".join([f"{v:.2f}" for v in action_dict.values()])
                 print(f"\r🤖 IA -> [{valores_formatados}]", end="", flush=True)
 
-            if action_sender:
-                # Modo distribuído: enviar via ZMQ (apenas corpo, sem mãos por enquanto)
-                action_sender.send_action(action_dict, body_motor_indices=body_motor_indices)
-            elif robot:
-                # Modo local: enviar ao robô local
-                robot.send_action(action_dict)
+            robot.send_action(action_dict)
 
             # 50Hz
             elapsed = time.perf_counter() - start_t
@@ -265,14 +221,8 @@ def main():
             stream_cap_rgb.release()
         if stream_cap_depth is not None:
             stream_cap_depth.release()
-        if action_sender:
-            action_sender.close()
-        if robot:
-            robot.disconnect()
-        try:
-            cv2.destroyAllWindows()
-        except cv2.error:
-            pass
+        robot.disconnect()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

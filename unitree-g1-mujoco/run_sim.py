@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import yaml
 from sim.simulator_factory import SimulatorFactory, init_channel
-from sim.action_receiver import ActionReceiver
 
 def main(n_envs=1, use_async_envs: bool = False, 
              publish_images=True, camera_port=5555, cameras=None, **kwargs):
@@ -45,11 +44,7 @@ def main(n_envs=1, use_async_envs: bool = False,
         offscreen=enable_offscreen,
         camera_configs=camera_configs,
     )
-
-    # Start action receiver (para receber ações do Atenas)
-    action_receiver = ActionReceiver(sim, port=6001, verbose=True)
-    action_receiver.start()
-
+    
     # Start simulator
     print("\nSimulator running. Press Ctrl+C to exit.")
     if enable_offscreen and publish_images:
@@ -68,7 +63,6 @@ def main(n_envs=1, use_async_envs: bool = False,
         print(f"++++error in simulator: {e} ++++")
     finally:
         print("++++closing simulator ++++")
-        action_receiver.stop()
         sim.close()
 
 if __name__ == "__main__":
