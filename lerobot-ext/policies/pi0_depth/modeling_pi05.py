@@ -752,6 +752,17 @@ class PI05Pytorch(nn.Module):
             use_cache=True,
         )
 
+        # ---------------------------------------------------------
+        # FIX: Impede que o HuggingFace modifique o cache in-place 
+        # a cada passo do loop de inferência (Bug do DynamicCache).
+        # ---------------------------------------------------------
+        if past_key_values is not None and not isinstance(past_key_values, tuple):
+            if hasattr(past_key_values, "key_cache"):
+                past_key_values = tuple((k, v) for k, v in zip(past_key_values.key_cache, past_key_values.value_cache))
+            elif hasattr(past_key_values, "to_legacy_cache"):
+                past_key_values = past_key_values.to_legacy_cache()
+        # ---------------------------------------------------------
+
         dt = -1.0 / num_steps
 
         # ── Denoising (potencialmente múltiplas amostras) ─────────────────────

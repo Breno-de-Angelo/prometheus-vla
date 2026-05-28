@@ -431,7 +431,8 @@ def main():
                 tokens = tokenizer(
                     full_prompt,
                     return_tensors="pt",
-                    padding=False,
+                    max_length=200,
+                    padding="max_length",
                     truncation=True,
                 ).to(device)
 
