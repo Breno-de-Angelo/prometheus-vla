@@ -134,9 +134,9 @@ policy:
 output_dir: "train_output/pick_up_the_cup_depth-260512"
 steps: 100000
 
-batch_size: 128
-num_workers: 10
-log_freq: 25
+batch_size: 4
+num_workers: 2
+log_freq: 100
 save_freq: 10000
 save_checkpoint: false
 
@@ -157,7 +157,7 @@ neutral_position_loss_weight: 0.3
 # ==========================================================
 # 5. AVALIAÇÃO E LOGS
 # ==========================================================
-eval_freq: 50
+eval_freq: 100
 
 wandb:
   enable: true

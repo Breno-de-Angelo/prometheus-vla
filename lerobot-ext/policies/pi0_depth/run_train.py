@@ -671,10 +671,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:
-                        wandb_log_dict.update({
-                            k: v for k, v in output_dict.items()
-                            if not isinstance(v, list)
-                        })
+                        wandb_log_dict.update(output_dict)
                     if rabc_weights is not None:
                         rabc_stats = rabc_weights.get_stats()
                         wandb_log_dict.update({
