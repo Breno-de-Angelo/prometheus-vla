@@ -333,6 +333,16 @@ class ChannelSubscriber:
         if self.topic == "rt/lowstate":
             if _lowstate_sock is None:
                 raise RuntimeError("ChannelFactoryInitialize must be called first")
+            try:
+                payload = _lowstate_sock.recv(zmq.NOBLOCK)  # ← não trava mais
+                msg_dict = json.loads(payload.decode("utf-8"))
+                return LowStateMsg(msg_dict.get("data", {}))
+            except zmq.Again:
+                return None  # sem dados ainda, tenta de novo no próximo ciclo
+
+        """ if self.topic == "rt/lowstate":
+            if _lowstate_sock is None:
+                raise RuntimeError("ChannelFactoryInitialize must be called first")
             payload = _lowstate_sock.recv()
             msg_dict = json.loads(payload.decode("utf-8"))
             return LowStateMsg(msg_dict.get("data", {}))
@@ -342,5 +352,5 @@ class ChannelSubscriber:
         elif self.topic == kTopicDex3RightState:
             with _hand_state_lock:
                 return _right_hand_state
-        return None
+        return None """
 
