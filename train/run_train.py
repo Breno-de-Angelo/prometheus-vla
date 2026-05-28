@@ -47,6 +47,7 @@ from lerobot.configs.train import TrainPipelineConfig, DatasetConfig
 @dataclasses.dataclass
 class CustomTrainPipelineConfig(TrainPipelineConfig):
     val_dataset: DatasetConfig | None = None
+    max_val_batches: int | None = None
     depth_fusion: bool = True
     # "full" = PointNet (depth) + pressure_proj (tactile)  [pi05-D, default]
     # "depth_only" = PointNet only                         [pi05-depth ablation]
@@ -56,6 +57,12 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     #   CALVIN       -> "observation.depths.static"
     #   LIBERO+depth -> "observation.images.image_depth"
     depth_key: str = "observation.images.head_camera_depth"
+    # Multiplier applied to depth values to obtain meters. Default 2.0 matches
+    # cup3 (ZMQ server normalizes depth to [0,1], so 2.0 maps to [0,2m]).
+    # Override per dataset:
+    #   CALVIN       -> 1.0  (already in meters, float32 native)
+    #   LIBERO+depth -> 1.0  (verify per source — robosuite emits NDC by default)
+    depth_scale: float = 2.0
 
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
@@ -267,6 +274,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 device=_device,
                 load_injected_from=injected_ckpt,
                 depth_key=cfg.depth_key,
+                depth_scale=cfg.depth_scale,
             )
         elif cfg.fusion_mode == "full":
             from train.pi05_d_injector import inject_pi05_d
@@ -509,7 +517,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             val_metrics = {} 
             
             with torch.no_grad():
-                for val_batch in val_dataloader:
+                for i, val_batch in enumerate(val_dataloader):
+                    if cfg.max_val_batches is not None and i >= cfg.max_val_batches:
+                        break
                     val_batch = preprocessor(val_batch)
                     with accelerator.autocast():
                         val_loss, val_output_dict = policy.forward(val_batch)

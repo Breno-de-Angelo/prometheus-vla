@@ -1,0 +1,42 @@
+# pi05 droid on CALVIN ABC (depth dataset, but ignoring depth).
+# Run pareado com pi05_calvin_vanilla (lcad232) — mesma config exceto pretrained_path.
+# Init: s3y/pi05_droid_pytorch (Franka DROID priors). CALVIN também é Franka 7-DoF,
+# então action dims batem perfeitamente.
+
+dataset:
+  repo_id: "local/calvin_abc_lerobot_depth"
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+val_dataset:
+  repo_id: "local/calvin_abc_lerobot_depth"
+
+output_dir: "/home/hercules/prometheus-vla/train/output/pi05_calvin_droid"
+job_name: "pi05_calvin_droid"
+
+policy:
+  type: pi05
+  pretrained_path: s3y/pi05_droid_pytorch
+  compile_model: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  freeze_vision_encoder: false
+  train_expert_only: true
+  push_to_hub: false
+
+depth_fusion: false
+
+log_freq: 50
+eval_freq: 2000
+max_val_batches: 200
+save_freq: 2000
+batch_size: 4
+steps: 30000
+seed: 1000
+num_workers: 4
+
+wandb:
+  enable: true
+  project: lerobot
