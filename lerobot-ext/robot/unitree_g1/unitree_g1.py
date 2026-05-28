@@ -226,8 +226,6 @@ class UnitreeG1(Robot):
             
             # Chamamos a sua função passando a lista de câmeras exigida!
             self.sim_env = make_local_env(cameras=lista_de_cameras)
-
-            import time
             time.sleep(3.0)
             
             # --- FIM DA MODIFICAÇÃO ---

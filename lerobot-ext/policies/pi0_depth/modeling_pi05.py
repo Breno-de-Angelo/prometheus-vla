@@ -62,6 +62,68 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _get_lm(paligemma):
+    """Compatibilidade entre versões do transformers.
+    4.46.x: PaliGemmaForConditionalGeneration
+              .model (PaliGemmaModel)
+                .language_model (GemmaModel)   ← aqui
+    4.49+ : PaliGemmaForConditionalGeneration
+              .language_model (GemmaModel)     ← direto
+    """
+    # Tenta direto no objeto (4.49+)
+    lm = getattr(paligemma, "language_model", None)
+    if lm is not None:
+        return lm
+    # Tenta via .model (4.46.x)
+    inner = getattr(paligemma, "model", None)
+    if inner is not None:
+        lm = getattr(inner, "language_model", None)
+        if lm is not None:
+            return lm
+    raise RuntimeError(
+        f"_get_lm: não encontrei language_model em {type(paligemma)}. "
+        f"Sub-módulos: {[n for n, _ in paligemma.named_children()]}"
+    )
+
+
+def _get_vision_tower(paligemma):
+    """Retorna o vision encoder independente da versão do transformers.
+    4.46.x: paligemma.model.vision_tower
+    4.49+ : paligemma.vision_tower
+    """
+    vt = getattr(paligemma, "vision_tower", None)
+    if vt is not None:
+        return vt
+    inner = getattr(paligemma, "model", None)
+    if inner is not None:
+        vt = getattr(inner, "vision_tower", None)
+        if vt is not None:
+            return vt
+    raise RuntimeError(
+        f"_get_vision_tower: não encontrei vision_tower em {type(paligemma)}. "
+        f"Sub-módulos: {[n for n, _ in paligemma.named_children()]}"
+    )
+
+
+def _get_projector(paligemma):
+    """Retorna o multi_modal_projector independente da versão do transformers.
+    4.46.x: paligemma.model.multi_modal_projector
+    4.49+ : paligemma.multi_modal_projector
+    """
+    proj = getattr(paligemma, "multi_modal_projector", None)
+    if proj is not None:
+        return proj
+    inner = getattr(paligemma, "model", None)
+    if inner is not None:
+        proj = getattr(inner, "multi_modal_projector", None)
+        if proj is not None:
+            return proj
+    raise RuntimeError(
+        f"_get_projector: não encontrei multi_modal_projector em {type(paligemma)}. "
+        f"Sub-módulos: {[n for n, _ in paligemma.named_children()]}"
+    )
+
+
 def get_safe_dtype(target_dtype, device_type):
     if device_type == "mps" and target_dtype == torch.float64:
         return torch.float32
@@ -169,7 +231,7 @@ def resize_with_pad_torch(
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
 ):
-    models = [paligemma.language_model, gemma_expert.model]
+    models = [_get_lm(paligemma), gemma_expert.model]
     query_states = []
     key_states = []
     value_states = []
@@ -200,21 +262,21 @@ def compute_layer_complete(
         dtype=query_states.dtype,
     )
 
-    cos, sin = paligemma.language_model.rotary_emb(dummy_tensor, position_ids)
+    cos, sin = _get_lm(paligemma).rotary_emb(dummy_tensor, position_ids)
     query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
 
     batch_size = query_states.shape[0]
-    scaling = paligemma.language_model.layers[layer_idx].self_attn.scaling
+    scaling = _get_lm(paligemma).layers[layer_idx].self_attn.scaling
 
     att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.language_model.layers[layer_idx].self_attn,
+        _get_lm(paligemma).layers[layer_idx].self_attn,
         query_states, key_states, value_states,
         attention_mask, scaling,
     )
 
-    head_dim = paligemma.language_model.layers[layer_idx].self_attn.head_dim
+    head_dim = _get_lm(paligemma).layers[layer_idx].self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
 
     outputs_embeds = []
@@ -293,85 +355,49 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
 
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        self.gemma_expert.model.embed_tokens = None
+        self.paligemma = PaliGemmaForConditionalGeneration(vlm_config_hf)
 
-        self.to_bfloat16_for_selected_params(precision)
-        self._set_requires_grad()
+        expert_config_hf = CONFIG_MAPPING["gemma"]()
+        expert_config_hf.hidden_size = action_expert_config.width
+        expert_config_hf.intermediate_size = action_expert_config.mlp_dim
+        expert_config_hf.num_attention_heads = action_expert_config.num_heads
+        expert_config_hf.head_dim = action_expert_config.head_dim
+        expert_config_hf.num_hidden_layers = action_expert_config.depth
+        expert_config_hf.num_key_value_heads = action_expert_config.num_kv_heads
+        expert_config_hf.hidden_activation = "gelu_pytorch_tanh"
+        expert_config_hf.torch_dtype = "float32"
+        expert_config_hf.vocab_size = 257152
+        expert_config_hf.use_adarms = use_adarms[1]
+        expert_config_hf.adarms_cond_dim = action_expert_config.width if use_adarms[1] else None
 
-    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
-        if precision == "bfloat16":
-            self.to(dtype=torch.bfloat16)
-        elif precision == "float32":
-            self.to(dtype=torch.float32)
-            return
-        else:
-            raise ValueError(f"Invalid precision: {precision}")
+        self.gemma_expert = GemmaForCausalLM(expert_config_hf)
 
-        params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
-            "input_layernorm",
-            "post_attention_layernorm",
-            "model.norm",
-        ]
-
-        for name, param in self.named_parameters():
-            if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
-
-    def _set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            vision_tower = self.paligemma.vision_tower if hasattr(self.paligemma, "vision_tower") else self.paligemma.model.vision_tower
-            vision_tower.eval()
-            for param in vision_tower.parameters():
+        if freeze_vision_encoder:
+            for param in _get_vision_tower(self.paligemma).parameters():
                 param.requires_grad = False
 
         if train_expert_only:
             for param in self.paligemma.parameters():
                 param.requires_grad = False
 
-<<<<<<< HEAD
     def embed_image(self, image):
-        return self.paligemma.get_image_features(pixel_values=image)
+        # Passo 1: vision encoder → [B, num_patches, 1152]
+        vision_out = _get_vision_tower(self.paligemma)(pixel_values=image, output_hidden_states=False)
+        if isinstance(vision_out, torch.Tensor):
+            vision_feats = vision_out
+        elif hasattr(vision_out, "last_hidden_state"):
+            vision_feats = vision_out.last_hidden_state
+        elif hasattr(vision_out, "pooler_output"):
+            vision_feats = vision_out.pooler_output
+        else:
+            raise RuntimeError(f"embed_image: tipo inesperado do vision encoder: {type(vision_out)}")
+
+        # Passo 2: projeta para o espaço do LM → [B, num_patches, lm_hidden_size]
+        vision_feats = _get_projector(self.paligemma)(vision_feats)
+        return vision_feats
 
     def embed_language_tokens(self, tokens):
-        return self.paligemma.language_model.get_input_embeddings()(tokens)
-=======
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.freeze_vision_encoder:
-            self.paligemma.vision_tower.eval()
-        if self.train_expert_only:
-            self.paligemma.eval()
-
-    def embed_image(self, image: torch.Tensor):
-<<<<<<< HEAD
-        # Verifica a versão da arquitetura do PaliGemma (compatibilidade transformers >= 4.52)
-        if hasattr(self.paligemma, "vision_tower"):
-            vision_tower = self.paligemma.vision_tower
-            projector = self.paligemma.multi_modal_projector
-        else:
-            vision_tower = self.paligemma.model.vision_tower
-            projector = self.paligemma.model.multi_modal_projector
-            
-        # 1. Extrai as saídas do encoder de visão
-        vision_outputs = vision_tower(image)
-        image_features = vision_outputs.last_hidden_state
-        
-        # 2. Passa as características pelo projetor multimodal
-        image_features = projector(image_features)
-        
-        return image_features
-=======
-        return self.paligemma.model.get_image_features(image)
->>>>>>> parent of 5c07ebd... ajsute pi05depth
-
-    def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.language_model.embed_tokens(tokens)
->>>>>>> parent of 02c119c... ajsute do yaml de treinamento e ajuste no pi05
+        return _get_lm(self.paligemma).get_input_embeddings()(tokens)
 
     def forward(
         self,
@@ -385,7 +411,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.language_model.forward(
+            prefix_output = _get_lm(self.paligemma).forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -409,7 +435,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
-            models = [self.paligemma.language_model, self.gemma_expert.model]
+            models = [_get_lm(self.paligemma), self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
             use_gradient_checkpointing = (
@@ -504,14 +530,14 @@ class PI05Pytorch(nn.Module):
 
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        _get_lm(self.paligemma_with_expert.paligemma).gradient_checkpointing = True
+        _get_vision_tower(self.paligemma_with_expert.paligemma).gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        _get_lm(self.paligemma_with_expert.paligemma).gradient_checkpointing = False
+        _get_vision_tower(self.paligemma_with_expert.paligemma).gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
     def _rtc_enabled(self):
@@ -633,15 +659,10 @@ class PI05Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-<<<<<<< HEAD
     def forward(
         self, images, img_masks, tokens, masks, actions,
         noise=None, time=None, depth_images=None, pressure_tensor=None
     ) -> Tensor:
-=======
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None, depth_images=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
->>>>>>> parent of 5c07ebd... ajsute pi05depth
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
         if time is None:
@@ -652,17 +673,13 @@ class PI05Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-<<<<<<< HEAD
             images, img_masks, tokens, masks,
             depth_images=depth_images, pressure_tensor=pressure_tensor,
-=======
-            images, img_masks, tokens, masks, depth_images=depth_images
->>>>>>> parent of 5c07ebd... ajsute pi05depth
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            _get_lm(self.paligemma_with_expert.paligemma).layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
@@ -725,7 +742,7 @@ class PI05Pytorch(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        _get_lm(self.paligemma_with_expert.paligemma).config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
