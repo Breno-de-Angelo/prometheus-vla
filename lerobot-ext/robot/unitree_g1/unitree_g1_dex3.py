@@ -77,6 +77,12 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
             self.control_mode = "high_level"
         else:
             self.control_mode = "upper_body"
+
+        if self.is_simulation and not self.remote_sim_ip:
+            self.robot_ip = "127.0.0.1"   # só local
+        elif self.remote_sim_ip:
+            self.robot_ip = self.remote_sim_ip  # aponta câmeras ZMQ para o PC remoto
+        # else: mantém robot_ip do hardware real
         
 
         # LÓGICA DE RESOLUÇÃO DINÂMICA

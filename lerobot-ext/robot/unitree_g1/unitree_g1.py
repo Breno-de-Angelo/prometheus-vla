@@ -204,33 +204,28 @@ class UnitreeG1(Robot):
         self._ChannelSubscriber = ChannelSubscriber
 
         # Initialize DDS channel and simulation environment
-        if self.config.is_simulation:
-            # Como o seu env.py já inicializa o canal internamente, 
-            # podemos só chamar a função principal dele.
-            
-            # --- INÍCIO DA MODIFICAÇÃO PARA USAR SEU SIMULADOR LOCAL ---
-            import sys
-            import os
-            
+        if self.config.is_simulation and not self.config.remote_sim_ip:
+            # ── Simulação LOCAL (comportamento original) ──────────────────
+            import sys, os
             local_sim_path = os.path.expanduser("../unitree-g1-mujoco")
             if local_sim_path not in sys.path:
                 sys.path.append(local_sim_path)
-            
-            # Importamos a função criadora do seu env.py (renomeamos para não dar conflito)
             from env import make_env as make_local_env
-            
             lista_de_cameras = list(self.config.cameras.keys())
-
             if "head_camera_depth" not in lista_de_cameras:
                 lista_de_cameras.append("head_camera_depth")
-            
-            # Chamamos a sua função passando a lista de câmeras exigida!
             self.sim_env = make_local_env(cameras=lista_de_cameras)
             time.sleep(3.0)
-            
-            # --- FIM DA MODIFICAÇÃO ---
+
+        elif self.config.remote_sim_ip:
+            # ── Simulação REMOTA: MuJoCo roda no PC do Miguel ─────────────
+            # Não sobe nada localmente. Apenas aponta o DDS para o IP remoto.
+            self.config.robot_ip = self.config.remote_sim_ip
+            self._ChannelFactoryInitialize(0, self.config.remote_sim_ip)
+            print(f"🌐 Modo simulação remota: conectando ao MuJoCo em {self.config.remote_sim_ip}")
 
         else:
+            # ── Robô real ─────────────────────────────────────────────────
             self._ChannelFactoryInitialize(0)
 
         # Initialize direct motor control interface
