@@ -369,7 +369,16 @@ def main():
             start_t = time.perf_counter()
 
             # 1. Observação do robô
-            obs = robot.get_observation()
+            try:
+                obs = robot.get_observation()
+            except TimeoutError as e:
+                print(f"⚠️  Timeout de câmera (rede lenta): {e}")
+                print("   Tentando com timeout maior...")
+                # Aumenta o timeout para 500ms
+                for cam in robot.cameras.values():
+                    if hasattr(cam, 'timeout_ms'):
+                        cam.timeout_ms = 500
+                obs = robot.get_observation()
             if not obs:
                 continue
 
