@@ -1,423 +1,310 @@
-# Manual de Treinamento — Políticas de Imitação com Flow Matching
+# Tutorial: Como Funciona a Validação no PI05-Depth
 
-> Guia completo: treino, validação e deploy.
+> Documento baseado no código `run_train.py` + `modeling_pi05.py` do projeto Prometheus G1.
+> Mapa de juntas extraído de `info.json` do dataset `pick_up_the_cup_2026-04-30`.
 
 ---
 
-## 1. Visão Geral do Processo
+## 1. Visão Geral
 
-O treinamento de uma política de imitação consiste em ensinar um modelo a reproduzir trajetórias demonstradas por um operador humano. A cada intervalo configurável de steps, o loop de treino pausa para executar uma etapa de validação nos episódios reservados — episódios que o modelo **nunca viu** durante o aprendizado.
+Durante o treinamento, a cada `eval_freq` steps (configurado como `100` no YAML), o loop
+principal pausa e roda a **validação**. O objetivo é medir como o modelo está generalizando
+para episódios que ele **nunca viu durante o treino**.
 
 ```
-Treino (steps 1..N)
+Treino (steps 1..5000)
     │
-    ├── a cada eval_freq steps  → Validação
-    │       ├── Forward pass sem gradiente nos eps. de validação
+    ├── a cada 100 steps → Validação
+    │       ├── Passa o val_dataset pelo modelo (sem gradiente)
     │       ├── Calcula val_loss por batch
-    │       ├── Loga métricas (WandB, CSV, etc.)
+    │       ├── Loga loss_per_dim/0..27 no WandB
     │       └── Se val_loss < melhor até agora → salva best_val_checkpoint
     │
-    └── a cada save_freq steps  → Checkpoint periódico
+    └── a cada 1000 steps → Checkpoint periódico (se save_checkpoint: true)
 ```
-
-> **Regra de ouro:** sempre use o `best_val_checkpoint` para deploy no ambiente real, nunca o checkpoint periódico mais recente.
 
 ---
 
-## 2. Divisão dos Datasets
-
-Os episódios coletados devem ser divididos em dois conjuntos independentes:
-
-| Conjunto | Papel | Proporção recomendada |
-|---|---|---|
-| `dataset` (treino) | O modelo vê e aprende. Gradientes são calculados sobre esses episódios. | ~80% dos episódios |
-| `val_dataset` (validação) | O modelo **nunca vê** durante o treino. Serve como prova de generalização. | ~20% dos episódios |
-
-Exemplo de configuração YAML:
+## 2. Datasets: Treino vs Validação
 
 ```yaml
-dataset:
-  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # 17 eps
+dataset:       # TREINO — o modelo vê e aprende
+  episodes: [1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21]  # 17 episódios
 
-val_dataset:
-  episodes: [17, 18, 19, 20]  # 4 eps — nunca vistos no treino
+val_dataset:   # VALIDAÇÃO — o modelo nunca vê durante o treino
+  episodes: [7, 9, 18, 19]                                                   # 4 episódios
 ```
 
-> **Por que separar?** Se o modelo fosse validado nos mesmos episódios de treino, poderia estar apenas memorizando trajetórias. Os episódios de validação revelam se o modelo realmente generalizou.
+Os 4 episódios de validação são a "prova real" — se o modelo acerta neles, provavelmente
+vai funcionar no robô físico também.
+
+> **Por que separar?** Se você validasse nos mesmos episódios de treino, o modelo poderia
+> estar apenas memorizando as trajetórias e pareceria ótimo sem realmente aprender.
 
 ---
 
-## 3. O Loop de Validação
-
-A cada `eval_freq` steps, o código executa o seguinte ciclo:
+## 3. O Loop de Validação no Código
 
 ```python
+# run_train.py — simplificado para entendimento
 if is_eval_step and val_dataloader is not None:
 
-    policy.eval()          # Desliga dropout — modo inferência
+    policy.eval()         # Desliga dropout, coloca modelo em modo inferência
 
-    with torch.no_grad():  # Sem cálculo de gradiente
+    with torch.no_grad(): # Não calcula gradientes — só forward pass
         for val_batch in val_dataloader:
-            val_batch = preprocessor(val_batch)  # Normaliza, tokeniza
-            val_loss, output = policy.forward(val_batch)
-            val_loss_meter.update(val_loss.item())
 
-    policy.train()         # Volta para modo treino
+            val_batch = preprocessor(val_batch)   # Normaliza, tokeniza, etc.
+
+            with accelerator.autocast():           # Precisão mista (bfloat16)
+                val_loss, val_output_dict = policy.forward(val_batch)
+
+            val_loss_meter.update(val_loss.item()) # Agrega o loss
+
+    policy.train()        # Volta para modo treino
 ```
 
 Pontos importantes:
-
-- `torch.no_grad()` — nenhum gradiente é calculado; mais rápido e sem custo extra de memória.
-- `policy.eval()` → `policy.train()` — garante comportamento idêntico ao da inferência real no ambiente de deploy.
-- O `preprocessor` é o **mesmo** do treino — as mesmas normalizações são aplicadas em ambos os conjuntos.
-
----
-
-## 4. O que é o val_loss
-
-O `val_loss` é o **MSE (Mean Squared Error) do Flow Matching** calculado sobre os episódios de validação. O Flow Matching aprende um campo vetorial que transforma ruído em ação de forma progressiva.
-
-### Como o loss é calculado
-
-| Passo | Operação | Dimensão típica |
-|---|---|---|
-| 1 | Pega a ação real do dataset: `actions` | `[B, chunk_size, action_dim]` |
-| 2 | Gera ruído aleatório: `noise` | `[B, chunk_size, action_dim]` |
-| 3 | Mistura com timestep t: `x_t = t × noise + (1−t) × actions` | `[B, chunk_size, action_dim]` |
-| 4 | Modelo prediz o campo: `v_t_pred = modelo(x_t, t, imagem, estado)` | `[B, chunk_size, action_dim]` |
-| 5 | Campo real: `v_t_real = noise − actions` | `[B, chunk_size, action_dim]` |
-| 6 | `Loss = MSE(v_t_pred, v_t_real)` — média sobre batch, chunk e dims | escalar |
-
-### Interpretação dos valores
-
-| val_loss | Significado | Fase típica |
-|---|---|---|
-| > 2.0 | Modelo ainda aleatório ou início do treino | Steps iniciais (< 5% do total) |
-| 1.0 – 2.0 | Convergindo — aprendizado ativo | Primeira metade do treino |
-| 0.4 – 1.0 | Bom aprendizado — generalização razoável | Metade final do treino |
-| < 0.4 | Excelente generalização para o número de demos | Fim do treino / mais dados |
-| `train_loss` << `val_loss` (fator > 5×) | Overfitting — use `best_val_checkpoint` | Qualquer momento |
-
-> A diferença entre `train_loss` e `val_loss` é natural. Um fator de até 5× é aceitável. Acima disso, o modelo provavelmente memorizou as demonstrações de treino sem generalizar.
+- `torch.no_grad()` — nenhum gradiente é calculado, mais rápido e sem custo de memória extra
+- `policy.eval()` → `policy.train()` — garante comportamento igual à inferência real no robô
+- O `preprocessor` é o **mesmo** do treino — as mesmas normalizações são aplicadas
 
 ---
 
-## 5. loss_per_dim — Diagnóstico por Dimensão
+## 4. O que é o `val_loss`
 
-Além do `val_loss` global, o código loga o loss separado por cada dimensão da ação. Isso permite identificar exatamente qual junta ou grau de liberdade está dificultando o aprendizado.
+O `val_loss` é o **MSE (Mean Squared Error) do Flow Matching** calculado nos episódios de
+validação. O Flow Matching aprende um "campo vetorial" que transforma ruído em ação.
+
+### Como o loss é calculado:
+
+```
+1. Pega a ação real do dataset:  actions  [B, chunk_size=50, action_dim=28]
+2. Gera ruído aleatório:         noise    [B, 50, 28]
+3. Mistura com timestep t:       x_t = t * noise + (1-t) * actions
+4. Modelo prediz o campo:        v_t_pred = modelo(x_t, t, imagem, estado)
+5. Campo real é:                 v_t_real = noise - actions
+6. Loss = MSE(v_t_pred, v_t_real)   ← média sobre batch, chunk e dimensões
+```
+
+### Interpretação dos valores — baseada no seu treino real:
+
+| val_loss | O que significa | Quando aconteceu |
+|---|---|---|
+| 2.482 | Início — modelo ainda aleatório | step 100 |
+| 1.169 | Convergindo rápido | step 200 |
+| 0.449 | Bom aprendizado | step 1700 — 1º recorde duradouro |
+| 0.383 | Melhor resultado do treino | step 5000 — checkpoint final |
+| train_loss = 0.046 | Modelo memorizou os demos | step 5000 |
+
+> A diferença entre `train_loss=0.046` e `val_loss=0.383` (fator ~8×) indica overfitting
+> leve nas juntas do braço — o modelo memorizou as trajetórias dos 17 demos mas não
+> generalizou completamente para os 4 episódios de validação.
+
+---
+
+## 5. `loss_per_dim` — O Diagnóstico por Junta
+
+O código loga o loss **separado por cada uma das 28 dimensões da ação**. Isso permite
+saber exatamente qual junta está errando.
 
 ```python
-loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu()
+# modeling_pi05.py
+loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu()  # média sobre batch e chunk
 loss_dict = {
-    f"loss_per_dim/{i}": v.item()
-    for i, v in enumerate(loss_per_dim)
+    f"loss_per_dim/{i}": v.item() for i, v in enumerate(loss_per_dim)
 }
 ```
 
-### Como interpretar
+---
 
-- **Loss muito alto (> 2×) em relação às outras dimensões** — aquele grau de liberdade tem alta variância entre demonstrações ou é geometricamente sensível à posição inicial.
-- **Loss baixo (< 0.1)** — movimentos simples, repetitivos ou de pequena amplitude que o modelo aprendeu facilmente.
-- **Todas as dimensões com loss similar e alto** — o problema é global: possivelmente dados insuficientes ou learning rate inadequado.
+## 6. Mapa Completo das 28 Dimensões — Unitree G1 Dex3
 
-### Metas por tipo de dimensão
+Extraído do `info.json` do dataset `pick_up_the_cup_2026-04-30`:
 
-| Tipo de dimensão | Meta de loss_per_dim | Observação |
-|---|---|---|
-| Dedos / preensão | < 0.15 | Movimentos simples e repetitivos — fácil de aprender |
-| Punho (pitch, roll) | < 1.0 | Moderado — sensível à posição da peça |
-| Ombro (pitch, roll) | < 1.0 | Difícil — sensível à posição inicial do robô |
-| Rotações axiais (yaw) | < 1.5 | O mais difícil — pequenas variações entre demos geram loss alto |
+```
+┌─────┬──────────────────────────────┬──────────────────────────────────────┐
+│ dim │ Nome no dataset              │ Descrição                            │
+├─────┼──────────────────────────────┼──────────────────────────────────────┤
+│  0  │ kLeftShoulderPitch.q         │ Ombro ESQ — elevação frente/trás     │
+│  1  │ kLeftShoulderRoll.q          │ Ombro ESQ — abdução lateral          │
+│  2  │ kLeftShoulderYaw.q           │ Ombro ESQ — rotação axial            │
+│  3  │ kLeftElbow.q                 │ Cotovelo ESQ — flexão/extensão       │
+│  4  │ kLeftWristRoll.q             │ Punho ESQ — rotação (pronação/sup.)  │
+│  5  │ kLeftWristPitch.q            │ Punho ESQ — flexão dorsal/palmar     │
+│  6  │ kLeftWristyaw.q              │ Punho ESQ — desvio ulnar/radial      │
+├─────┼──────────────────────────────┼──────────────────────────────────────┤
+│  7  │ kRightShoulderPitch.q        │ Ombro DIR — elevação frente/trás     │
+│  8  │ kRightShoulderRoll.q         │ Ombro DIR — abdução lateral          │
+│  9  │ kRightShoulderYaw.q          │ Ombro DIR — rotação axial            │
+│ 10  │ kRightElbow.q                │ Cotovelo DIR — flexão/extensão       │
+│ 11  │ kRightWristRoll.q            │ Punho DIR — rotação (pronação/sup.)  │
+│ 12  │ kRightWristPitch.q           │ Punho DIR — flexão dorsal/palmar     │
+│ 13  │ kRightWristYaw.q             │ Punho DIR — desvio ulnar/radial      │
+├─────┼──────────────────────────────┼──────────────────────────────────────┤
+│ 14  │ left_hand_thumb_0_joint.q    │ Polegar ESQ — articulação base       │
+│ 15  │ left_hand_thumb_1_joint.q    │ Polegar ESQ — articulação média      │
+│ 16  │ left_hand_thumb_2_joint.q    │ Polegar ESQ — articulação ponta      │
+│ 17  │ left_hand_middle_0_joint.q   │ Dedo médio ESQ — articulação base    │
+│ 18  │ left_hand_middle_1_joint.q   │ Dedo médio ESQ — articulação ponta   │
+│ 19  │ left_hand_index_0_joint.q    │ Indicador ESQ — articulação base     │
+│ 20  │ left_hand_index_1_joint.q    │ Indicador ESQ — articulação ponta    │
+├─────┼──────────────────────────────┼──────────────────────────────────────┤
+│ 21  │ right_hand_thumb_0_joint.q   │ Polegar DIR — articulação base       │
+│ 22  │ right_hand_thumb_1_joint.q   │ Polegar DIR — articulação média      │
+│ 23  │ right_hand_thumb_2_joint.q   │ Polegar DIR — articulação ponta      │
+│ 24  │ right_hand_index_0_joint.q   │ Indicador DIR — articulação base     │
+│ 25  │ right_hand_index_1_joint.q   │ Indicador DIR — articulação ponta    │
+│ 26  │ right_hand_middle_0_joint.q  │ Dedo médio DIR — articulação base    │
+│ 27  │ right_hand_middle_1_joint.q  │ Dedo médio DIR — articulação ponta   │
+└─────┴──────────────────────────────┴──────────────────────────────────────┘
+```
 
 ---
 
-## 6. Best-Val Checkpoint
+## 7. Leitura Real dos Logs — Step 5000 (resultado final)
 
-O `BestValTracker` monitora o `val_loss` a cada validação e salva automaticamente quando um novo mínimo é atingido:
+```
+dim/ 0  kLeftShoulderPitch   1.354  ← ombro ESQ elevação — ainda errando
+dim/ 1  kLeftShoulderRoll    0.444  ← ombro ESQ lateral — ok
+dim/ 2  kLeftShoulderYaw     2.077  ← ombro ESQ rotação — PIOR DO BRAÇO ESQ
+dim/ 3  kLeftElbow           0.292  ← cotovelo ESQ — ok
+dim/ 4  kLeftWristRoll       1.881  ← punho ESQ rotação — alto
+dim/ 5  kLeftWristPitch      1.531  ← punho ESQ flexão — alto
+dim/ 6  kLeftWristyaw        0.013  ← punho ESQ lateral — quase perfeito
+──────────────────────────────────────────────────────────────────────────
+dim/ 7  kRightShoulderPitch  0.409  ← ombro DIR — ok (braço passivo)
+dim/ 8  kRightShoulderRoll   0.537  ← ombro DIR — ok
+dim/ 9  kRightShoulderYaw    0.160  ← ok
+dim/10  kRightElbow          0.215  ← ok
+dim/11  kRightWristRoll      0.473  ← ok
+dim/12  kRightWristPitch     0.258  ← ok
+dim/13  kRightWristYaw       0.304  ← ok
+──────────────────────────────────────────────────────────────────────────
+dim/14  left_hand_thumb_0    0.016  ✅ polegar ESQ — quase perfeito
+dim/15  left_hand_thumb_1    0.013  ✅
+dim/16  left_hand_thumb_2    0.012  ✅
+dim/17  left_hand_middle_0   0.012  ✅ dedo médio ESQ
+dim/18  left_hand_middle_1   0.014  ✅
+dim/19  left_hand_index_0    0.013  ✅ indicador ESQ
+dim/20  left_hand_index_1    0.013  ✅
+──────────────────────────────────────────────────────────────────────────
+dim/21  right_hand_thumb_0   0.011  ✅ polegar DIR — quase perfeito
+dim/22  right_hand_thumb_1   0.112  ✅
+dim/23  right_hand_thumb_2   0.107  ✅
+dim/24  right_hand_index_0   0.113  ✅ indicador DIR
+dim/25  right_hand_index_1   0.112  ✅
+dim/26  right_hand_middle_0  0.110  ✅ dedo médio DIR
+dim/27  right_hand_middle_1  0.113  ✅
+```
+
+### Conclusão do padrão:
+
+O modelo aprendeu perfeitamente **como fechar a mão** para pegar a caneca (dims 14–27
+todos abaixo de 0.12). O erro restante está concentrado nas **juntas de rotação do ombro
+e punho esquerdos** (dims 0, 2, 4, 5) — as juntas que controlam *como o braço chega* até
+a caneca, não *como a mão a segura*.
+
+Isso faz sentido física e geometricamente: a rotação axial do ombro (`kLeftShoulderYaw`)
+é a junta mais sensível a pequenas variações na posição inicial do robô e na posição da
+caneca. Com 17 demos, pequenas inconsistências entre episódios se traduzem em erro alto
+nessas dimensões.
+
+---
+
+## 8. Evolução do Treino — Resumo Cronológico
+
+```
+step  100 │ val=2.482 │ dim/2=13.0  dim/5=12.1 │ Início, tudo alto
+step  200 │ val=1.169 │ dim/2= 4.9  dim/5= 3.8 │ Queda rápida (-53%)
+step 1700 │ val=0.449 │ dim/2= 2.5  dim/5= 1.9 │ 🏆 Primeiro recorde duradouro
+step 2000 │ val=0.497 │ dim/2= 2.7  dim/5= 2.3 │ Plateau — braço travou
+step 4800 │ val=0.386 │ —                       │ 🏆 Novo recorde (decay do LR)
+step 5000 │ val=0.383 │ dim/2= 2.1  dim/5= 1.5 │ 🏆 Final — melhor checkpoint
+          │           │                         │
+train_loss│    0.046  │ ← fator 8× abaixo do val│ Overfitting leve no braço ESQ
+```
+
+O plateau entre steps 1700–4800 foi quebrado pelo **cosine decay do learning rate**
+(`scheduler_decay_steps=4500`), que forçou o otimizador a fazer ajustes mais finos
+nos últimos 1000 steps.
+
+---
+
+## 9. Best-Val Checkpoint
+
+O `BestValTracker` monitora automaticamente e salva quando bate recorde:
 
 ```python
+# run_train.py
 class BestValTracker:
-    def update(self, val_loss, step):
+    def update(self, val_loss, step, ...):
         if val_loss >= self.best_val_loss:
             return False   # Não melhorou, não salva
         self.best_val_loss = val_loss
-        save_checkpoint(output_dir / "best_val_checkpoint", ...)
+        save_checkpoint(self.output_dir / "best_val_checkpoint", ...)
         return True
 ```
 
-### Estrutura de saída
-
 ```
-train_output/<nome_do_experimento>/
-├── best_val_checkpoint/        ← USE ESTE para deploy
-│   ├── pretrained_model/
-│   │   └── model.safetensors   ← pesos do melhor step
-│   └── best_val_meta.txt       ← best_val_loss e best_step
-│
-└── checkpoints/                ← checkpoints periódicos (não usar)
+train_output/pick_up_the_cup_pi05_depth/
+└── best_val_checkpoint/          ← USE ESTE para deploy no robô
+    ├── pretrained/
+    │   └── model.safetensors     ← pesos do step 5000 (val_loss=0.383)
+    └── best_val_meta.txt         ← best_val_loss=0.383, best_step=5000
 ```
 
+> **Regra:** sempre use o `best_val_checkpoint` para deploy, nunca o último checkpoint
+> periódico. O último pode ter sofrido overfitting — o melhor generalizou mais.
+
 ---
 
-## 7. Evolução Típica do Treino
+## 10. O que Acompanhar no WandB
 
-| Step / % | val_loss típico | O que está acontecendo |
+Com `wandb.enable: true` e `project: prometheus_g1`, tudo é logado automaticamente.
+
+### Curvas principais:
+
+**`val_loss` vs `loss` (treino):**
+- Ambos devem cair juntos no início
+- Se `val_loss` para de cair enquanto `loss` continua → overfitting → use `best_val_checkpoint`
+
+**Juntas críticas a monitorar no seu caso:**
+
+| Chave WandB | Junta | Meta para funcionar no robô |
 |---|---|---|
-| 5% | 1.5 – 3.0 | Início — modelo ainda aleatório, queda rápida esperada |
-| 10% | 0.8 – 1.5 | Convergência acelerada — maior ganho por step |
-| 30–40% | 0.4 – 0.8 | Primeiro patamar — modelo aprendeu os padrões principais |
-| 50–80% | plateau | Estabilização — cosine decay do LR quebra o plateau nos últimos steps |
-| 100% | mínimo do treino | Melhor generalização — salvo como `best_val_checkpoint` |
+| `val/loss_per_dim/2` | kLeftShoulderYaw | < 1.0 |
+| `val/loss_per_dim/4` | kLeftWristRoll | < 1.0 |
+| `val/loss_per_dim/5` | kLeftWristPitch | < 1.0 |
+| `val/loss_per_dim/0` | kLeftShoulderPitch | < 0.8 |
 
-> O cosine decay do learning rate (parâmetro `scheduler_decay_steps`) costuma ser decisivo para superar plateaus na segunda metade do treino.
+Se após mais demos esses valores caírem abaixo de 1.0, o robô provavelmente vai conseguir
+posicionar o braço consistentemente acima da caneca antes de fechar a mão.
 
 ---
 
-## 8. Configurações que Afetam a Validação
+## 11. Configurações que Afetam a Validação
 
-| Parâmetro YAML | Efeito | Valor típico |
+```yaml
+eval_freq: 100        # Valida a cada 100 steps (~45s por validação)
+                      # 50 validações em 5000 steps = ~37 min gastos em validação
+
+val_dataset:
+  episodes: [7, 9, 18, 19]   # 4 episódios — mínimo funcional
+                              # Ideal: 20% do total (com 50 demos → 10 de val)
+
+save_best_checkpoint: true    # Salva automaticamente no melhor val_loss
+```
+
+---
+
+## 12. Sinais de Alerta
+
+| Sinal no log | Significado | Ação |
 |---|---|---|
-| `eval_freq` | Frequência de validação em steps | 100 – 500 |
-| `val_dataset.episodes` | Episódios reservados para validação | ~20% do total |
-| `save_best_checkpoint` | Salva automaticamente no melhor val_loss | `true` |
-| `scheduler_decay_steps` | Steps para cosine decay do LR | 80–90% do total de steps |
-| `training_steps` | Total de steps de treino | Depende do dataset |
-
----
-
-## 9. Monitoramento das Métricas
-
-Com WandB ou outro logger ativado, as seguintes curvas devem ser acompanhadas:
-
-### Curvas principais
-
-- **`val_loss` vs `loss` (treino):** ambos devem cair juntos no início. Se o `val_loss` para enquanto o `train_loss` continua caindo → overfitting.
-- **`loss_per_dim/N`:** monitorar as dimensões com loss mais alto. Se não caem após mais dados, o problema é de consistência nas demonstrações.
-- **`grad_norm`:** gradiente explodindo (> 50 repetidamente) indica necessidade de reduzir o learning rate.
-
----
-
-## 10. Sinais de Alerta
-
-| Sinal no log | Significado | Ação recomendada |
-|---|---|---|
-| `val_loss` nunca cai abaixo de 1.0 | Modelo não está aprendendo | Verificar LR, arquitetura e preprocessor |
-| `val_loss` sobe após um recorde | Overfitting — usar `best_val_checkpoint` | Parar treino ou coletar mais dados |
-| `dim/N` > 2.0 no final | Dataset insuficiente para aquela dimensão | Gravar mais demos com posição consistente |
-| 🏆 para de aparecer | Plateau — modelo convergiu para o limite dos dados | Normal após ~60–80% dos steps com poucos demos |
+| `val_loss` nunca cai abaixo de 1.0 | Modelo não está aprendendo | Verificar LR, `train_expert_only` |
+| `val_loss` sobe após um recorde | Overfitting — use `best_val_checkpoint` | Parar ou coletar mais dados |
+| `dim/2` > 2.0 no step 5000 | Dataset insuficiente para `kLeftShoulderYaw` | Gravar mais demos com braço consistente |
+| `🏆` para de aparecer | Plateau — modelo convergiu para o limite dos dados | Normal após step 3000–4000 com 17 demos |
 | `grad_norm` > 50 repetidamente | Gradiente explodindo | Reduzir `optimizer_lr` |
 | `train_loss` / `val_loss` > 5× | Overfitting forte | Reduzir steps ou coletar mais dados |
-
----
-
-## 11. Recomendações para Melhorar o Desempenho
-
-### Se o val_loss está alto globalmente
-
-- Coletar mais demonstrações, especialmente em posições iniciais variadas.
-- Verificar se o preprocessor (normalização) está sendo aplicado corretamente tanto no treino quanto na validação.
-- Checar se os episódios de validação são representativos da variedade do dataset.
-
-### Se o val_loss está alto em dimensões específicas
-
-- Regravar demonstrações com maior atenção à consistência do movimento naquelas dimensões.
-- Verificar se há ruído ou inconsistência no sensor daquela junta.
-- Considerar aumentar o `chunk_size` para dar mais contexto temporal ao modelo.
-
-### Se train_loss e val_loss divergem muito (overfitting)
-
-- Aumentar o número de episódios de validação (meta: 20% do total).
-- Adicionar mais demonstrações de treino.
-- Reduzir `training_steps` ou confiar no `best_val_checkpoint` como critério de parada.
-
-> Com poucos demos (< 20 episódios), algum overfitting é esperado e aceitável. O `best_val_checkpoint` mitiga isso ao garantir que os pesos usados no deploy sejam os que melhor generalizaram.
-
----
-
-## 12. Referência Completa do YAML de Configuração
-
-Esta seção descreve cada campo disponível no arquivo de configuração de treinamento.
-
----
-
-### 12.1 Dataset de Treinamento (`dataset`)
-
-```yaml
-dataset:
-  repo_id: <usuario>/<nome-do-dataset>   # ID do dataset no HuggingFace Hub
-  root: <caminho/local>                  # Caminho local onde o dataset está salvo
-  episodes: [0, 1, 2, ...]              # Lista de episódios usados no treino
-```
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `repo_id` | string | Identificador do dataset no HuggingFace Hub (`usuario/nome`). Usado para download automático se o dataset não estiver em `root`. |
-| `root` | string | Caminho local onde o dataset está ou será salvo. Se o diretório não existir, o sistema faz download a partir de `repo_id`. |
-| `episodes` | lista de int | Índices dos episódios usados **exclusivamente** no treino. O modelo calcula gradientes sobre esses episódios. Recomendado: ~80% do total. |
-
----
-
-### 12.2 Dataset de Validação (`val_dataset`)
-
-```yaml
-val_dataset:
-  repo_id: <usuario>/<nome-do-dataset>
-  root: <caminho/local>
-  episodes: [17, 18, 19, 20]
-```
-
-Mesmos campos que `dataset`. Os episódios listados aqui **nunca** são vistos durante o treino — servem exclusivamente para medir generalização.
-
-> Recomendado: ~20% do total de episódios. Com menos de 3 episódios de validação, o `val_loss` pode ser ruidoso demais para ser confiável.
-
----
-
-### 12.3 Política (`policy`)
-
-#### Identificação e repositório
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `type` | string | Tipo da política. Deve corresponder a um tipo registrado no sistema (ex: `pi05depth`, `actdepth`). |
-| `repo_id` | string | Repositório HuggingFace de onde os pesos base são carregados para fine-tuning. |
-| `push_to_hub` | bool | Se `true`, faz upload do checkpoint final para o `repo_id` ao término do treino. |
-
-#### Modelos base (backbone)
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `paligemma_variant` | string | Variante do modelo de linguagem/visão principal. Ex: `"gemma_2b"`. Controla tamanho e capacidade do VLM. |
-| `action_expert_variant` | string | Variante do modelo especialista em ações. Ex: `"gemma_300m"`. Modelo menor que processa estado e gera ações. |
-| `image_resolution` | `[H, W]` | Resolução para a qual as imagens são redimensionadas antes de entrar no VLM. Ex: `[224, 224]`. |
-| `max_state_dim` | int | Dimensão máxima do vetor de estado. Deve ser igual ao número de juntas/sensores no vetor de observação. |
-| `max_action_dim` | int | Dimensão máxima do vetor de ação. Deve ser igual ao número de juntas controladas. |
-
-#### Entradas opcionais
-
-| Campo | Tipo | Padrão | Descrição |
-|---|---|---|---|
-| `use_depth_3d` | bool | `false` | Ativa o uso de imagem de profundidade como entrada adicional. Requer que `observation.images.<nome>_depth` esteja em `input_features`. |
-| `use_pressure` | bool | `false` | Ativa o uso de sensores de pressão/tato como entrada adicional. Requer que `observation.<lado>_hand_pressure` esteja em `input_features`. |
-
-> `use_depth_3d` e `use_pressure` devem ser consistentes com os campos comentados/descomentados em `input_features`. O sistema valida isso no `__post_init__`.
-
-#### Scene Uncertainty Gate
-
-| Campo | Tipo | Padrão | Descrição |
-|---|---|---|---|
-| `scene_uncertainty_threshold` | float | `0.0` | Limiar de incerteza para o gate. Se `0.0`, o gate está desligado. Valores típicos: `0.05` (conservador) a `0.10` (permissivo). |
-| `n_samples_uncertainty` | int | `1` | Número de denoising passes com ruídos diferentes para estimar a incerteza. Auto-ajustado para `3` se `threshold > 0`. Aumentar para `5` dá estimativas mais precisas com custo maior. |
-
-**Como funciona o gate (Flow Matching):** diferente de arquiteturas VAE (que têm `log_sigma` grátis), o Flow Matching estima incerteza rodando `n_samples_uncertainty` passes com ruídos iniciais diferentes. O prefixo VLM é computado **uma vez** com KV-cache; apenas o modelo expert roda N vezes. Com `n=3` o custo extra é moderado.
-
-```
-threshold = 0.0  → gate desligado (baseline, sem overhead)
-threshold = 0.10 → ativa retorno à posição neutra em alta incerteza
-threshold = 0.05 → mais conservador, retorna com mais frequência
-```
-
-#### Features de entrada (`input_features`)
-
-Cada entrada é declarada com `type` e `shape`:
-
-```yaml
-input_features:
-  observation.images.head_camera:
-    type: VISUAL
-    shape: [3, 480, 640]       # [canais, altura, largura]
-
-  observation.state:
-    type: STATE
-    shape: [28]                # número de dimensões do estado
-
-  # Descomente para ativar depth (junto com use_depth_3d: true):
-  # observation.images.head_camera_depth:
-  #   type: VISUAL
-  #   shape: [3, 480, 640]
-
-  # Descomente para ativar pressão (junto com use_pressure: true):
-  # observation.left_hand_pressure:
-  #   type: STATE
-  #   shape: [33]
-  # observation.right_hand_pressure:
-  #   type: STATE
-  #   shape: [33]
-```
-
-| Tipo | Quando usar |
-|---|---|
-| `VISUAL` | Imagens RGB ou depth (tensores `[C, H, W]`) |
-| `STATE` | Vetores numéricos: posições de juntas, sensores de pressão, etc. |
-
-#### Features de saída (`output_features`)
-
-```yaml
-output_features:
-  action:
-    type: ACTION
-    shape: [28]    # deve ser igual a max_action_dim
-```
-
-#### Temporalidade
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `chunk_size` | int | Tamanho do chunk de ações previsto por inferência. O modelo prediz `chunk_size` passos de ação de uma vez. Valores maiores dão mais contexto temporal mas aumentam o custo. |
-| `n_action_steps` | int | Quantos passos do chunk são efetivamente executados no robô antes de uma nova inferência. Geralmente igual a `chunk_size`. |
-| `n_obs_steps` | int | Quantos frames de observação são passados como contexto. `1` = só o frame atual. |
-
-#### Hiperparâmetros do otimizador e scheduler
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `optimizer_lr` | float | Learning rate do otimizador AdamW. Valores típicos: `1e-5` a `1e-4`. Reduzir se `grad_norm` explodir. |
-| `optimizer_weight_decay` | float | Penalidade L2 nos pesos. Ajuda a evitar overfitting. Típico: `0.01`. |
-| `scheduler_warmup_steps` | int | Steps de warmup linear do LR (de 0 até `optimizer_lr`). Típico: 2–5% do total de steps. |
-| `scheduler_decay_steps` | int | Steps totais para o cosine decay do LR. Deve ser próximo do total de `steps` de treino para o decay completar no fim. |
-
-#### Fine-tuning seletivo
-
-| Campo | Tipo | Padrão | Descrição |
-|---|---|---|---|
-| `train_expert_only` | bool | `false` | Se `true`, congela o VLM principal (PaliGemma) e treina apenas o modelo expert de ações. Recomendado para datasets pequenos — reduz drasticamente o risco de overfitting e acelera o treino. |
-| `freeze_vision_encoder` | bool | `false` | Se `true`, congela o encoder de visão (ViT). Use junto com `train_expert_only: true` para máximo controle de quais partes são treinadas. |
-
-> Com poucos demos (< 50 episódios), use `train_expert_only: true` e `freeze_vision_encoder: true`. O VLM já tem capacidade visual pré-treinada; o que precisa aprender é o mapeamento visão→ação específico da tarefa.
-
----
-
-### 12.4 Configurações de Treinamento
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `output_dir` | string | Diretório onde checkpoints, logs e o `best_val_checkpoint` serão salvos. |
-| `steps` | int | Número total de steps de gradiente. Um "step" = um batch processado com atualização de pesos. |
-| `batch_size` | int | Número de amostras por step. Valores maiores são mais estáveis mas exigem mais VRAM. |
-| `num_workers` | int | Workers do DataLoader para carregamento paralelo de dados. `0` = carregamento no processo principal (mais seguro em ambientes com multiprocessing instável). |
-| `log_freq` | int | Frequência (em steps) com que métricas de treino são logadas. |
-| `save_freq` | int | Frequência (em steps) para salvar checkpoints periódicos. |
-| `save_checkpoint` | bool | Se `false`, desativa os checkpoints periódicos (só `best_val_checkpoint` é salvo). |
-| `save_best_checkpoint` | bool | Se `true`, ativa o `BestValTracker` — salva automaticamente sempre que `val_loss` bater recorde. **Recomendado: `true` para qualquer treino de produção.** |
-| `neutral_position_loss_weight` | float | Peso do loss de curriculum de posição neutra. `0.0` = desligado. Valores entre `0.1` e `0.3` ensinam o modelo a retornar à posição neutra quando incerto. Requer que `neutral_position` esteja configurado. |
-
----
-
-### 12.5 Avaliação e Logs
-
-| Campo | Tipo | Descrição |
-|---|---|---|
-| `eval_freq` | int | Frequência (em steps) para rodar a validação completa no `val_dataset`. |
-| `wandb.enable` | bool | Ativa integração com Weights & Biases para logging em tempo real. |
-| `wandb.project` | string | Nome do projeto no WandB onde as runs serão agrupadas. |
-
----
-
-### 12.6 Diferença do Uncertainty Gate: Flow Matching vs VAE
-
-| Aspecto | VAE (ex: ACT) | Flow Matching (ex: PI05) |
-|---|---|---|
-| **Fonte da incerteza** | `log_sigma` do encoder VAE | Variância entre N denoising passes |
-| **Custo** | Zero — já computado no forward pass | N × forward pass do modelo expert |
-| **Otimização** | N/A | Prefixo VLM computado 1× com KV-cache |
-| **Parâmetro** | `scene_uncertainty_threshold` | `scene_uncertainty_threshold` + `n_samples_uncertainty` |
-| **Recomendação** | Pode ativar desde o início | Ativar só após treino básico convergir |
