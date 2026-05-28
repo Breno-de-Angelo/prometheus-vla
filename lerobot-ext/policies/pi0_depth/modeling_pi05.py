@@ -749,7 +749,7 @@ class PI05Pytorch(nn.Module):
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+            use_cache=False,
         )
 
         # ---------------------------------------------------------
@@ -827,15 +827,26 @@ class PI05Pytorch(nn.Module):
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        # ✅ FIX: Recalcula o tamanho real do prefix a cada denoise_step
+        # O cache pode ter tamanho diferente se transformers o redimensionou
+        if past_key_values is not None and len(past_key_values) > 0:
+            first_cache_layer = past_key_values[0]
+            if isinstance(first_cache_layer, tuple) and len(first_cache_layer) >= 1:
+                actual_prefix_len = first_cache_layer[0].shape[-2]
+            else:
+                actual_prefix_len = prefix_len
+        else:
+            actual_prefix_len = prefix_len
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :actual_prefix_len].expand(batch_size, suffix_len, actual_prefix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        prefix_offsets = torch.sum(prefix_pad_masks[:, :actual_prefix_len], dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
