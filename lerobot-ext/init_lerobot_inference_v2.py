@@ -290,6 +290,8 @@ def main():
         elif arg == "--v":
             show_video = True
             print("[INFO]: Visualização de câmera ativada (--v)")
+        elif arg.startswith("--remote-sim="):
+            remote_sim_ip = arg.split("=", 1)[1]
 
     if checkpoint_dir is None:
         print("❌ ERRO: --checkpoint obrigatório.")
@@ -330,6 +332,7 @@ def main():
         robot_ip="192.168.123.164",
         control_mode="upper_body",
         is_simulation=is_sim,
+        remote_sim_ip=remote_sim_ip,
     )
     robot = UnitreeG1Dex3(g1_config)
     robot.connect()
