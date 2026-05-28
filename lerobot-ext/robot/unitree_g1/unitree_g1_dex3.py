@@ -65,8 +65,8 @@ class HandState:
 @dataclass
 class UnitreeG1Dex3Config(UnitreeG1Config):
     """Configuration for Unitree G1 with Dex3-1 hands."""
-    hand_kp: float = 0.8  # Position gain for hand motors
-    hand_kd: float = 0.2  # Damping gain for hand motors
+    hand_kp: float = 0.5  # Position gain for hand motors
+    hand_kd: float = 0.15  # Damping gain for hand motors
     hand_control_dt: float = 0.005  # 100 Hz control loop
 
     use_loco: bool = False  # False = Low Level (Suporte), True = High Level (Andando)

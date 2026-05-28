@@ -66,7 +66,8 @@ class UnitreeG1Config(RobotConfig):
     remote_sim_ip: str = ""
 
     # Socket config for ZMQ bridge
-    robot_ip: str = "192.168.123.164"  # default G1 IP
+    #robot_ip: str = "192.168.123.164"  # default G1 IP
+    robot_ip: str = "10.9.8.73"  # default G1 IP
 
 
     # Cameras (ZMQ-based remote cameras)
