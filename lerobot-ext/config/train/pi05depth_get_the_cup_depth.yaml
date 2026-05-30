@@ -37,7 +37,7 @@ val_dataset:
 # ==========================================================
 policy:
   type: pi05depth
-  repo_id: Mrwlker/pick_up_the_cup_pi05_depth
+  repo_id: Mrwlker/pick_up_the_cup_pi05_depth_20260529
   push_to_hub: false
 
   # ── Modelos base ────────────────────────────────────────
@@ -52,7 +52,7 @@ policy:
   use_depth_3d: true
 
   # ── ACT-D: Tato / Pressão ──────────────────────────────
-  use_pressure: true
+  use_pressure: false
 
   # ── Scene Uncertainty Gate ──────────────────────────────
   # O PI05 estima incerteza rodando n_samples_uncertainty
@@ -85,12 +85,12 @@ policy:
       shape: [28]
 
     # Pressão: descomente E mude use_pressure para true para ativar
-    observation.left_hand_pressure:
-      type: STATE
-      shape: [33]
-    observation.right_hand_pressure:
-      type: STATE
-      shape: [33]
+    #observation.left_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+    #observation.right_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
 
   output_features:
     action:
@@ -104,12 +104,12 @@ policy:
   # ── Hiperparâmetros Flow Matching ───────────────────────
   optimizer_lr: 5e-5
   optimizer_weight_decay: 0.01
-  scheduler_warmup_steps: 200
-  scheduler_decay_steps: 4800
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 40000
 
 
 
-  train_expert_only: true        # ← ADICIONE ISSO
+  train_expert_only: false        # ← ADICIONE ISSO
   freeze_vision_encoder: true    # ← E ISSO
 
   # Com isso: 3B → ~300M parâmetros treináveis
@@ -119,10 +119,10 @@ policy:
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_pi05_depth"
-steps: 5000
+output_dir: "train_output/pick_up_the_cup_pi05_depth_20260529"
+steps: 100000
 
-batch_size: 4
+batch_size: 8
 num_workers: 0
 log_freq: 100
 save_freq: 1000
