@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import struct
 import threading
@@ -31,15 +32,17 @@ from .g1_utils import G1_29_JointIndex, G1_29_JointArmIndex
 
 from lerobot.robots.robot import Robot
 from .config_unitree_g1 import UnitreeG1Config
-#from .utils.motion_switcher import MotionSwitcher, MotionSwitcherClient
-#from .utils.robot_arm import G1_29_ArmController
 
 logger = logging.getLogger(__name__)
 
 # DDS topic names follow Unitree SDK naming conventions
 # ruff: noqa: N816
-kTopicLowCommand_Debug = "rt/lowcmd"
-kTopicLowState = "rt/lowstate"
+kTopicLowCommand_Debug  = "rt/lowcmd"
+kTopicLowCommand_Motion = "rt/arm_sdk"  # High Level / Loco (WBC)
+kTopicLowState          = "rt/lowstate"
+
+# Porta ZMQ onde o servidor anuncia o modo ativo ("loco" ou "debug")
+_STATUS_PORT = 6004
 
 
 @dataclass
@@ -70,7 +73,7 @@ class G1_29_LowState:  # noqa: N801
 
 class UnitreeG1(Robot):
     config_class = UnitreeG1Config
-    name = "unitree_g1_loco"
+    name = "unitree_g1_ext"
 
     # unitree remote controller
     class RemoteController:
@@ -118,6 +121,35 @@ class UnitreeG1(Robot):
         self.last_action_q = {}
         self.smoothing_alpha = 0.1  # Ajuste entre 0.05 (muito suave) e 0.3 (mais responsivo)
 
+    def _query_server_mode(self, robot_ip: str, timeout: float = 5.0) -> str:
+        """
+        Conecta na porta 6004 do servidor ZMQ e lê o modo ativo ("loco" ou "debug").
+        Aguarda até `timeout` segundos. Se não receber resposta, assume "debug" por segurança.
+        """
+        import zmq
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        sock.connect(f"tcp://{robot_ip}:{_STATUS_PORT}")
+        try:
+            payload = sock.recv()
+            msg = json.loads(payload.decode("utf-8"))
+            mode = msg.get("robot_mode", "debug")
+            logger.info(f"[UnitreeG1] Servidor confirmou modo: '{mode}'")
+            return mode
+        except zmq.Again:
+            logger.warning(
+                f"[UnitreeG1] Timeout ao consultar o servidor ({timeout}s). "
+                "Assumindo 'debug' por segurança. Verifique se dex3_g1_server_v2.py está rodando."
+            )
+            return "debug"
+        except Exception as e:
+            logger.warning(f"[UnitreeG1] Erro ao consultar modo do servidor: {e}. Assumindo 'debug'.")
+            return "debug"
+        finally:
+            sock.close()
+
     def _subscribe_motor_state(self):  # polls robot state @ 250Hz
         while not self._shutdown_event.is_set():
             start_time = time.time()
@@ -160,11 +192,11 @@ class UnitreeG1(Robot):
     @cached_property
     def action_features(self) -> dict[str, type]:
         """Define action space based on control mode."""
-        if self.config.control_mode in ["upper_body", "high_level"]:
-            # Upper body ou High Level: apenas juntas dos braços (14 juntas)
+        if self.config.control_mode in ("upper_body", "high_level"):
+            # Braços apenas (14 juntas) — tanto upper_body quanto high_level (Loco)
             return {f"{G1_29_JointArmIndex(motor).name}.q": float for motor in G1_29_JointArmIndex}
         else:
-            # Full body mode: todas as 29/35 juntas do corpo
+            # Full body: todas as 29 juntas
             return {f"{G1_29_JointIndex(motor).name}.q": float for motor in G1_29_JointIndex}
 
     def calibrate(self) -> None:  # robot is already calibrated
@@ -206,56 +238,53 @@ class UnitreeG1(Robot):
         self._ChannelSubscriber = ChannelSubscriber
 
         # Initialize DDS channel and simulation environment
-        if self.config.is_simulation:
-            # Como o seu env.py já inicializa o canal internamente, 
-            # podemos só chamar a função principal dele.
-            
-            # --- INÍCIO DA MODIFICAÇÃO PARA USAR SEU SIMULADOR LOCAL ---
-            import sys
-            import os
-            
+        if self.config.is_simulation and not self.config.remote_sim_ip:
+            # ── Simulação LOCAL (comportamento original) ──────────────────
+            import sys, os
             local_sim_path = os.path.expanduser("../unitree-g1-mujoco")
             if local_sim_path not in sys.path:
                 sys.path.append(local_sim_path)
-            
-            # Importamos a função criadora do seu env.py (renomeamos para não dar conflito)
             from env import make_env as make_local_env
-            
             lista_de_cameras = list(self.config.cameras.keys())
-
             if "head_camera_depth" not in lista_de_cameras:
                 lista_de_cameras.append("head_camera_depth")
-            
-            # Chamamos a sua função passando a lista de câmeras exigida!
             self.sim_env = make_local_env(cameras=lista_de_cameras)
-
-            import time
             time.sleep(3.0)
-            
-            # --- FIM DA MODIFICAÇÃO ---
+            # Simulação local não tem servidor ZMQ — usa o modo do config diretamente
+            active_mode = "loco" if self.config.control_mode == "high_level" else "debug"
+            logger.info(f"[UnitreeG1] Simulação local: modo derivado do config = '{active_mode}'")
+
+        elif self.config.remote_sim_ip:
+            # ── Simulação REMOTA: MuJoCo roda no PC do Miguel ─────────────
+            # Não sobe nada localmente. Apenas aponta o DDS para o IP remoto.
+            self.config.robot_ip = self.config.remote_sim_ip
+            self._ChannelFactoryInitialize(0, self.config.remote_sim_ip)
+            print(f"🌐 Modo simulação remota: conectando ao MuJoCo em {self.config.remote_sim_ip}")
+            active_mode = self._query_server_mode(self.config.robot_ip)
 
         else:
+            # ── Robô real ─────────────────────────────────────────────────
             self._ChannelFactoryInitialize(0)
 
-        # Initialize direct motor control interface
-        self.lowcmd_publisher = self._ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
-        self.lowcmd_publisher.Init()
-        self.lowstate_subscriber = self._ChannelSubscriber(kTopicLowState, hg_LowState)
-        self.lowstate_subscriber.Init()
+        # ----------------------------------------------------------------
+        # HANDSHAKE DE MODO (robô real e simulação remota):
+        # Lê da porta 6004 qual modo o servidor está usando e escolhe
+        # o tópico de comando correto. Não requer nenhum switch aqui.
+        # ----------------------------------------------------------------
+        if not (self.config.is_simulation and not self.config.remote_sim_ip):
+            active_mode = self._query_server_mode(self.config.robot_ip)
+            logger.info(f"[UnitreeG1] Modo reportado pelo servidor: '{active_mode}'")
 
-        # =================================================================
-        # MAGIA DO ROTEAMENTO ZMQ: O LeRobot só muda a etiqueta do pacote
-        # =================================================================
-        if self.config.control_mode == "high_level":
-            target_topic = "rt/arm_sdk"
-            logger.info("[UnitreeG1] MODO HIGH LEVEL: Enviando pacotes ZMQ para rt/arm_sdk.")
+        if active_mode == "loco":
+            lowcmd_topic = kTopicLowCommand_Motion
+            logger.info("[UnitreeG1] → Usando rt/arm_sdk (High Level / WBC ativo)")
         else:
-            target_topic = kTopicLowCommand_Debug
-            logger.info("[UnitreeG1] MODO LOW LEVEL: Enviando pacotes ZMQ para rt/lowcmd.")
-            
-        self.lowcmd_publisher = self._ChannelPublisher(target_topic, hg_LowCmd)
+            lowcmd_topic = kTopicLowCommand_Debug
+            logger.info("[UnitreeG1] → Usando rt/lowcmd (Low Level / Debug Mode)")
+
+        # Initialize direct motor control interface usando tópico escolhido pelo handshake
+        self.lowcmd_publisher = self._ChannelPublisher(lowcmd_topic, hg_LowCmd)
         self.lowcmd_publisher.Init()
-        
         self.lowstate_subscriber = self._ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
 
@@ -294,8 +323,9 @@ class UnitreeG1(Robot):
         for id in G1_29_JointIndex:
             motor_name = id.name.lower()
             
-            # Se estivermos no modo upper_body, DESLIGAMOS a força das pernas e cintura
-            if self.config.control_mode == "upper_body" and ('leg' in motor_name or 'waist' in motor_name):
+            # Se estivermos no modo upper_body ou high_level, DESLIGAMOS a força das pernas e cintura
+            # (no high_level o WBC/IA controla as pernas — não interferimos)
+            if self.config.control_mode in ("upper_body", "high_level") and ('leg' in motor_name or 'waist' in motor_name):
                 self.msg.motor_cmd[id.value].mode = 0  # 0 = Motor livre para outro controlador (WBC/Joystick)
                 self.msg.motor_cmd[id.value].kp = 0.0
                 self.msg.motor_cmd[id.value].kd = 0.0
@@ -361,9 +391,8 @@ class UnitreeG1(Robot):
 
         obs = {}
 
-        
         # Select joints based on control mode
-        joint_index = G1_29_JointArmIndex if self.config.control_mode in ["upper_body", "high_level"] else G1_29_JointIndex
+        joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
 
         # Motors - q, dq, tau for controlled joints
         for motor in joint_index:
@@ -425,7 +454,7 @@ class UnitreeG1(Robot):
     @property
     def _motors_ft(self) -> dict[str, type]:
         """Motor features based on control mode."""
-        if self.config.control_mode in ["upper_body", "high_level"]:
+        if self.config.control_mode in ("upper_body", "high_level"):
             return {f"{G1_29_JointArmIndex(motor).name}.q": float for motor in G1_29_JointArmIndex}
         else:
             return {f"{G1_29_JointIndex(motor).name}.q": float for motor in G1_29_JointIndex}
@@ -447,35 +476,44 @@ class UnitreeG1(Robot):
         return {**self._motors_ft, **self._cameras_ft}
 
     def send_action(self, action: RobotAction) -> RobotAction:
-        joint_index = G1_29_JointArmIndex if self.config.control_mode in ["upper_body", "high_level"] else G1_29_JointIndex
+        # Select joints based on control mode
+        joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
 
-        max_delta = 0.015
+        max_delta = 0.08  # Radianos por ciclo. (~5 rad/s a 250Hz). Ajuste conforme necessário.
+
         for motor in joint_index:
             key = f"{motor.name}.q"
             if key in action:
                 target_q = action[key]
                 
+                # Inicializa se for a primeira vez. 
+                # Pega a posição ATUAL do robô para evitar um tranco no primeiro frame.
                 if key not in self.last_action_q:
                     if self._lowstate is not None:
                         self.last_action_q[key] = self._lowstate.motor_state[motor.value].q
                     else:
                         self.last_action_q[key] = target_q
                 
+                # 1. FILTRO: Suaviza a transição (Low-pass)
                 smoothed_q = (1 - self.smoothing_alpha) * self.last_action_q[key] + self.smoothing_alpha * target_q
+                
+                # 2. LIMITADOR: Garante que a variação não ultrapasse o max_delta
                 delta = smoothed_q - self.last_action_q[key]
                 delta_clipped = np.clip(delta, -max_delta, max_delta)
                 final_q = float(self.last_action_q[key] + delta_clipped)
                 
+                # 3. ATUALIZA ESTADO E COMANDO
                 self.last_action_q[key] = final_q
                 self.msg.motor_cmd[motor.value].q = final_q
-                self.msg.motor_cmd[motor.value].qd = 0  
+                
+                # Restante dos parâmetros...
+                self.msg.motor_cmd[motor.value].qd = 0  # Velocidade desejada zero
                 self.msg.motor_cmd[motor.value].kp = self.kp[motor.value]
                 self.msg.motor_cmd[motor.value].kd = self.kd[motor.value]
                 self.msg.motor_cmd[motor.value].tau = 0
 
         self.msg.crc = self.crc.Crc(self.msg)
         self.lowcmd_publisher.Write(self.msg)
-
         return action
 
     def get_gravity_orientation(self, quaternion):  # get gravity orientation from quaternion
@@ -502,7 +540,7 @@ class UnitreeG1(Robot):
             default_positions = np.array(self.config.default_positions, dtype=np.float32)
 
         # SELECIONA OS MOTORES BASEADO NO MODO (Igual fizemos no send_action)
-        joint_index = G1_29_JointArmIndex if self.config.control_mode in ["upper_body", "high_level"] else G1_29_JointIndex
+        joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
 
         if self.config.is_simulation and self.sim_env is not None:
             self.sim_env.reset()

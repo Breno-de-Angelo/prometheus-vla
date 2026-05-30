@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Caminho absoluto para a pasta do seu projeto
-PROJECT_DIR=~/prometheus-vla
+PROJECT_DIR=~/Scripts_Prometheus_int
 
 # 1. Inicializa o Conda usando o ativador exato do seu terminal
 source ~/miniconda3/bin/activate
