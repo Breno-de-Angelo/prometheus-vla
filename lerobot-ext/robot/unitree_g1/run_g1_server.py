@@ -258,8 +258,13 @@ def handcmd_forward_loop(
 
 def main() -> None:
     """Main entry point for the robot server bridge."""
-    # initialize DDS
-    ChannelFactoryInitialize(0)
+    # DDS na interface $G1_DDS_IFACE, se setado
+    import os as _os
+    _iface = _os.environ.get("G1_DDS_IFACE")
+    if _iface:
+        ChannelFactoryInitialize(0, _iface)
+    else:
+        ChannelFactoryInitialize(0)
 
     # stop all active publishers on the robot
     msc = MotionSwitcherClient()

@@ -174,7 +174,7 @@ class UnitreeG1(Robot):
     def connect(self, calibrate: bool = True) -> None:  # connect to DDS
         # Import channel classes and message types based on mode
         # (deferred imports to avoid circular import in unitree_sdk2py)
-        if self.config.is_simulation:
+        if self.config.is_simulation and getattr(self.config, "sim_backend", "mujoco") != "isaac":
             from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
                 LowCmd_ as hg_LowCmd,
@@ -188,7 +188,7 @@ class UnitreeG1(Robot):
             )
             LowCmdMsg = unitree_hg_msg_dds__LowCmd_
         else:
-            # Use SDK-free wrappers for ZMQ mode to avoid circular import
+            # Use SDK-free wrappers for ZMQ mode to avoid circular import (Isaac backend uses this)
             from .unitree_sdk2_socket import (
                 ChannelFactoryInitialize,
                 ChannelPublisher,
@@ -204,8 +204,12 @@ class UnitreeG1(Robot):
         self._ChannelSubscriber = ChannelSubscriber
 
         # Initialize DDS channel and simulation environment
-        if self.config.is_simulation:
-            # Como o seu env.py já inicializa o canal internamente, 
+        if self.config.is_simulation and getattr(self.config, "sim_backend", "mujoco") == "isaac":
+            # Backend Isaac: a ponte ZMQ externa (lcad232) faz o step; NAO cria MuJoCo in-process
+            self.sim_env = None
+            logger.info("[UnitreeG1] sim_backend=isaac -> ponte Isaac externa (sem MuJoCo in-process)")
+        elif self.config.is_simulation:
+            # Como o seu env.py já inicializa o canal internamente,
             # podemos só chamar a função principal dele.
             
             # --- INÍCIO DA MODIFICAÇÃO PARA USAR SEU SIMULADOR LOCAL ---
@@ -227,13 +231,12 @@ class UnitreeG1(Robot):
             # Chamamos a sua função passando a lista de câmeras exigida!
             self.sim_env = make_local_env(cameras=lista_de_cameras)
 
-            import time
             time.sleep(3.0)
-            
+
             # --- FIM DA MODIFICAÇÃO ---
 
         else:
-            self._ChannelFactoryInitialize(0)
+            self._ChannelFactoryInitialize(0, self.config.robot_ip)
 
         # Initialize direct motor control interface
         self.lowcmd_publisher = self._ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
@@ -427,11 +430,47 @@ class UnitreeG1(Robot):
     def observation_features(self) -> dict[str, type | tuple]:
         return {**self._motors_ft, **self._cameras_ft}
 
+    def _read_tuning(self):
+        """Lê arm_kp/smoothing_alpha/max_delta de g1_tuning.json ($G1_TUNING), recarregando quando o arquivo muda."""
+        import os
+        import json
+        defaults = {"arm_kp": 150.0, "smoothing_alpha": 0.3, "max_delta": 0.12}
+        path = os.environ.get("G1_TUNING", "g1_tuning.json")
+        try:
+            mt = os.path.getmtime(path)
+            if mt != getattr(self, "_tuning_mtime", None):
+                with open(path) as f:
+                    self._tuning = {**defaults, **json.load(f)}
+                self._tuning_mtime = mt
+                logger.info(f"[tuning] g1_tuning.json recarregado: {self._tuning}")
+        except FileNotFoundError:
+            self._tuning = getattr(self, "_tuning", defaults)
+        except Exception as e:
+            logger.warning(f"[tuning] erro lendo g1_tuning.json ({e}); mantendo anterior")
+            self._tuning = getattr(self, "_tuning", defaults)
+        return self._tuning
+
+    def _action_log(self):
+        """Abre o JSONL de log de ações se $G1_ACTION_LOG estiver setado, senão retorna None."""
+        if getattr(self, "_action_log_f", "unset") == "unset":
+            import os
+            _p = os.environ.get("G1_ACTION_LOG")
+            self._action_log_f = open(_p, "a") if _p else None
+            if self._action_log_f:
+                logger.warning(f"[action_log] gravando target/sent/obs em {_p}")
+        return self._action_log_f
+
     def send_action(self, action: RobotAction) -> RobotAction:
         # Select joints based on control mode
         joint_index = G1_29_JointArmIndex if self.config.control_mode == "upper_body" else G1_29_JointIndex
 
-        max_delta = 0.04  # Radianos por ciclo. (~5 rad/s a 250Hz). Ajuste conforme necessário.
+        tun = self._read_tuning()
+        smoothing_alpha = tun["smoothing_alpha"]
+        max_delta = tun["max_delta"]
+        arm_kp = tun["arm_kp"]
+
+        _logf = self._action_log()
+        _rec = {"t": round(time.time(), 3), "names": [], "tgt": [], "sent": [], "obs": []} if _logf else None
 
         for motor in joint_index:
             key = f"{motor.name}.q"
@@ -447,7 +486,7 @@ class UnitreeG1(Robot):
                         self.last_action_q[key] = target_q
                 
                 # 1. FILTRO: Suaviza a transição (Low-pass)
-                smoothed_q = (1 - self.smoothing_alpha) * self.last_action_q[key] + self.smoothing_alpha * target_q
+                smoothed_q = (1 - smoothing_alpha) * self.last_action_q[key] + smoothing_alpha * target_q
                 
                 # 2. LIMITADOR: Garante que a variação não ultrapasse o max_delta
                 delta = smoothed_q - self.last_action_q[key]
@@ -460,9 +499,20 @@ class UnitreeG1(Robot):
                 
                 # Restante dos parâmetros...
                 self.msg.motor_cmd[motor.value].qd = 0  # Velocidade desejada zero
-                self.msg.motor_cmd[motor.value].kp = self.kp[motor.value]
+                self.msg.motor_cmd[motor.value].kp = arm_kp
                 self.msg.motor_cmd[motor.value].kd = self.kd[motor.value]
                 self.msg.motor_cmd[motor.value].tau = 0
+
+                if _rec is not None:
+                    _rec["names"].append(motor.name)
+                    _rec["tgt"].append(round(float(target_q), 4))
+                    _rec["sent"].append(round(final_q, 4))
+                    _rec["obs"].append(round(float(self._lowstate.motor_state[motor.value].q), 4) if self._lowstate else None)
+
+        if _rec is not None:
+            import json as _json
+            _logf.write(_json.dumps(_rec) + "\n")
+            _logf.flush()
 
         self.msg.crc = self.crc.Crc(self.msg)
         self.lowcmd_publisher.Write(self.msg)

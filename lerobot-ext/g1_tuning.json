@@ -1,0 +1,5 @@
+{
+  "arm_kp": 100.0,
+  "smoothing_alpha": 0.2,
+  "max_delta": 0.06
+}
