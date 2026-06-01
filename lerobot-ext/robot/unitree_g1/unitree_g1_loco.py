@@ -479,7 +479,7 @@ class UnitreeG1(Robot):
         # Select joints based on control mode
         joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
 
-        max_delta = 0.08  # Radianos por ciclo. (~5 rad/s a 250Hz). Ajuste conforme necessário.
+        max_delta = 0.1  # Radianos por ciclo. (~5 rad/s a 250Hz). Ajuste conforme necessário.
 
         for motor in joint_index:
             key = f"{motor.name}.q"

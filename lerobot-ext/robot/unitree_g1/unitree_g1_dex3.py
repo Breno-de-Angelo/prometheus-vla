@@ -17,7 +17,8 @@ import sys
 import subprocess
 
 # Isso em baixo ele vai usar a class nova Loco para controla o robo com High ou Low Level.
-from .unitree_g1 import UnitreeG1, UnitreeG1Config
+from .unitree_g1_loco import UnitreeG1, UnitreeG1Config
+#from .unitree_g1 import UnitreeG1, UnitreeG1Config
 from lerobot.robots.config import RobotConfig
 from .g1_utils import (
     Dex3_1_Left_JointIndex, 
