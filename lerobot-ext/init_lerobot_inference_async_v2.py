@@ -24,7 +24,13 @@ Opções:
   --sim                  Modo simulação (sem robô real)
   --cam-robot=<IP>       Stream ZMQ de câmera externa
   --port-cam=<PORTA>     Porta do stream (padrão: 5555)
-  --fake-video=<PATH>    Injeta imagem ou vídeo na câmera
+  --fake-video=<PATH>    Injeta imagem ou vídeo na câmera RGB
+  --fake-depth=<PATH>    Injeta vídeo ou imagem de depth sincronizado com --fake-video.
+                         O frame de depth avança em lock-step com o RGB:
+                         mesmo índice, mesmo loop, mesma lógica de seek/pause.
+                         Útil para testar modelos ACT-D (use_depth_3d=True) sem
+                         câmera real. O canal depth deve ser gravado com o mesmo
+                         hack ZMQ (0–255 → 0–1 → metros reais em depth_to_pointcloud).
   --uncertainty=<FLOAT>  Ativa o uncertainty gate (ex: 0.1)
   --chunk=<INT>          Ações por chunk (padrão: 60). Deve cobrir 1 inferência inteira.
   --lead=<INT>           Pede nova inferência quando restam N ações no buffer (padrão: 50).
@@ -38,6 +44,11 @@ Opções:
                          Mostra heatmap de onde o decoder presta atenção
                          nos tokens de imagem RGB a cada inferência.
                          Compatível com --v e --v-control.
+  --v-depth              Abre terceira janela com a Point Cloud 3D gerada
+                         pelo mesmo depth_to_pointcloud() que alimenta a
+                         PointNet — vista Top-Down (XZ) + lateral (YZ)
+                         lado a lado. Requer use_depth_3d=True ou --fake-depth.
+                         [Q/ESC] na janela para fechar.
   --debug                Loga ações e tempos no terminal em tempo real
   -h, --help             Mostra esta mensagem
 
@@ -56,12 +67,20 @@ Exemplos:
   python init_lerobot_inference_async.py \
       --checkpoint=train_output/pi05/best_val_checkpoint/pretrained_model \
       --cam-robot=192.168.123.164 --v --chunk=60 --lead=50
+
+  # ACT-D com vídeo fake RGB + depth sincronizado do dataset:
+  python init_lerobot_inference_async.py \
+      --checkpoint=train_output/actdepth/best_val_checkpoint/pretrained_model \
+      --fake-video=dataset/episode_rgb.mp4 \
+      --fake-depth=dataset/episode_depth.mp4 \
+      --v --v-attn --chunk=10 --lead=8 --debug
 """
 
 import os
 import sys
 import time
 import threading
+import multiprocessing as mp
 from queue import Queue, Empty, Full
 
 import torch
@@ -408,6 +427,241 @@ class AttnMapWindow:
             pass
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 1c. JANELA DE POINT CLOUD 3D — Open3D em processo separado (--v-depth)
+# ─────────────────────────────────────────────────────────────────────
+
+def _pointcloud_process(queue: mp.Queue, intrinsics: dict, stop_evt: mp.Event):
+    """
+    Roda em processo separado (não thread) porque o Open3D precisa da
+    thread principal do seu próprio processo para desenhar.
+
+    Recebe dicts {"depth": uint8[H,W,3], "rgb": uint8[H,W,3]} via queue.
+
+    Cor de cada ponto: back-projection do RGB.
+    Para cada ponto XYZ gerado pelo depth_to_pointcloud(), reprojetamos
+    de volta para o plano da imagem (u, v) e lemos o pixel RGB ali.
+    Isso é exatamente como um sensor RGBD funde as duas câmeras — você
+    vê a nuvem colorida com a textura real da cena.
+
+    Se o RGB não estiver disponível, cai no colormap por distância Z.
+    """
+    import torch
+    import numpy as np
+    import open3d as o3d
+    from policies.act_depth.depth_encoder import depth_to_pointcloud
+
+    fx = intrinsics["fx"]; fy = intrinsics["fy"]
+    cx = intrinsics["cx"]; cy = intrinsics["cy"]
+
+    # ── Helpers locais ────────────────────────────────────────────────
+    def criar_grade(tamanho=2.0, espacamento=0.1, altura=-0.2):
+        pontos, linhas, idx = [], [], 0
+        for z in np.arange(-tamanho / 2, tamanho / 2 + espacamento, espacamento):
+            pontos += [[-tamanho / 2, altura, z], [tamanho / 2, altura, z]]
+            linhas.append([idx, idx + 1]); idx += 2
+        for x in np.arange(-tamanho / 2, tamanho / 2 + espacamento, espacamento):
+            pontos += [[x, altura, -tamanho / 2], [x, altura, tamanho / 2]]
+            linhas.append([idx, idx + 1]); idx += 2
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(pontos)
+        ls.lines  = o3d.utility.Vector2iVector(linhas)
+        ls.colors = o3d.utility.Vector3dVector([[0.25, 0.25, 0.25]] * len(linhas))
+        return ls
+
+    def backproject_rgb(pontos_xyz_original: np.ndarray,
+                        rgb_hwc: np.ndarray) -> np.ndarray:
+        """
+        Para cada ponto [X, Y, Z] (antes da inversão de eixos Open3D),
+        recalcula o pixel (u, v) na imagem RGB usando a projeção pinhole
+        inversa — e lê a cor RGB ali.
+
+        pontos_xyz_original: [N, 3] float32, eixos câmera (Y↓, Z→frente)
+        rgb_hwc:             [H, W, 3] uint8 RGB
+
+        Retorna cores [N, 3] float64 em [0, 1] para o Open3D.
+        """
+        H, W = rgb_hwc.shape[:2]
+        X, Y, Z = pontos_xyz_original[:, 0], pontos_xyz_original[:, 1], pontos_xyz_original[:, 2]
+
+        # Projeção pinhole: (X, Y, Z) → (u, v) em pixels
+        # u = fx * X/Z + cx  |  v = fy * Y/Z + cy
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = np.where(Z > 0, fx * X / Z + cx, -1).astype(np.int32)
+            v = np.where(Z > 0, fy * Y / Z + cy, -1).astype(np.int32)
+
+        # Clipa para dentro da imagem
+        u = np.clip(u, 0, W - 1)
+        v = np.clip(v, 0, H - 1)
+
+        # Lê pixel RGB e normaliza para [0, 1]
+        cores = rgb_hwc[v, u].astype(np.float64) / 255.0   # [N, 3]
+        return cores
+
+    # ── Janela Open3D ─────────────────────────────────────────────────
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(
+        window_name="Point Cloud RGB — ACT-D  [Q para fechar]",
+        width=1280, height=720,
+    )
+
+    pcd   = o3d.geometry.PointCloud()
+    eixos = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                size=0.15, origin=[0, 0, 0])
+    grade = criar_grade()
+
+    vis.add_geometry(pcd)
+    vis.add_geometry(eixos)
+    vis.add_geometry(grade)
+
+    opt = vis.get_render_option()
+    opt.background_color = np.array([0.05, 0.05, 0.08])
+    opt.point_size = 3.0
+
+    primeiro_frame = True
+
+    while not stop_evt.is_set():
+        # Drena a fila pegando sempre o par mais recente
+        payload = None
+        while not queue.empty():
+            try:
+                payload = queue.get_nowait()
+            except Exception:
+                break
+
+        if payload is not None:
+            try:
+                depth_hwc = payload["depth"]   # uint8 [H, W, 3]
+                rgb_hwc   = payload.get("rgb")  # uint8 [H, W, 3] RGB ou None
+
+                # ── Depth → Point Cloud (igual ao modelo) ─────────────
+                canal_r = depth_hwc[:, :, 0]
+                depth_tensor = (
+                    torch.from_numpy(canal_r).float()
+                    .div(255.0)
+                    .unsqueeze(0).unsqueeze(0)   # [1, 1, H, W]
+                )
+
+                with torch.no_grad():
+                    pc = depth_to_pointcloud(
+                        depth_tensor, intrinsics, num_points=5000
+                    )  # [1, 3, 5000]
+
+                # [5000, 3] — X, Y, Z em metros, eixos câmera (Y↓, Z→frente)
+                pontos_cam = pc[0].T.numpy()
+
+                # Filtra padding de zeros
+                validos    = pontos_cam[:, 2] > 0.05
+                pontos_cam = pontos_cam[validos]
+
+                if pontos_cam.shape[0] > 0:
+                    # ── Cor: back-projection RGB ou fallback por Z ─────
+                    if rgb_hwc is not None:
+                        # Usa os eixos ORIGINAIS da câmera (antes de inverter)
+                        # para reprojetar corretamente no plano da imagem.
+                        cores = backproject_rgb(pontos_cam, rgb_hwc)
+                    else:
+                        # Fallback: colormap por distância Z
+                        z_n = (pontos_cam[:, 2] - pontos_cam[:, 2].min()) / \
+                              (pontos_cam[:, 2].max() - pontos_cam[:, 2].min() + 1e-5)
+                        cores = np.zeros((pontos_cam.shape[0], 3))
+                        cores[:, 0] = 1.0 - z_n
+                        cores[:, 1] = z_n * 0.5
+                        cores[:, 2] = z_n
+
+                    # ── Inverte eixos para convenção Open3D ────────────
+                    pontos_o3d = pontos_cam.copy()
+                    pontos_o3d[:, 1] *= -1
+                    pontos_o3d[:, 2] *= -1
+
+                    pcd.points = o3d.utility.Vector3dVector(pontos_o3d)
+                    pcd.colors = o3d.utility.Vector3dVector(cores)
+                    vis.update_geometry(pcd)
+
+                    if primeiro_frame:
+                        vis.reset_view_point(True)
+                        ctr = vis.get_view_control()
+                        ctr.set_front([0.0, -0.4, 1.0])
+                        ctr.set_up([0.0, 1.0, 0.0])
+                        ctr.set_zoom(0.5)
+                        primeiro_frame = False
+
+            except Exception as e:
+                print(f"[PointCloudProc] Erro: {e}")
+
+        if not vis.poll_events():
+            break
+        vis.update_renderer()
+
+    vis.destroy_window()
+
+
+class PointCloudWindow:
+    """
+    Wrapper que lança _pointcloud_process num processo separado e
+    expõe a mesma API das outras janelas (update / show / destroy).
+
+    O Open3D PRECISA da thread principal do seu processo — por isso
+    usamos multiprocessing em vez de threading.
+    """
+
+    def __init__(self, intrinsics: dict | None = None):
+        self._intrinsics = intrinsics or {
+            "fx": 500.0, "fy": 500.0, "cx": 320.0, "cy": 240.0
+        }
+        self._queue: mp.Queue | None = None
+        self._stop:  mp.Event | None = None
+        self._proc:  mp.Process | None = None
+
+    def create(self):
+        self._queue = mp.Queue(maxsize=2)
+        self._stop  = mp.Event()
+        self._proc  = mp.Process(
+            target=_pointcloud_process,
+            args=(self._queue, self._intrinsics, self._stop),
+            daemon=True,
+        )
+        self._proc.start()
+
+    def update(self, depth_frame: np.ndarray | None, rgb_frame: np.ndarray | None = None):
+        """
+        Envia o par (depth, rgb) para o processo Open3D.
+
+        depth_frame: uint8 [H, W, 3] — canal R = depth quantizado.
+        rgb_frame:   uint8 [H, W, 3] RGB — mesma resolução do depth.
+                     Se None, o processo usa colormap por distância como fallback.
+        """
+        if depth_frame is None or self._queue is None:
+            return
+        payload = {
+            "depth": depth_frame.copy(),
+            "rgb":   rgb_frame.copy() if rgb_frame is not None else None,
+        }
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except Exception:
+                pass
+        try:
+            self._queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def show(self) -> bool:
+        """Retorna False se o processo Open3D foi fechado."""
+        if self._proc is None:
+            return False
+        return self._proc.is_alive()
+
+    def destroy(self):
+        if self._stop is not None:
+            self._stop.set()
+        if self._proc is not None and self._proc.is_alive():
+            self._proc.join(timeout=2.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -564,10 +818,20 @@ def make_raw_obs(
 # ─────────────────────────────────────────────────────────────────────
 # 5. SETUP DE CÂMERAS / LEITURA DE FRAME
 # ─────────────────────────────────────────────────────────────────────
-def setup_cameras(cam_robot_ip, cam_port, fake_video_path):
+def setup_cameras(cam_robot_ip, cam_port, fake_video_path, fake_depth_path=None):
+    """
+    Inicializa câmeras reais (ZMQ) ou fontes fake (vídeo/imagem).
+
+    fake_depth_path: caminho para vídeo ou imagem de depth a injetar em
+                     obs["head_camera_depth"]. Avança frame-a-frame em
+                     lock-step com fake_cap (mesmo índice, mesmo seek).
+                     Ignorado se cam_robot_ip estiver definido (ZMQ já
+                     entrega depth nativo).
+    """
     from Scripts_Prometheus_int.sim.sensor_utils import SensorClient, ImageUtils  # noqa: F401
 
     stream_client = fake_cap = fake_img_rgb = None
+    fake_depth_cap = fake_depth_img = None   # ← novas variáveis de depth
 
     if cam_robot_ip:
         stream_client = SensorClient()
@@ -575,27 +839,61 @@ def setup_cameras(cam_robot_ip, cam_port, fake_video_path):
         print(f"📡 Conectando ao ZMQ SensorServer em tcp://{cam_robot_ip}:{cam_port}...")
     elif fake_video_path:
         if not os.path.exists(fake_video_path):
-            print(f"❌ ERRO: Arquivo fake não encontrado: {fake_video_path}")
+            print(f"❌ ERRO: Arquivo fake RGB não encontrado: {fake_video_path}")
             sys.exit(1)
         if fake_video_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
             fake_cap = cv2.VideoCapture(fake_video_path)
-            print("✅ Vídeo fake carregado! (Modo Loop)")
+            print("✅ Vídeo fake RGB carregado! (Modo Loop)")
         else:
             img_bgr = cv2.imread(fake_video_path)
             fake_img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            print("✅ Imagem fake carregada!")
+            print("✅ Imagem fake RGB carregada!")
 
-    return stream_client, fake_cap, fake_img_rgb
+    # ── Depth fake — só faz sentido sem ZMQ (ZMQ já entrega depth) ────
+    if fake_depth_path and not cam_robot_ip:
+        if not os.path.exists(fake_depth_path):
+            print(f"❌ ERRO: Arquivo fake depth não encontrado: {fake_depth_path}")
+            sys.exit(1)
+        if fake_depth_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            fake_depth_cap = cv2.VideoCapture(fake_depth_path)
+            print("✅ Vídeo fake Depth carregado! (sincronizado frame-a-frame com RGB)")
+        else:
+            depth_bgr = cv2.imread(fake_depth_path, cv2.IMREAD_GRAYSCALE)
+            if depth_bgr is None:
+                depth_bgr = cv2.imread(fake_depth_path)
+            if depth_bgr is not None:
+                if len(depth_bgr.shape) == 2:
+                    # Grayscale → replica para 3 canais (make_raw_obs espera H×W×3)
+                    fake_depth_img = np.stack([depth_bgr] * 3, axis=-1)
+                else:
+                    fake_depth_img = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB)
+            print("✅ Imagem fake Depth carregada!")
+    elif fake_depth_path and cam_robot_ip:
+        print("⚠️  --fake-depth ignorado: ZMQ já fornece depth nativo.")
+
+    return stream_client, fake_cap, fake_img_rgb, fake_depth_cap, fake_depth_img
 
 
-def get_camera_frames(obs, stream_client, fake_cap, fake_img_rgb):
+def get_camera_frames(obs, stream_client, fake_cap, fake_img_rgb,
+                      fake_depth_cap=None, fake_depth_img=None):
+    """
+    Lê o próximo frame de câmera e o injeta em `obs`.
+
+    Depth fake (fake_depth_cap / fake_depth_img):
+      - Avança em lock-step com o RGB fake: mesmo read(), mesmo loop,
+        mesmo seek pelo chamador.
+      - O seek de --v-control já reposiciona fake_cap ANTES desta função,
+        então basta espelhar CAP_PROP_POS_FRAMES do fake_cap no fake_depth_cap.
+    """
     if stream_client is not None:
         from Scripts_Prometheus_int.sim.sensor_utils import ImageUtils
         msg = stream_client.receive_message()
         if msg and "images" in msg:
-            obs["head_camera"] = ImageUtils.decode_image(msg["images"]["head_camera"])
+            obs["head_camera"]       = ImageUtils.decode_image(msg["images"]["head_camera"])
             obs["head_camera_depth"] = ImageUtils.decode_image(msg["images"]["head_camera_depth"])
+
     elif fake_cap is not None:
+        # ── RGB ──────────────────────────────────────────────────────
         ret, frame = fake_cap.read()
         if not ret:
             fake_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -603,8 +901,32 @@ def get_camera_frames(obs, stream_client, fake_cap, fake_img_rgb):
         if ret:
             fake_img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             obs["head_camera"] = fake_img_rgb
+
+        # ── Depth fake em lock-step com RGB ──────────────────────────
+        if fake_depth_cap is not None:
+            # Espelha o índice de frame do RGB para garantir sincronia
+            # mesmo depois de loops ou seeks externos.
+            rgb_pos = int(fake_cap.get(cv2.CAP_PROP_POS_FRAMES))
+            fake_depth_cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, rgb_pos - 1))
+            ret_d, depth_frame = fake_depth_cap.read()
+            if not ret_d:
+                fake_depth_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret_d, depth_frame = fake_depth_cap.read()
+            if ret_d:
+                # Converte para RGB de 3 canais (make_raw_obs → div(255) → PointNet)
+                if len(depth_frame.shape) == 2:
+                    depth_rgb = np.stack([depth_frame] * 3, axis=-1)
+                else:
+                    depth_rgb = cv2.cvtColor(depth_frame, cv2.COLOR_BGR2RGB)
+                obs["head_camera_depth"] = depth_rgb
+
+        elif fake_depth_img is not None:
+            obs["head_camera_depth"] = fake_depth_img
+
     elif fake_img_rgb is not None:
         obs["head_camera"] = fake_img_rgb
+        if fake_depth_img is not None:
+            obs["head_camera_depth"] = fake_depth_img
 
     return obs, fake_img_rgb
 
@@ -745,12 +1067,14 @@ def main():
     checkpoint_dir = None
     is_sim = False
     fake_video_path = None
+    fake_depth_path = None          # ← novo: --fake-depth
     cam_robot_ip = None
     cam_port = "5555"
     debug_mode = False
     show_video = False
     show_video_control = False
     show_attn = False
+    show_depth = False
     uncertainty_threshold = 0.0
     remote_sim_ip = None
     actions_per_chunk = 60
@@ -763,6 +1087,8 @@ def main():
             is_sim = True
         elif arg.startswith("--fake-video="):
             fake_video_path = arg.split("=", 1)[1]
+        elif arg.startswith("--fake-depth="):             # ← novo
+            fake_depth_path = arg.split("=", 1)[1]
         elif arg.startswith("--cam-robot="):
             cam_robot_ip = arg.split("=", 1)[1]
         elif arg.startswith("--port-cam="):
@@ -783,6 +1109,8 @@ def main():
         elif arg == "--v-attn":
             show_attn = True
             show_video = True   # --v-attn também precisa do frame RGB
+        elif arg == "--v-depth":
+            show_depth = True
         elif arg.startswith("--remote-sim="):
             remote_sim_ip = arg.split("=", 1)[1]
 
@@ -813,7 +1141,9 @@ def main():
     task_str = "pick up the cup" if policy_type == "pi05depth" else None
 
     # ── Câmeras ───────────────────────────────────────────────────────
-    stream_client, fake_cap, fake_img_rgb = setup_cameras(cam_robot_ip, cam_port, fake_video_path)
+    stream_client, fake_cap, fake_img_rgb, fake_depth_cap, fake_depth_img = setup_cameras(
+        cam_robot_ip, cam_port, fake_video_path, fake_depth_path
+    )
 
     # ── Robô ─────────────────────────────────────────────────────────
     from robot.unitree_g1.unitree_g1_dex3 import UnitreeG1Dex3, UnitreeG1Dex3Config
@@ -861,6 +1191,16 @@ def main():
         aw = AttnMapWindow("Attention Map — ACT-D")
         aw.create()
 
+    dw = None
+    if show_depth:
+        # Pega intrinsics do config da política (setadas em configuration_act.py)
+        # Fallback para os valores do pointcloud.py original que funcionava
+        pc_intrinsics = getattr(policy, "camera_intrinsics", None) or {
+            "fx": 500.0, "fy": 500.0, "cx": 320.0, "cy": 240.0
+        }
+        dw = PointCloudWindow(intrinsics=pc_intrinsics)
+        dw.create()
+
     # ── Filas entre threads ───────────────────────────────────────────
     obs_queue    = Queue(maxsize=1)   # sempre a obs mais recente
     action_queue = Queue(maxsize=2)   # no máximo 2 chunks em fila
@@ -902,6 +1242,14 @@ def main():
     if show_attn:
         print("   🔥 Janela de Attention Map ativa (--v-attn).")
         print("      Atualiza a cada inferência. [Q/ESC] na janela de attn para fechar.")
+    if show_depth:
+        print("   🟣 Janela de Point Cloud ativa (--v-depth). Vista Top-Down + Lateral.")
+        print("      Replica depth_to_pointcloud() — você vê o que a PointNet vê.")
+        print("      [Q/ESC] na janela de PC para fechar.")
+    if fake_depth_cap is not None:
+        print("   📐 Depth fake (vídeo) ativo — sincronizado frame-a-frame com RGB.")
+    elif fake_depth_img is not None:
+        print("   📐 Depth fake (imagem estática) ativa.")
     print("   Ctrl+C para parar.\n")
 
     current_chunk: list = []
@@ -928,6 +1276,9 @@ def main():
                     cur_pos = int(fake_cap.get(cv2.CAP_PROP_POS_FRAMES))
                     new_pos = max(0, cur_pos + seek_delta)
                     fake_cap.set(cv2.CAP_PROP_POS_FRAMES, new_pos)
+                    # Mantém depth em lock-step com RGB no seek
+                    if fake_depth_cap is not None:
+                        fake_depth_cap.set(cv2.CAP_PROP_POS_FRAMES, new_pos)
 
                 # Pausado: exibe último frame congelado e volta ao topo
                 # SEM chamar get_observation nem get_camera_frames,
@@ -958,7 +1309,11 @@ def main():
 
             # 2. Câmeras externas
             if obs_valid and obs is not None:
-                obs, fake_img_rgb = get_camera_frames(obs, stream_client, fake_cap, fake_img_rgb)
+                obs, fake_img_rgb = get_camera_frames(
+                    obs, stream_client, fake_cap, fake_img_rgb,
+                    fake_depth_cap=fake_depth_cap,
+                    fake_depth_img=fake_depth_img,
+                )
 
             # 3. Visualização + aplicação de contraste/brilho à observação
             if obs_valid and obs is not None and show_video:
@@ -985,6 +1340,18 @@ def main():
                         # ── Modo --v simples ──────────────────────────────────
                         cv2.imshow("Visao da IA", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
                         cv2.waitKey(1)
+
+            # 3b. Janela de Point Cloud Open3D (--v-depth)
+            if dw is not None and obs_valid and obs is not None:
+                depth_raw = obs.get("head_camera_depth")
+                rgb_raw = obs.get("head_camera")  # Pega o frame RGB colorido
+                
+                # Envia OS DOIS para a janela do Open3D
+                dw.update(depth_raw, rgb_raw)  
+                
+                alive = dw.show()
+                if not alive:
+                    raise KeyboardInterrupt
 
             # 4. Alimenta a fila de inferência quando o buffer estiver baixo
             if obs_valid and len(current_chunk) <= lead_actions:
@@ -1048,6 +1415,8 @@ def main():
 
         if fake_cap is not None:
             fake_cap.release()
+        if fake_depth_cap is not None:       # ← novo
+            fake_depth_cap.release()
         if stream_client is not None:
             stream_client.stop_client()
         robot.disconnect()
@@ -1055,10 +1424,15 @@ def main():
             vc.destroy()
         if aw is not None:
             aw.destroy()
+        if dw is not None:
+            dw.destroy()
         if show_video:
             cv2.destroyAllWindows()
         print("✅ Encerrado com segurança.")
 
 
 if __name__ == "__main__":
+    # "spawn" evita problemas de CUDA + fork no Linux quando --v-depth está ativo.
+    # É ignorado se o processo já foi iniciado com outro método.
+    mp.set_start_method("spawn", force=False)
     main()
