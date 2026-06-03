@@ -55,7 +55,7 @@ vis.add_geometry(pcd)
 # 2.2 Adicionar a Referência de Eixos (XYZ)
 # Tamanho 0.2 = As setinhas terão 20 centímetros
 eixos = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2, origin=[0, 0, 0])
-vis.add_geometry(eixos)
+# vis.add_geometry(eixos)
 
 # 2.3 Adicionar a Grade de Piso (Floor Grid)
 # Uma grade de 2 metros por 2 metros, com quadrados a cada 10 cm (0.1m)
@@ -108,8 +108,9 @@ while cap.isOpened():
     if primeiro_frame:
         # Movemos a visão inicial para olhar um pouco de cima e na diagonal
         ctr = vis.get_view_control()
-        ctr.set_front([0.0, -0.5, -1.0]) # Olha levemente para baixo
+        ctr.set_front([0.0, -0.5, 1.0]) # Olha levemente para baixo
         ctr.set_up([0.0, 1.0, 0.0])      # Define onde é "cima"
+        ctr.set_zoom(0.5)                # Aproxima um pouco
         primeiro_frame = False
 
     vis.update_geometry(pcd)

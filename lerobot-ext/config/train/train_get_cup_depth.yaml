@@ -63,13 +63,13 @@ policy:
       type: STATE
       shape: [28]
 
-    observation.left_hand_pressure:
-      type: STATE
-      shape: [33]
+    #observation.left_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
 
-    observation.right_hand_pressure:
-      type: STATE
-      shape: [33]
+    #observation.right_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
 
   output_features:
     action:
@@ -91,7 +91,7 @@ policy:
   pointnet_num_points: 1024
 
   # ── ACT-D: Percepção Tátil ──────────────────────────────
-  use_pressure: true
+  use_pressure: false
   pressure_feature_dim: 66
   pressure_hidden_dim: 256
 
@@ -131,7 +131,7 @@ policy:
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_depth-260512"
+output_dir: "train_output/pick_up_the_cup_depth-260603"
 steps: 100000
 
 batch_size: 128

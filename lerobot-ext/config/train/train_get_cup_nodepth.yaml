@@ -131,7 +131,7 @@ policy:
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_nodepth-260512"
+output_dir: "train_output/pick_up_the_cup_nodepth-260603"
 steps: 100000
 
 batch_size: 128
