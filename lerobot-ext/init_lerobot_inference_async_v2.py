@@ -34,6 +34,10 @@ Opções:
                          pause/resume, velocidade (0.25x–4x), seek, e painéis
                          laterais de contraste e brilho para simular
                          degradação de vídeo.
+  --v-attn               Abre janela de attention map ao lado da câmera.
+                         Mostra heatmap de onde o decoder presta atenção
+                         nos tokens de imagem RGB a cada inferência.
+                         Compatível com --v e --v-control.
   --debug                Loga ações e tempos no terminal em tempo real
   -h, --help             Mostra esta mensagem
 
@@ -237,6 +241,165 @@ class VideoControlWindow:
             self._seek_delta = 0
         delay = int(33 / speed) if speed > 0 else 33
         return paused, delay, seek
+
+    def destroy(self):
+        try:
+            cv2.destroyWindow(self.win)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 1b. JANELA DE ATTENTION MAP (--v-attn)
+# ─────────────────────────────────────────────────────────────────────
+
+class AttnMapWindow:
+    """
+    Janela OpenCV que exibe o attention map do decoder ACT-D sobreposto
+    na imagem RGB ao vivo.
+
+    Como funciona:
+      - Após cada inferência, `policy.last_attn_weights` contém
+        [B, chunk_size, num_encoder_tokens].
+      - Os primeiros tokens correspondem aos patches de imagem (h*w por câmera).
+      - Fazemos a média dos pesos sobre o chunk, redimensionamos para a
+        resolução da imagem e sobrepõemos como heatmap JET.
+
+    Uso:
+      aw = AttnMapWindow("Attention Map — ACT-D")
+      aw.create()
+      aw.update(policy, rgb_frame)   # chame após cada inferência
+      alive = aw.show()              # False → fechar
+    """
+
+    # Tokens de imagem no encoder: h*w do backbone (feature map final do ResNet18)
+    # Para entrada 480×640 com ResNet18: feature map = 15×20 = 300 patches por câmera
+    # Calculamos dinamicamente no primeiro update.
+    _img_token_h: int | None = None
+    _img_token_w: int | None = None
+
+    def __init__(self, window_name: str = "Attention Map — ACT-D"):
+        self.win = window_name
+        self._last_display: np.ndarray | None = None
+        self._lock = threading.Lock()
+
+    def create(self):
+        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.win, 640, 480)
+
+    def update(self, policy, rgb_frame: np.ndarray | None):
+        """
+        Processa `policy.last_attn_weights` e prepara o frame para exibição.
+        Pode ser chamado da thread de inferência (tem lock interno).
+
+        Args:
+            policy: ACTPolicy com `last_attn_weights` populado.
+            rgb_frame: imagem RGB [H, W, 3] uint8 — pode ser None se não houver câmera.
+        """
+        attn = getattr(policy, "last_attn_weights", None)
+        if attn is None or rgb_frame is None:
+            return
+
+        try:
+            # attn: [B, chunk_size, num_encoder_tokens]  (pode ser Tensor ou ndarray)
+            if isinstance(attn, torch.Tensor):
+                attn_np = attn.detach().cpu().float().numpy()
+            else:
+                attn_np = np.array(attn, dtype=np.float32)
+
+            # Média sobre batch e chunk → [num_encoder_tokens]
+            weights = attn_np[0].mean(axis=0)  # [num_encoder_tokens]
+
+            # ── Descobre a geometria do feature map de imagem ────────────
+            # Tokens de imagem ficam no início do encoder.
+            # Heurística: raiz quadrada do número de tokens por câmera.
+            # Para ResNet18 com entrada 480×640: backbone layer4 → 15×20 = 300.
+            # Para entradas diferentes, tentamos o split mais quadrado possível.
+            n_img_tokens = weights.shape[0]
+            # Pega só tokens de imagem (descarta state/latent/depth extras no final)
+            # Estimativa conservadora: descartamos os últimos 3 tokens
+            # (state, latent, latent_pos). Ajuste se tiver mais modalidades.
+            n_extra = 3  # state token + 2 latent pos tokens
+            n_img = max(n_img_tokens - n_extra, 1)
+
+            # Tenta encontrar dimensões h×w para o feature map
+            if self._img_token_h is None or self._img_token_w is None:
+                # Tenta resolução conhecida primeiro, senão usa sqrt
+                if n_img == 300:        # ResNet18, 480×640 → 15×20
+                    self._img_token_h, self._img_token_w = 15, 20
+                elif n_img == 225:      # ResNet18, 360×480 → 15×15 (approx)
+                    self._img_token_h, self._img_token_w = 15, 15
+                else:
+                    side = int(n_img ** 0.5)
+                    self._img_token_h = side
+                    self._img_token_w = side
+
+            h_feat, w_feat = self._img_token_h, self._img_token_w
+            n_use = h_feat * w_feat
+
+            img_weights = weights[:n_use]  # [h_feat * w_feat]
+
+            # Normaliza para [0, 1]
+            w_min, w_max = img_weights.min(), img_weights.max()
+            if w_max - w_min > 1e-6:
+                img_weights = (img_weights - w_min) / (w_max - w_min)
+            else:
+                img_weights = np.zeros_like(img_weights)
+
+            # Reshape → [h_feat, w_feat]
+            attn_map = img_weights.reshape(h_feat, w_feat)
+
+            # Upscale para resolução da imagem original
+            H, W = rgb_frame.shape[:2]
+            attn_resized = cv2.resize(attn_map, (W, H), interpolation=cv2.INTER_LINEAR)
+
+            # Converte para heatmap colorido (JET)
+            attn_uint8 = (attn_resized * 255).astype(np.uint8)
+            heatmap_bgr = cv2.applyColorMap(attn_uint8, cv2.COLORMAP_JET)
+            heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+
+            # Sobrepõe na imagem RGB original
+            alpha = 0.55
+            blended = (alpha * heatmap_rgb + (1 - alpha) * rgb_frame).astype(np.uint8)
+
+            # Legenda
+            cv2.putText(
+                blended, "Decoder Cross-Attention (media chunk)",
+                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+            )
+            cv2.putText(
+                blended, "QUENTE = maior atencao",
+                (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA,
+            )
+
+            with self._lock:
+                self._last_display = blended
+
+        except Exception as e:
+            # Nunca deixa a thread de inferência crashar por causa do visual
+            print(f"[AttnMapWindow] Erro ao processar attention: {e}")
+
+    def show(self) -> bool:
+        """Exibe o último frame processado. Retorna False se janela fechada."""
+        with self._lock:
+            frame = self._last_display
+
+        if frame is None:
+            # Ainda sem dados — exibe tela preta com mensagem
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(
+                placeholder, "Aguardando 1a inferencia...",
+                (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 1,
+            )
+            cv2.imshow(self.win, placeholder)
+        else:
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.imshow(self.win, bgr)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27):
+            return False
+        return True
 
     def destroy(self):
         try:
@@ -465,6 +628,7 @@ def inference_worker(
     task_str: str | None,
     actions_per_chunk: int,
     debug: bool,
+    attn_window=None,        # AttnMapWindow ou None
 ):
     """
     Roda em thread separada.
@@ -472,11 +636,19 @@ def inference_worker(
     """
     print("🧠 [inference_worker] Iniciada.")
 
+    # Frame RGB mais recente — usado para gerar o attention overlay
+    _last_rgb: np.ndarray | None = None
+
     while not stop_event.is_set():
         try:
             obs = obs_queue.get(timeout=0.5)
         except Empty:
             continue
+
+        # Guarda o frame RGB para o overlay de atenção
+        rgb = obs.get("head_camera") if obs else None
+        if rgb is not None:
+            _last_rgb = rgb
 
         t0 = time.perf_counter()
 
@@ -533,10 +705,15 @@ def inference_worker(
                         action = action["action"]
                     chunk_np = [action.squeeze(0).cpu().numpy()]
 
+            # 3b. Atualiza o attention map (não bloqueia — tem lock interno)
+            if attn_window is not None and _last_rgb is not None:
+                attn_window.update(policy, _last_rgb)
+
             t_inf_ms = (time.perf_counter() - t0) * 1000
 
             if debug:
-                print(f"\n🧠 [inference] {t_inf_ms:.1f}ms | chunk={len(chunk_np)} ações")
+                has_attn = getattr(policy, "last_attn_weights", None) is not None
+                print(f"\n🧠 [inference] {t_inf_ms:.1f}ms | chunk={len(chunk_np)} ações | attn={'✓' if has_attn else '✗'}")
 
             # 4. Envia chunk para o loop de controle
             #    Se a fila estiver cheia, descarta o chunk antigo e insere o novo
@@ -573,6 +750,7 @@ def main():
     debug_mode = False
     show_video = False
     show_video_control = False
+    show_attn = False
     uncertainty_threshold = 0.0
     remote_sim_ip = None
     actions_per_chunk = 60
@@ -602,6 +780,9 @@ def main():
         elif arg == "--v-control":
             show_video_control = True
             show_video = True   # --v-control implica exibição
+        elif arg == "--v-attn":
+            show_attn = True
+            show_video = True   # --v-attn também precisa do frame RGB
         elif arg.startswith("--remote-sim="):
             remote_sim_ip = arg.split("=", 1)[1]
 
@@ -638,7 +819,8 @@ def main():
     from robot.unitree_g1.unitree_g1_dex3 import UnitreeG1Dex3, UnitreeG1Dex3Config
     print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim})...")
     g1_config = UnitreeG1Dex3Config(
-        robot_ip="10.9.8.73",
+        #robot_ip="10.9.8.73",
+        robot_ip="192.168.123.164",
         control_mode="upper_body",
         is_simulation=is_sim,
         remote_sim_ip=remote_sim_ip,
@@ -668,6 +850,17 @@ def main():
         "right_hand_middle_1_joint.q",
     ]
 
+    # ── Janelas OpenCV — criadas ANTES do inf_thread (aw precisa existir) ─
+    vc = None
+    if show_video_control:
+        vc = VideoControlWindow("Visao da IA — Controles")
+        vc.create()
+
+    aw = None
+    if show_attn:
+        aw = AttnMapWindow("Attention Map — ACT-D")
+        aw.create()
+
     # ── Filas entre threads ───────────────────────────────────────────
     obs_queue    = Queue(maxsize=1)   # sempre a obs mais recente
     action_queue = Queue(maxsize=2)   # no máximo 2 chunks em fila
@@ -691,6 +884,7 @@ def main():
             task_str=task_str,
             actions_per_chunk=actions_per_chunk,
             debug=debug_mode,
+            attn_window=aw,          # None se --v-attn não foi passado
         ),
         daemon=True,
         name="inference_worker",
@@ -705,13 +899,10 @@ def main():
         print("      Trackbars: Contraste e Brilho para simular degradação de vídeo.")
     elif show_video:
         print("   📺 Janela de câmera ativa.")
+    if show_attn:
+        print("   🔥 Janela de Attention Map ativa (--v-attn).")
+        print("      Atualiza a cada inferência. [Q/ESC] na janela de attn para fechar.")
     print("   Ctrl+C para parar.\n")
-
-    # Instancia o player com controles (se pedido)
-    vc = None
-    if show_video_control:
-        vc = VideoControlWindow("Visao da IA — Controles")
-        vc.create()
 
     current_chunk: list = []
     vc_last_rgb = None   # último frame RGB válido para o modo pause
@@ -841,6 +1032,13 @@ def main():
                 _diag_loops = 0
                 _diag_elapsed_sum = 0.0
 
+            # 8. Exibe janela de attention map (atualiza a cada inferência,
+            #    o loop principal só chama show() para processar eventos OpenCV)
+            if aw is not None:
+                alive = aw.show()
+                if not alive:
+                    raise KeyboardInterrupt
+
     except KeyboardInterrupt:
         print("\n🛑 Parando inferência...")
 
@@ -855,6 +1053,8 @@ def main():
         robot.disconnect()
         if vc is not None:
             vc.destroy()
+        if aw is not None:
+            aw.destroy()
         if show_video:
             cv2.destroyAllWindows()
         print("✅ Encerrado com segurança.")

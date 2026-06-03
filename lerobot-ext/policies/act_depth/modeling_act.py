@@ -82,6 +82,9 @@ class ACTPolicy(PreTrainedPolicy):
             )
 
         self.reset()
+        # Último attention map do decoder (atualizado a cada predict_action_chunk)
+        # shape: [B, chunk_size, num_encoder_tokens] ou None
+        self.last_attn_weights = None
 
     def get_optim_params(self) -> dict:
         return [
@@ -197,7 +200,11 @@ class ACTPolicy(PreTrainedPolicy):
         # Injeta features extras no estado se disponíveis
         batch = self._inject_extra_features(batch, depth_feat, pressure_feat)
 
-        actions, (mu, log_sigma) = self.model(batch)
+        actions, (mu, log_sigma), last_attn = self.model(batch)
+
+        # Guarda o último attention map para visualização externa
+        # shape: [B, chunk_size, num_encoder_tokens]  ou None
+        self.last_attn_weights = last_attn
 
         # ── Scene Uncertainty Gate ────────────────────────────
         threshold = getattr(self.config, "scene_uncertainty_threshold", 0.0)
@@ -274,7 +281,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         batch = self._inject_extra_features(batch, depth_feat, pressure_feat)
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat), _ = self.model(batch)
 
         l1_loss_unreduced = (
             F.l1_loss(batch[ACTION], actions_hat, reduction="none")
@@ -443,11 +450,14 @@ class ACTDecoder(nn.Module):
         self.norm = nn.LayerNorm(config.dim_model)
 
     def forward(self, x, encoder_out, pos_embed=None, query_pos_embed=None):
+        last_attn = None
         for layer in self.layers:
             x = layer(x, encoder_out, pos_embed=pos_embed, query_pos_embed=query_pos_embed)
+            last_attn = getattr(layer, "last_cross_attn_weights", None)
         if self.norm is not None:
             x = self.norm(x)
-        return x.unsqueeze(0)
+        # last_attn: [B, chunk_size, num_encoder_tokens]
+        return x.unsqueeze(0), last_attn
 
 
 class ACTDecoderLayer(nn.Module):
@@ -479,7 +489,11 @@ class ACTDecoderLayer(nn.Module):
             x = self.norm2(x)
         q = x if query_pos_embed is None else x + query_pos_embed
         k = encoder_out if pos_embed is None else encoder_out + pos_embed
-        x = self.multihead_attn(q, k, value=encoder_out)[0]
+        # need_weights=True para capturar attention map decoder→encoder
+        x, self.last_cross_attn_weights = self.multihead_attn(
+            q, k, value=encoder_out,
+            need_weights=True, average_attn_weights=True,
+        )
         x = skip + self.dropout_layer(x)
         if not self.pre_norm:
             x = self.norm2(x)
@@ -642,11 +656,11 @@ class ACT(nn.Module):
         decoder_in = torch.zeros(B, self.config.chunk_size, self.config.dim_model, device=encoder_out.device)
         query_pos = self.decoder_pos_embed.weight.unsqueeze(0).expand(B, -1, -1)
 
-        decoder_out = self.decoder(decoder_in, encoder_out, query_pos_embed=query_pos)
+        decoder_out, last_attn = self.decoder(decoder_in, encoder_out, query_pos_embed=query_pos)
         # decoder_out: [1, B, chunk_size, dim_model]
         actions = self.action_head(decoder_out[0])  # [B, chunk_size, action_dim]
 
-        return actions, (mu, log_sigma_x2)
+        return actions, (mu, log_sigma_x2), last_attn
 
 
 def _get_activation_fn(activation: str) -> Callable:
