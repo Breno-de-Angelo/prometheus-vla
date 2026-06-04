@@ -28,17 +28,11 @@ class ImagePublishProcess:
         for camera_name, camera_config in camera_configs.items():
             height = camera_config["height"]
             width = camera_config["width"]
-            target_name = f"g1_{camera_name}_shm" 
+            target_name = f"g1_{camera_name}_shm"
 
-            # =========================================================
-            # CORREÇÃO: 1 Canal para Depth, 3 Canais para RGB
-            # =========================================================
-            if 'depth' in camera_name.lower():
-                size = height * width * 1
-                shape = (height, width, 1)
-            else:
-                size = height * width * 3
-                shape = (height, width, 3)
+            # Depth e RGB ambos usam 3 canais (depth será triplicado no processamento)
+            size = height * width * 3
+            shape = (height, width, 3)
                 
             dtype = np.uint8
 
@@ -67,17 +61,13 @@ class ImagePublishProcess:
                 image = render_caches[image_key]
 
                 if 'depth' in camera_name.lower():
-                    # =========================================================
-                    # PROFUNDIDADE REAL (1 Canal)
-                    # =========================================================
-                    # O simulador (MuJoCo) manda a distância em metros.
-                    depth_clipped = np.clip(image, 0.0, 2.0)
-                    
-                    # Converte de 2.0m para a escala de 8-bits (0 a 255)
-                    depth_8bit = (depth_clipped * (255.0 / 2.0)).astype(np.uint8)
-                    
-                    # Adiciona a dimensão do canal para ficar (Height, Width, 1)
-                    processed_img = np.expand_dims(depth_8bit, axis=-1)
+                    # Depth vem em uint16 milímetros do simulator (base_sim.py:214),
+                    # com shape (H, W, 1). Squeeze pra 2D antes de empilhar nos 3 canais.
+                    # Converter para metros, scale com factor 38, e triplicar para 3 canais
+                    depth_m = np.squeeze(image).astype(np.float32) / 1000.0
+                    depth_8bit = np.clip(depth_m * 38, 0, 255).astype(np.uint8)
+                    # Stack para (H, W, 3)
+                    processed_img = np.stack([depth_8bit, depth_8bit, depth_8bit], axis=-1)
                         
                 elif 'ir_' in camera_name.lower():
                     if len(image.shape) == 3 and image.shape[2] == 3:
@@ -138,17 +128,19 @@ class ImagePublishProcess:
             sys.path.insert(0, root_dir)
 
         from sim.sensor_utils import ImageUtils, SensorServer
-        
+
         try:
             sensor_server = SensorServer()
             sensor_server.start_server(port=zmq_port)
+            print(f"[ZMQ SERVER] Aguardando conexões na porta {zmq_port}...")
             shared_arrays, shm_blocks = {}, {}
-            
+
             for camera_name, info in shared_memory_info.items():
                 shm = shared_memory.SharedMemory(name=info["name"])
                 shm_blocks[camera_name] = shm
                 shared_arrays[camera_name] = np.ndarray(info["shape"], dtype=info["dtype"], buffer=shm.buf)
 
+            first_publish = True
             while not stop_event.is_set():
                 if data_ready_event.wait(timeout=min(image_dt, 0.1)):
                     data_ready_event.clear()
@@ -162,7 +154,10 @@ class ImagePublishProcess:
                             
                         serialized_data = {"timestamps": timestamps, "images": encoded_images}
                         sensor_server.send_message(serialized_data)
-                    except Exception as e: 
+                        if first_publish:
+                            print(f"[ZMQ SERVER] ✅ PUBLICANDO IMAGENS! Câmeras: {list(encoded_images.keys())}")
+                            first_publish = False
+                    except Exception as e:
                         print(f"Error publishing images: {e}")
                 else:
                     time.sleep(0.001)

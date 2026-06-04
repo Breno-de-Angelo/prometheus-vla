@@ -1,0 +1,189 @@
+# ==========================================================
+# PI05-D — Treino com FUSÃO DEPTH + TÁTIL  (fusion_mode: full)
+# Projeto: Unitree G1 + Dex3 + câmera de profundidade
+#
+# COMO FUNCIONA A FUSÃO (importante):
+#   Esta config usa a policy NATIVA do LeRobot `type: pi05`
+#   (lerobot/policies/pi05). A profundidade (PointNet) e o tato
+#   (pressure_proj das duas mãos Dex3) NÃO são campos do PI05Config —
+#   eles são injetados como tokens extras de prefixo em tempo de
+#   treino pelo `train/pi05_d_injector.py::inject_pi05_d`.
+#
+#   O acionamento é feito pelo motor `train/run_train.py`, que olha
+#   as chaves de TOPO `depth_fusion: true` + `fusion_mode: full` e o
+#   `policy.type: pi05` (ver run_train.py ~linha 270-287). Por isso o
+#   treino DEVE ser lançado por `python -m train.run_train` (não pelo
+#   init_lerobot_train_v3.py, que só roteia actdepth/pi05depth).
+#
+#   O injector `inject_pi05_d` consome do batch, em cada step, as
+#   features: observation.images.head_camera_depth,
+#   observation.left_hand_pressure e observation.right_hand_pressure.
+#   Logo elas PRECISAM estar em input_features (abaixo) para o
+#   dataloader carregá-las. Se faltarem, o injector degrada para uma
+#   passada pi05 nativa (sem fusão) naquele step.
+# ==========================================================
+
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
+#    repo_id/root vêm de config/record/record_televuer.yaml
+#    (dataset gravado por init_lerobot_record_v2.py).
+# ==========================================================
+dataset:
+  repo_id: lewislf/G1_Dex3_depth_tactil_dataset
+  root: datasets/G1_Dex3_depth_tactil_dataset
+
+  # Augmentation só em RGB (o run_train.py já mascara o depth do
+  # ColorJitter via patched_getitem_rgb_only_transforms). Copiado de
+  # config/train/train_get_cup_depth.yaml.
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+  # TODO(SPLIT): ajustar à quantidade REAL de episódios gravados.
+  # No momento meta/info.json reporta total_episodes=2 (índices 0 e 1),
+  # ou seja o dataset ainda está sendo gravado / é só um teste.
+  # Quando houver N episódios, separe a maioria aqui para treino e
+  # deixe alguns held-out no val_dataset abaixo. (LeRobot v3 indexa
+  # episódios a partir de 0.)
+  episodes: [0, 1]
+
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO (held-out, mesmo repo)
+# ==========================================================
+val_dataset:
+  repo_id: lewislf/G1_Dex3_depth_tactil_dataset
+  root: datasets/G1_Dex3_depth_tactil_dataset
+  # TODO(SPLIT): com apenas 2 episódios não há held-out real.
+  # Reutiliza o ep. 1 só para o pipeline rodar; troque por episódios
+  # que NÃO estejam na lista de treino assim que houver dados.
+  episodes: [1]
+
+
+# ==========================================================
+# 3. POLICY — PI05 NATIVA (a fusão é injetada via run_train.py)
+# ==========================================================
+# ATENÇÃO: NÃO coloque use_pressure / use_depth_3d / camera_intrinsics /
+# depth_fusion / fusion_mode aqui dentro de `policy:`. Esses NÃO são
+# campos de PI05Config (lerobot/policies/pi05/configuration_pi05.py) e
+# o parser (draccus) rejeita campos desconhecidos. Os de fusão são
+# chaves de TOPO (seção 4). Os parâmetros de depth/tato são fixos no
+# injector (pressure_dim=66, intrínsecos default fx=fy=600/cx=320/cy=240).
+policy:
+  type: pi05
+  repo_id: lewislf/G1_Dex3_depth_tactil_pi05_full
+  push_to_hub: false
+
+  # ── pretrained base ─────────────────────────────────────
+  # TODO(PRETRAIN): apontar para o pretrain pi05/pi05_depth_uni do
+  # Dossiê. Convenção do repo (train/config/pi05.yaml): lerobot/pi05_base.
+  # Deixado COMENTADO de propósito — não invente um caminho inexistente.
+  # Se omitido, o treino parte dos pesos baixados pelo make_policy
+  # (PaliGemma/Gemma) sem o checkpoint do projeto.
+  # pretrained_path: lerobot/pi05_base
+  # pretrained_path: <caminho-do-pi05_depth_uni>   # se for resumir injetado
+
+  # ── modelos base / dims ─────────────────────────────────
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  image_resolution: [224, 224]
+  # state[28]/action[28] do projeto < 32 → padding automático para max_*_dim
+  max_state_dim: 32
+  max_action_dim: 32
+
+  # ── chunking / observações ──────────────────────────────
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  # ── normalização (default do PI05: VISUAL=IDENTITY, STATE/ACTION=QUANTILES)
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+  # ── finetuning / memória ────────────────────────────────
+  train_expert_only: true       # campo válido do PI05Config (congela VLM)
+  freeze_vision_encoder: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+
+  # ── otimizador / scheduler (lr 1e-4 -> 1e-5, do Dossiê) ──
+  optimizer_lr: 1.0e-4
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 13000
+  scheduler_decay_lr: 1.0e-5
+
+  # ── FEATURES ────────────────────────────────────────────
+  # head_camera_depth + *_hand_pressure: NÃO são consumidas pela
+  # pipeline nativa do PI05; servem para o dataloader carregá-las e o
+  # injector pi05_d retirá-las do batch e gerar os tokens extras.
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [1, 480, 640]
+    observation.state:
+      type: STATE
+      shape: [28]
+    observation.left_hand_pressure:
+      type: STATE
+      shape: [33]
+    observation.right_hand_pressure:
+      type: STATE
+      shape: [33]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [28]
+
+
+# ==========================================================
+# 4. FUSÃO + TREINAMENTO (chaves de TOPO — CustomTrainPipelineConfig)
+# ==========================================================
+# depth_fusion + fusion_mode são lidos por train/run_train.py:
+#   depth_fusion: true  + policy.type: pi05 + fusion_mode: full
+#   → from .pi05_d_injector import inject_pi05_d  (PointNet + pressão)
+depth_fusion: true
+fusion_mode: full        # "full" = depth(PointNet) + tato(pressão Dex3)
+
+# Intrínsecos da câmera: documentados aqui por rastreabilidade. O
+# injector usa os defaults (fx=600, fy=600, cx=320, cy=240) — iguais a
+# config/train/train_get_cup_depth.yaml — pois run_train.py chama
+# inject_pi05_d sem repassar este bloco. Mantido como comentário para
+# não quebrar o parser (não é campo de TrainPipelineConfig).
+# camera_intrinsics: { fx: 600.0, fy: 600.0, cx: 320.0, cy: 240.0 }
+
+output_dir: train_output/cup_depth_tactil_pi05_full
+job_name: cup_depth_tactil_pi05_full
+
+# Dossiê: batch_size 128, ~13000 steps, eval/save_freq 500.
+steps: 13000
+batch_size: 128
+num_workers: 4
+log_freq: 100
+save_freq: 500
+save_checkpoint: true
+
+
+# ==========================================================
+# 5. AVALIAÇÃO E LOGS
+# ==========================================================
+eval_freq: 500
+
+wandb:
+  enable: true
+  project: prometheus_g1

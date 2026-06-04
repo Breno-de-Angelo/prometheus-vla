@@ -50,7 +50,12 @@ def _load_policy(checkpoint_dir, fusion_mode, device):
     policy.load_state_dict(sd, strict=False)
     return policy
 
-from lerobot.robots.unitree_g1.unitree_g1_dex3 import (  # noqa: E402
+# Usa a classe de lerobot-ext (tátil via get_observation + heartbeat anti-watchdog),
+# igual ao inference_realtime_pi05d.py e ao pipeline de gravação. (lerobot-ext já está
+# no sys.path acima, linha 26.) A cópia de lerobot/src NÃO expõe tátil nem heartbeat.
+# CAVEAT Isaac: este script mira o unitree_sim_isaaclab; p/ ext conectar na ponte Isaac
+# externa (e NÃO subir um MuJoCo in-process), o robot_cfg deve usar sim_backend="isaac".
+from robot.unitree_g1.unitree_g1_dex3 import (  # noqa: E402
     UnitreeG1Dex3,
     UnitreeG1Dex3Config,
 )

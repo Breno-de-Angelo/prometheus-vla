@@ -126,16 +126,71 @@ mesma sub-rede do robô (ex.: `ip addr add 192.168.123.<x>/24 ...`).
 cd ~/I2CA/prometheus-vla
 conda activate g1
 python lerobot-ext/init_lerobot_record_v2.py \
-    --config_path lerobot-ext/config/record/record_televuer.yaml --sim
+    --config_path lerobot-ext/config/record/record_televuer.yaml \
+    --sim \
+    --quest-ip 192.168.68.61 \
+    --quest-adb-ip=192.168.68.51
 ```
 
 `--sim` apenas liga `--robot.is_simulation=true` e `--teleop.is_simulation=true`. Sobe o MuJoCo
 (`unitree-g1-mujoco`), o servidor Vuer VR na **:8012** e o publicador de imagens ZMQ na **:5555**.
 Acesse pelo Quest: `https://<ip-do-laptop>:8012/?ws=wss://<ip-do-laptop>:8012`.
 
-- **As mãos Dex3 não respondem no sim** — `connect()` pula a criação dos publishers DDS da mão; o
-  `get_observation` preenche os joints da mão com 0.0. Mãos só no robô real.
+> ⚠️ **Passe o `--quest-ip <ip-do-laptop>`** (ver §Flags). Sem ele o script **não abre/recarrega** a
+> página do Vuer no browser do Quest — e se o headset não estiver com uma **sessão VR ativa** apontando
+> pro Vuer, o teleop **não recebe dado de controle**: você aperta X/B/A/gatilho/move a mão e **nada
+> responde**. Esse é o motivo nº 1 de "os controles pararam de funcionar".
+
+- **As mãos Dex3 respondem no sim** (classe `lerobot-ext`, atual): o `connect()` sobe a ponte ZMQ↔DDS
+  (`ponte_mao.py`) e o teleop controla os dedos. **Por padrão as DUAS mãos são controladas** (esquerda
+  igual à direita); com `--left-arm-limp` a esquerda inteira (braço + mão) fica solta. ⚠️ Em MuJoCo,
+  `kp=0` **não** deixa a junta visivelmente caída (atrito das juntas a segura) — no sim o efeito é a
+  esquerda **parar de seguir o controle**; o "cair mole" de verdade só no robô real.
+- **A pressão tátil NÃO existe no sim** — `left/right_hand_pressure` saem zeradas; o tátil real só vem do
+  robô (porta ZMQ 6002). Não grave dataset de fusão tátil pelo sim.
 - **A depth do sim NÃO é depth16** (ver §9). Use o sim só pra validar movimento/teleop, nunca pra dataset de profundidade.
+
+---
+
+## 5.1 Flags da linha de comando (CLI)
+
+Flags **extras** do `init_lerobot_record_v2.py` (extraídas e tratadas no `__main__` **antes** de chamar o
+`lerobot_record`; aceitam tanto `--flag valor` quanto `--flag=valor`). Tudo o que não está aqui é repassado
+ao draccus (ex.: `--dataset.root=`, `--config_path`).
+
+| Flag | Vale p/ | O que faz | Default |
+|---|---|---|---|
+| `--config_path <yaml>` | real + sim | Config draccus do record (obrigatório). | — |
+| `--sim` | — | Liga simulação (MuJoCo): seta `--robot.is_simulation=true` e `--teleop.is_simulation=true`. Sem ela = robô real. | off (robô real) |
+| `--quest-ip <ip>` | real + sim | IP do **laptop/servidor Vuer**. O script usa pra abrir o Vuer no browser do Quest via ADB (`https://<ip>:8012/...`). **Sem ele, o browser do Quest não é aberto** → sem sessão VR ativa, o teleop não recebe controle (ver §5). | não abre o browser |
+| `--quest-adb-ip <ip>` | real + sim | IP do **próprio headset Quest** na rede (muda por DHCP). Usado p/ ADB: manter o headset acordado (`prox_close`) e abrir o browser. **Não** é o `--quest-ip`. | `192.168.68.51:5555` |
+| `--left-arm-limp` | real + sim | **Lado esquerdo INTEIRO solto** (`kp=0`): braço (juntas 15–21) **e** mão Dex3 (7 motores). A esquerda para de seguir o controle; só o lado **direito** é teleoperado. Sem a flag, as **duas** mãos/braços são controlados normalmente. (env `G1_LEFT_ARM_LIMP=1`) | off (esquerda ativa) |
+| `--debug` | real + sim | Grava **tudo** enviado/recebido do robô (send/recv) num JSONL em `/tmp/g1_debug_io_<timestamp>.jsonl`. Analise com `python lerobot-ext/analyze_debug_io.py <arquivo>`. (env `G1_DEBUG_IO=<path>`) | off |
+| `--dataset.root=<dir>` | real + sim | Diretório fixo do dataset (repassado ao draccus). Sem ele → auto-timestamp `datasets/.../<YYYYmmdd_HHMMSS>/` (§7). | auto-timestamp |
+
+**Mão/braço esquerdo — resumo do comportamento (importante):**
+- **Sem `--left-arm-limp` (default):** mão **e** braço esquerdos controlados normalmente, **simétrico** ao
+  lado direito (mesmo `kp`, segue o controle, segura a posição via heartbeat).
+- **Com `--left-arm-limp`:** lado esquerdo inteiro com `kp=0` (mole) — braço (em `unitree_g1.py`) e mão
+  Dex3 (`connect`/`heartbeat`/`send_action` em `unitree_g1_dex3.py`) param de seguir o controle. Use quando
+  for treinar/gravar **só com o lado direito**.
+
+**Exemplos:**
+```bash
+# Sim, as duas mãos ativas, abrindo o Vuer no Quest e mantendo o headset acordado:
+python lerobot-ext/init_lerobot_record_v2.py \
+    --config_path lerobot-ext/config/record/record_televuer.yaml \
+    --sim --quest-ip 192.168.68.61 --quest-adb-ip=192.168.68.51
+
+# Só lado direito (braço + mão esquerdos soltos) + gravando debug-IO:
+python lerobot-ext/init_lerobot_record_v2.py \
+    --config_path lerobot-ext/config/record/record_televuer.yaml \
+    --sim --quest-ip 192.168.68.61 --quest-adb-ip=192.168.68.51 \
+    --left-arm-limp --debug
+```
+
+> O guia de como habilitar o ADB-over-wifi no Quest (`adb tcpip 5555`, autorizar o PC, `prox_close` pra
+> pendurar no pescoço) está em `_claude_notes/README_QUEST_PROXIMITY.md`.
 
 ---
 
@@ -147,10 +202,16 @@ Lidos a cada frame em `xr_g1_arm.py`. Detecção por **borda de subida** (clique
 |---|---|---|
 | **X** | esquerdo | **Travar / destravar** o seguimento (toggle). Ao destravar, re-ancora a pose (clutch). |
 | **Y** | esquerdo | **Encerrar** a sessão / gravação. |
-| **A** | direito | **Salvar** o episódio e já começar a gravar o próximo (sem reset). |
-| **B** | direito | **Descartar** o episódio e regravá-lo. |
+| **A** | direito | **Salvar** o episódio e já começar a gravar o próximo (sem reset). Trava a garra direita (grip latch). |
+| **B** | direito | **Descartar** o episódio e regravá-lo. Trava a garra direita (grip latch). |
 | **Grip** (squeeze) | esq/dir | **Fechar a mão inteira** (grip completo). Só no `input_mode: controller`. |
 | **Gatilho** (trigger) | esq/dir | **Pinça** (indicador + polegar). Só no `input_mode: controller`. |
+
+**Grip latch (não solta o copo ao salvar):** ao apertar `A`/`B` com a garra direita fechada (squeeze>0,2),
+ela **trava** na posição atual e segura o objeto através do save e do próximo episódio — porque pra alcançar
+o `A` você relaxa o grip e a mão abriria. Para **retomar o controle ao vivo**: **solte e re-aperte** o grip
+até o nível em que travou (tem que soltar primeiro; não destrava no mesmo instante do `A`). Logs:
+`🔒 [GRIP LATCH] travada` / `🔓 [GRIP LATCH] Destravado`.
 
 **`input_mode` (ver config):**
 - `"controller"` (atual): começa **TRAVADO**; o botão **X** destrava (depois de um countdown de ~3 s).
@@ -197,7 +258,7 @@ dataset:
   single_task: "push the cup"         # ⚠️ é "push" (empurrar) — ajuste se a tarefa for "pick up"
   vcodec: "h264"                      # codec do RGB (a depth NÃO usa vídeo, vai como PNG)
   reset_time_s: 0                     # sem fase de reset entre episódios (salvou → grava o próximo)
-  video_encoding_batch_size: 50       # adia o encoding pro fim, não trava o loop a cada save
+  video_encoding_batch_size: 1        # encoda após cada save (default/testado). batch>1 está BUGADO nesta versão (KeyError no save em lote) — ver §12
 play_sounds: false
 ```
 
@@ -283,6 +344,27 @@ Os patches de treino (`pi05_d_injector` + config) precisam estar na Atena antes 
 - **`single_task: "push the cup"`** — é "empurrar", não "pegar". Confirme se bate com o que você quer treinar.
 - **Reset do copo é manual.** Com `reset_time_s: 0` não há fase de reset entre episódios; reposicione o
   copo no home **antes** de cada sequência, fora do fluxo automático.
+- **`video_encoding_batch_size` > 1 está BUGADO** nesta versão do LeRobot. No fim da gravação, o encode em
+  lote crasha com `KeyError: 'videos/observation.images.head_camera/chunk_index'`
+  (`lerobot_dataset.py:_save_episode_video`): a detecção de "resume" vê os episódios já gravados (sem
+  coluna de vídeo, porque o encode foi adiado) e tenta ler a coluna inexistente → **o dataset inteiro do
+  run sai incompleto/corrompido.** Use `video_encoding_batch_size: 1` (default): encoda após cada save; o
+  heartbeat segura o robô durante a pausa (~1 s p/ episódios curtos), sem timeout.
+- **Soltar o copo ao salvar (`A`).** A mão segue o squeeze **ao vivo** (`right_hand_q = squeeze * RIGHT_TARGET`).
+  Pressionar `A` no controle direito costuma exigir relaxar o grip → squeeze cai a 0 → mão abriria → copo cairia.
+  **Resolvido por DOIS mecanismos:**
+  1. **GRIP LATCH** (`xr_g1_arm.py`): ao apertar `A`/`B` com a garra direita fechada (pico de squeeze recente
+     >0,2), ela **trava** no comando atual e segura o copo através do save e do próximo episódio. Retoma o
+     controle ao vivo quando você **solta e re-aperta** o grip até o nível travado (precisa soltar antes — não
+     destrava no mesmo frame do `A`). Logs `🔒/🔓 [GRIP LATCH]`.
+  2. **HEARTBEAT segura o COMANDO** (`unitree_g1_dex3.py:_heartbeat_worker`): durante a pausa de encode (~13s
+     com `batch_size: 1`), o teleop não roda e o robô fica só no heartbeat. Ele re-publica o **q comandado**
+     das mãos (não a posição medida) — porque re-semear da medida afrouxava a força do grip (o copo bloqueia
+     os dedos → erro ~0 → torque ~0) e soltava o copo. Agora mantém a garra firme. Idem o corpo (via `self.msg`).
+  Alternativa sem latch: **salvar por VOZ ("salvar")**, que não exige soltar o grip.
+
+  ⚠️ A pausa de ~13s por save é o custo de `video_encoding_batch_size: 1` (encode síncrono). O robô fica
+  **seguro e segurando o copo** durante ela (heartbeat). É também um bom momento pra reposicionar o copo.
 - **SIM ≠ REAL na depth (importante):** no `--sim`, a depth do MuJoCo **não** sai como `uint16` mm PNG —
   ela é achatada para `uint8` 3 canais (≈ metros × 38, clip 0–255) e transportada como **JPEG lossy**.
   Além disso, `base_sim.py` define `update_render_caches` **duas vezes** e a segunda (a que o Python usa)

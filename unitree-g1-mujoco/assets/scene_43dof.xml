@@ -2,6 +2,10 @@
   <include file="g1_29dof_with_hand.xml"/>
   <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
 
+  <!-- Grasp estavel: impratio alto (atrito rigido), cone eliptico, passe noslip.
+       Padrao p/ objeto nao deslizar da garra (MuJoCo docs). -->
+  <option impratio="50" cone="elliptic" noslip_iterations="15"/>
+
   <statistic center="0 0 0.5" extent="2.0"/>
 
   <visual>
@@ -15,8 +19,9 @@
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
       markrgb="0.8 0.8 0.8" width="300" height="300"/>
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
-    <mesh name="cup" file="../cup.stl" scale="0.0013 0.0013 0.0013" />
-    <mesh name="chaleira" file="../chaleira.obj" scale="0.2 0.2 0.2" />
+    <material name="toalha_mat" rgba="0.96 0.96 0.93 1" shininess="0.0" specular="0.0" reflectance="0.0"/>
+    <mesh name="copo_visual" file="copo_visual.obj"/>
+    <mesh name="copo_hull"   file="copo_hull.obj"/>
   </asset>
 
   <worldbody>
@@ -25,27 +30,36 @@
     <!-- Site -->
     <site name="com_marker" pos="0.1 0 0" size="0.05" rgba="1 0 0 1" type="sphere"/>
 
-  <body name="mesa" pos="0.45 0 0.45">
-      <geom name="geometria_mesa" type="box" size="0.2 0.6 0.35" rgba="0.6 0.4 0.2 1" friction="1 0.005 0.0001"/>
-      
-      <geom name="borda_fundo" type="box" size="0.01 0.6 0.02" pos="0.19 0 0.37" rgba="0.5 0.3 0.1 1" friction="1 0.005 0.0001"/>
-      <geom name="borda_esquerda" type="box" size="0.2 0.01 0.02" pos="0 0.59 0.37" rgba="0.5 0.3 0.1 1" friction="1 0.005 0.0001"/>
-      <geom name="borda_direita" type="box" size="0.2 0.01 0.02" pos="0 -0.59 0.37" rgba="0.5 0.3 0.1 1" friction="1 0.005 0.0001"/>
-
-      <body name="corpo_botao" pos="0 0.3 0.37">
-        <joint name="junta_botao" type="slide" axis="0 0 1" range="-0.015 0" springref="0" stiffness="100" damping="5"/>
-        <geom name="geometria_botao" type="cylinder" size="0.03 0.02" rgba="0 1 0 1" mass="0.01" friction="1 0.005 0.0001"/>
-      </body>
+  <!-- Mesa 180x79x75 cm (CxLxA). Tocando no chão (body z=0). -->
+  <body name="mesa" pos="0.45 0 0">
+      <!-- Tampo: 3cm espessura, topo em z=0.75 -->
+      <geom name="geometria_mesa" type="box" size="0.395 0.90 0.015" pos="0 0 0.735"
+            rgba="0.75 0.60 0.42 1" friction="1 0.005 0.0001"
+            solref="0.005 1.0" solimp="0.99 0.999 0.0001"/>
+      <!-- Toalha branca fosca presa ao tampo -->
+      <geom name="toalha_mesa" type="box" size="0.405 0.91 0.002" pos="0 0 0.752"
+            material="toalha_mat" friction="0.8 0.005 0.0001"
+            solref="0.005 1.0" solimp="0.99 0.999 0.0001"/>
+      <!-- 4 pernas: 3cm quadrado, dos 0 até 0.72m -->
+      <geom name="perna_1" type="box" size="0.015 0.015 0.36" pos=" 0.370  0.875 0.36" rgba="0.65 0.50 0.35 1"/>
+      <geom name="perna_2" type="box" size="0.015 0.015 0.36" pos=" 0.370 -0.875 0.36" rgba="0.65 0.50 0.35 1"/>
+      <geom name="perna_3" type="box" size="0.015 0.015 0.36" pos="-0.370  0.875 0.36" rgba="0.65 0.50 0.35 1"/>
+      <geom name="perna_4" type="box" size="0.015 0.015 0.36" pos="-0.370 -0.875 0.36" rgba="0.65 0.50 0.35 1"/>
     </body>
 
-    <!--<body name="objeto_customizado2" pos="0.40 0.05 0.98">
-      <freejoint name="junta_livre_bloco2"/>
-      <geom name="geometria_bloco2" type="mesh" mesh="chaleira" rgba="0.8 0.1 0.1 1" mass="0.700" friction="3 0.05 0.0001"/>
-    </body>-->
-
-    <body name="objeto_customizado" pos="0.35 -0.05 0.90">
+    <!-- Copo branco — mesh real do objeto do lab. Base em z=0 no mesh. -->
+    <!-- spawn 2mm acima da toalha para evitar penetração inicial -->
+    <body name="objeto_customizado" pos="0.329 -0.081 0.756">
       <freejoint name="junta_livre_bloco"/>
-      <geom name="geometria_bloco" type="mesh" mesh="cup" rgba="0.8 0.1 0.1 1" mass="0.1" friction="1 0.005 0.0001"/>
+      <!-- visual: mesh com aparência real, sem colisão -->
+      <geom name="copo_geom_visual" type="mesh" mesh="copo_visual"
+            rgba="0.97 0.97 0.95 1" contype="0" conaffinity="0" mass="0"/>
+      <!-- colisão: cilindro simples alinhado ao centro do copo (raio=4.4cm, h=9.2cm)
+           Centrado em z=0.046 (metade da altura) para coincidir com o mesh -->
+      <geom name="geometria_bloco" type="cylinder" size="0.044 0.046" pos="0 0 0.046"
+            rgba="0 0 0 0" mass="0.05" condim="4"
+            friction="8.0 0.3 0.0" priority="2"
+            solref="0.005 1.0" solimp="0.99 0.999 0.0001 0.5 2"/>
     </body>
     
     <!-- Third-person camera for visualization -->

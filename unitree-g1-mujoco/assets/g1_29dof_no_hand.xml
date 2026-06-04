@@ -404,8 +404,10 @@
                           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_wrist_yaw_link" />
                           <body name="right_rubber_hand" >
                             <inertial pos="0.0001 0.0001 0.0001" mass="0.0001" diaginertia="0 0 0" />
-                            <geom pos="0.0415 -0.003 0" quat="1 0 0 0" type="mesh"  density="0" rgba="0.7 0.7 0.7 1"
-                              mesh="right_rubber_hand" />
+                            <geom pos="0.0415 -0.003 0" quat="1 0 0 0" type="mesh" density="0" rgba="0.7 0.7 0.7 1"
+                              mesh="right_rubber_hand"
+                              friction="2.0 0.01 0.0001"
+                              solref="0.01 1.0" solimp="0.95 0.99 0.001 0.5 2"/>
                           </body>
                         </body>
                       </body>

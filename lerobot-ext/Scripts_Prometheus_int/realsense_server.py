@@ -41,16 +41,16 @@ def start_realsense_zmq():
                 continue
 
             rgb = np.asanyarray(color_frame.get_data())
-            depth_raw = np.asanyarray(depth_frame.get_data())  # uint16, mm
+            depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 (unidades do sensor)
 
-            # Normaliza depth para [0, 1] = [0, 2 m] (convencao usada no ACT-D / pi05-D)
-            depth_m = depth_raw.astype(np.float32) * depth_scale  # metros
-            depth_norm = np.clip(depth_m / 2.0, 0.0, 1.0)         # [0, 1]
-            depth_u8 = (depth_norm * 255.0).astype(np.uint8)
-            depth_3ch = cv2.merge([depth_u8, depth_u8, depth_u8])  # 3 canais p/ encoder
+            # depth em mm como uint16 (1 canal), PNG lossless no transporte.
+            # clip em 32767: o ToTensor decodifica PNG I;16 como int16 (com sinal).
+            depth_mm = np.clip(
+                depth_raw.astype(np.float32) * depth_scale * 1000.0, 0.0, 32767.0
+            ).astype(np.uint16)
 
             encoded_rgb = ImageUtils.encode_image(rgb)
-            encoded_depth = ImageUtils.encode_image(depth_3ch)
+            encoded_depth = ImageUtils.encode_depth_image(depth_mm)  # PNG uint16 (1 canal)
 
             t = time.time()
             server.send_message({

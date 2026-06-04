@@ -18,6 +18,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 import yaml
 import os
 from .image_publish_utils import ImagePublishProcess
+from .depth_noise import DepthNoiseModel
 from .metric_utils import check_contact
 from .sim_utils import get_subtree_body_names
 from .unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
@@ -75,7 +76,10 @@ class DefaultEnv:
         self.renderers = {}  # Will be lazily initialized
         self._renderers_initialized = False
         self.image_dt = self.config.get("IMAGE_DT", 0.033333)
-        
+
+        # Modelo de ruído pra aproximar o depth da D435 (opt-in via config/env).
+        self.depth_noise = DepthNoiseModel.from_config(self.config)
+
         # Image publishing subprocess (initialized separately)
         self.image_publish_process = None
 
@@ -210,6 +214,8 @@ class DefaultEnv:
             # MATEMÁTICA DO DEPTH: METROS PARA MILÍMETROS (16-bits)
             if 'depth' in camera_name.lower():
                 depth_meters = renderer.render()
+                # Aproxima o ruído da D435 ainda em metros (inválidos -> 0).
+                depth_meters = self.depth_noise.apply(depth_meters)
                 depth_mm = (depth_meters * 1000.0).astype(np.uint16)
                 render_caches[camera_name + "_image"] = depth_mm[..., np.newaxis]
             else:
@@ -544,7 +550,48 @@ class DefaultEnv:
 
     def update_viewer(self):
         if self.viewer is not None:
+            self._draw_vla_target_marker()
             self.viewer.sync()
+
+    def _draw_vla_target_marker(self):
+        """Opt-in (env SHOW_TARGET_MARKER=1): desenha esferas verdes na posicao
+        que a VLA quer para os punhos -- FK do q-alvo recebido em low_cmd. Mostra
+        ao vivo PARA ONDE a politica esta mandando a mao (vs onde ela esta)."""
+        import os
+        if os.environ.get("SHOW_TARGET_MARKER") not in ("1", "true", "True"):
+            return
+        if self.unitree_bridge is None or not getattr(self.unitree_bridge, "low_cmd", None):
+            return
+        try:
+            if getattr(self, "_fk_data", None) is None:
+                self._fk_data = mujoco.MjData(self.mj_model)
+            fk = self._fk_data
+            # parte do estado atual e sobrescreve so os bracos com o q-alvo (motores 15..28 no G1-29)
+            fk.qpos[:] = self.mj_data.qpos
+            for i in range(15, 29):
+                if i >= len(self.body_joint_index):
+                    continue
+                jid = int(self.body_joint_index[i])
+                qadr = int(self.mj_model.jnt_qposadr[jid])
+                fk.qpos[qadr] = self.unitree_bridge.low_cmd.motor_cmd[i].q
+            mujoco.mj_kinematics(self.mj_model, fk)
+
+            scn = self.viewer.user_scn
+            n = 0
+            for body_name in ("left_wrist_yaw_link", "right_wrist_yaw_link"):
+                bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                if bid < 0 or n >= scn.maxgeom:
+                    continue
+                pos = np.asarray(fk.xpos[bid], dtype=np.float64)
+                mujoco.mjv_initGeom(
+                    scn.geoms[n], mujoco.mjtGeom.mjGEOM_SPHERE,
+                    np.array([0.03, 0, 0]), pos, np.eye(3).flatten(),
+                    np.array([0.0, 1.0, 0.0, 0.8], dtype=np.float32),
+                )
+                n += 1
+            scn.ngeom = n
+        except Exception as e:
+            print(f"[target_marker] erro: {e}")
 
     def update_viewer_camera(self):
         if self.viewer is not None:
@@ -560,31 +607,6 @@ class DefaultEnv:
     def get_privileged_obs(self):
         """Get privileged observation. Should be implemented by subclasses."""
         return {}
-
-    def update_render_caches(self):
-        """Update render cache and shared memory for subprocess."""
-        # Lazy init renderers on first call (creates OpenGL context in calling thread)
-        if not self._renderers_initialized and self.offscreen:
-            self.init_renderers()
-            self._renderers_initialized = True
-            print(f"✓ Renderers initialized lazily in thread {__import__('threading').current_thread().name}")
-        
-        render_caches = {}
-        for camera_name, camera_config in self.camera_configs.items():
-            renderer = self.renderers.get(camera_name)
-            if renderer is None:
-                continue
-            if "params" in camera_config:
-                renderer.update_scene(self.mj_data, camera=camera_config["params"])
-            else:
-                renderer.update_scene(self.mj_data, camera=camera_name)
-            render_caches[camera_name + "_image"] = renderer.render()
-        
-        # Update shared memory if image publishing process is available
-        if self.image_publish_process is not None:
-            self.image_publish_process.update_shared_memory(render_caches)
-
-        return render_caches
 
     def handle_keyboard_button(self, key):
         if self.elastic_band is not None:

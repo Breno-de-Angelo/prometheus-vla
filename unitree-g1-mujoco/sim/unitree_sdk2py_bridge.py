@@ -452,7 +452,10 @@ class ElasticBand:
         self.kd_pos = 1000
         self.kp_ang = 1000
         self.kd_ang = 10
-        self.point = np.array([0, 0, 1])
+        import os as _os
+        # Z do alvo da faixa (segura o torso_link). 1.0 = robo "voando"; 0.847 = pes no chao.
+        self.point = np.array([float(_os.environ.get("ROOT_X", 0.0)), 0,
+                               float(_os.environ.get("BAND_Z", 0.847))])
         self.length = 0
         self.enable = True
 

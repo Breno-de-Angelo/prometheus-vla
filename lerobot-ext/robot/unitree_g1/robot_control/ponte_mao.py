@@ -103,6 +103,12 @@ class PonteG1Completa:
                     self.dds_left_pub.Write(cmd_dds)
                 else:
                     self.dds_right_pub.Write(cmd_dds)
+
+                # >>> DEBUG TEMPORÁRIO (remover depois)
+                self._dbg = getattr(self, "_dbg", 0) + 1
+                if self._dbg % 60 == 0:
+                    qs = [round(float(m["q"]), 2) for m in payload["data"]["motor_cmd"][:4]]
+                    print(f"[PONTE-DBG] recv {topic} q[:4]={qs}", flush=True)
             except Exception as e:
                 if self.running:
                     print(f"Erro: {e}")

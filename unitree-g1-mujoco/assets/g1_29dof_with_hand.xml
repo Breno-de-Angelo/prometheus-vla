@@ -239,11 +239,11 @@
 
 
           <body name="torso_link" pos="0 0 0.019">
-            <camera name="head_camera" pos="0.06 0.0 0.45" euler="0 -0.8 -1.57" fovy="90"/>
+            <camera name="head_camera" pos="0.06 0.0 0.45" euler="0 -0.3 -1.57" fovy="43"/>
 
-            <camera name="head_camera_depth"    pos="0.06 0.0175 0.45" euler="0 -0.8 -1.57" fovy="58" />
-            <camera name="d435i_ir_left"  pos="0.06 0.032 0.45" euler="0 -0.8 -1.57" fovy="58" />
-            <camera name="d435i_ir_right" pos="0.06 -0.0175 0.45" euler="0 -0.8 -1.57" fovy="58" />
+            <camera name="head_camera_depth"    pos="0.06 0.0175 0.45" euler="0 -0.3 -1.57" fovy="58" />
+            <camera name="d435i_ir_left"  pos="0.06 0.032 0.45" euler="0 -0.3 -1.57" fovy="58" />
+            <camera name="d435i_ir_right" pos="0.06 -0.0175 0.45" euler="0 -0.3 -1.57" fovy="58" />
 
 
             <inertial pos="0.00331658 0.000261533 0.179856"
@@ -487,7 +487,9 @@
                             conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1"
                             mesh="right_hand_palm_link" />
                           <geom pos="0.0415 -0.003 0" quat="1 0 0 0" type="mesh"
-                            rgba="0.7 0.7 0.7 1" mesh="right_hand_palm_link" />
+                            rgba="0.7 0.7 0.7 1" mesh="right_hand_palm_link"
+                            friction="2.0 0.01 0.0001"
+                            solref="0.01 1.0" solimp="0.95 0.99 0.001 0.5 2"/>
                           <body name="right_hand_thumb_0_link" pos="0.067 -0.003 0">
                               <inertial pos="-0.000884246 0.00863407 0.000944293"
                                 quat="0.643965 0.462991 -0.398986 0.460173" mass="0.0862366"

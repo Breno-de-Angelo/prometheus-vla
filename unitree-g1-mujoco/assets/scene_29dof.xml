@@ -26,6 +26,21 @@
     <site name="left_foot_marker" pos="0.1 0 0" size="0.025" rgba="1 0 0 1" type="sphere"/>
     <site name="right_foot_marker" pos="0.1 0 0" size="0.025" rgba="1 0 0 1" type="sphere"/>
     <camera name="global_view" pos="2.910 -5.040 3.860" xyaxes="0.866 0.500 0.000 -0.250 0.433 0.866"/>
+
+    <body name="mesa" pos="0.45 0 0.45">
+      <geom name="geometria_mesa" type="box" size="0.2 0.6 0.35" rgba="0.6 0.4 0.2 1" friction="1 0.005 0.0001"/>
+      <geom name="borda_fundo"    type="box" size="0.01 0.6 0.02" pos="0.19 0 0.37"   rgba="0.5 0.3 0.1 1" friction="1 0.005 0.0001"/>
+      <geom name="borda_esquerda" type="box" size="0.2 0.01 0.02" pos="0 0.59 0.37"   rgba="0.5 0.3 0.1 1" friction="1 0.005 0.0001"/>
+      <geom name="borda_direita"  type="box" size="0.2 0.01 0.02" pos="0 -0.59 0.37"  rgba="0.5 0.3 0.1 1" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- COPO (Cilindro com fricção e contato otimizados) -->
+    <body name="bloco" pos="0.35 -0.05 1.2">
+      <freejoint name="junta_livre_bloco"/>
+      <geom name="geometria_bloco" type="cylinder" size="0.04 0.08" rgba="0.8 0.1 0.1 1" mass="0.1"
+            friction="1.5 0.005 0.0001"
+            solref="0.02 1.0" solimp="0.9 0.95 0.001 0.5 2"/>
+    </body>
   </worldbody>
   <!-- <default>
     <geom friction="0.5"/>

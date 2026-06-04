@@ -106,7 +106,8 @@ def inject_pi05_d(policy, device, camera_intrinsics=None, pressure_dim=66, load_
 
         tokens = []
         if depth is not None:
-            pc = depth_to_pointcloud(depth.float(), self.camera_intrinsics)
+            # depth chega em mm; converte pra metros na back-projection
+            pc = depth_to_pointcloud(depth.float(), self.camera_intrinsics, depth_scale=0.001)
             depth_tok = self.pointnet(pc).unsqueeze(1)
             tokens.append(depth_tok)
         if left is not None and right is not None:

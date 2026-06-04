@@ -23,12 +23,30 @@ IMAGE_DT: 0.033333  # ~30Hz camera
 
 # Rendering
 ENABLE_ONSCREEN: true
-ENABLE_OFFSCREEN: false
+ENABLE_OFFSCREEN: true
 MP_START_METHOD: "spawn"
 
 # Sensors
 USE_SENSOR: False
 PRINT_SCENE_INFORMATION: True
+
+# Ruído procedural no depth pra aproximar a Intel RealSense D435 (sim2real).
+# O MuJoCo gera depth geométrico perfeito; isto injeta ruído axial (~quadrático
+# em z), buracos de borda, dropout e clip de alcance. Override rápido por env:
+# G1_DEPTH_NOISE=0 desliga, G1_DEPTH_NOISE=1 liga (tem precedência sobre 'enabled').
+DEPTH_NOISE:
+  enabled: true
+  z_min: 0.2            # alcance mínimo útil da D435 (m); abaixo -> inválido (0)
+  z_max: 3.0            # alcance máx. confiável (m); acima -> inválido (0)
+  baseline_m: 0.05      # baseline do par stereo (~50 mm)
+  subpix_sigma: 0.08    # desvio do ruído de disparidade (px) -> erro axial
+  quantize: true        # quantiza disparidade (resolução cai com z²)
+  subpix_levels: 8      # passos de sub-pixel (1/8 px)
+  edge_thresh_m: 0.02   # salto de profundidade que vira borda/buraco (m)
+  edge_dilate: 1        # dilatação do halo de buracos (px)
+  p_dropout: 0.001      # fração de pixels válidos zerados (speckle)
+  lateral_sigma_px: 0.0 # jitter lateral (0 = off; custa caro)
+  seed: 0
 
 # Robot Dimensions
 NUM_MOTORS: 29

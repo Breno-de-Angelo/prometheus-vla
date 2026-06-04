@@ -5,15 +5,20 @@ robot:
 teleop:
   type: xr_g1_arm
   zmq: true
-  input_mode: "hand"
-  display_mode: "ego"
+  input_mode: "controller"   # "hand" = hand tracking | "controller" = controles físicos do Quest
+  display_mode: "pass-through"
   ee_type: "dex3"
 
 dataset:
-  repo_id: Mrwlker/push_cup
-  root: "meu_dataset/push_cup"
-  push_to_hub: true
-  single_task: "push the cup"
+  repo_id: lewislf/G1_Dex3_depth_tactil_dataset
+  root: "datasets/G1_Dex3_depth_tactil_dataset"
+  push_to_hub: false
+  single_task: "Pick up the white cup"
   vcodec: "h264"
+  episode_time_s: 3600  # sem auto-reset: salva/descarta manualmente com A/B
+  reset_time_s: 0  # sem período de espera entre episódios — descarta e re-grava imediatamente
+  # 50 = adia o encode pro fim da sessão → sem pausa por save → controle contínuo.
+  # Bug do LeRobot (KeyError 'videos/.../chunk_index') foi corrigido em lerobot_dataset.py.
+  video_encoding_batch_size: 50
 
 play_sounds: false
