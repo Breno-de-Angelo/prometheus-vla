@@ -88,7 +88,7 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
             cam2_height = 480
         else:
             # Hardware Real: D435i em 848x480 (16:9) — FOV horizontal completo (4:3 cortava
-            # as laterais) + resolução nativa/ótima do depth da D435.
+            # as laterais) + resolução nativa/ótima do depth da D435i.
             cam2_width = 848
             cam2_height = 480
 
