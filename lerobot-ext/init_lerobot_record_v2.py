@@ -85,11 +85,16 @@ def patched_hw_to_dataset_features(features, feature_type, use_videos):
         
         chave_depth = "observation.images.head_camera_depth"
         if chave_depth in dataset_features:
-            # depth como imagem uint16 1-canal (PNG), em vez de video h264 8-bit
-            print("[HACK LEROBOT] Depth -> PNG uint16 1-canal (mm)")
+            # depth como imagem uint16 1-canal (PNG), em vez de video h264 8-bit.
+            # Deriva a largura do shape que o robot já calculou (cam2_width: 640 no sim,
+            # 848 no real) — evita hardcode que crashava o sim depois da mudança 848.
+            orig = dataset_features[chave_depth]
+            h = orig["shape"][0]
+            w = orig["shape"][1]
+            print(f"[HACK LEROBOT] Depth -> PNG uint16 1-canal (mm) | shape derivado: ({h},{w},1)")
             dataset_features[chave_depth] = {
                 "dtype": "image",
-                "shape": (480, 848, 1),
+                "shape": (h, w, 1),
                 "names": ["height", "width", "channels"],
             }
             
