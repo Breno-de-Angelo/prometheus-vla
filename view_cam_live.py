@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Viewer ao vivo das câmeras RGB e Depth do robô via ZMQ."""
 import argparse
+import os
 import sys
 import time
 import json
@@ -74,25 +75,30 @@ def main():
             #     → é ESSE array uint16 (mm) que o LeRobot grava como observação.
             # Mudar a cor aqui NÃO altera o dataset (nem precisa rodar no robô).
             # ──────────────────────────────────────────────────────────────────
-            # Convenção pedida: VERMELHO = mais perto, AZUL = mais longe.
-            # depth do servidor: valor alto = mais longe; 0 = pixel inválido (sem leitura).
+            # Convenção: VERMELHO = perto, AZUL = longe.
+            # Usa FAIXA ABSOLUTA FIXA (em metros), NÃO auto-estica por frame. Auto-esticar
+            # (min/max ou percentis do frame) faz uma cena toda perto — mesa a 0.5-1m —
+            # ser espalhada no arco-íris inteiro e parecer "longe". Com faixa fixa, a cor
+            # significa distância real. Ajuste a faixa por env DEPTH_VIS_MIN_M/MAX_M.
+            vis_min = float(os.environ.get("DEPTH_VIS_MIN_M", "0.2"))
+            vis_max = float(os.environ.get("DEPTH_VIS_MAX_M", "1.5"))
             valid = depth > 0
             if valid.any():
-                # percentis 5–95 dos VÁLIDOS → ignora inválidos e outliers, dá contraste estável.
-                lo = float(np.percentile(depth[valid], 5))
-                hi = float(np.percentile(depth[valid], 95))
-                hi = hi if hi > lo else lo + 1.0
-                norm = np.clip((depth.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
-                # JET: 0=azul, 255=vermelho. perto (depth baixo) → 255 (vermelho);
-                # longe (depth alto) → 0 (azul). Daí o (1 - norm).
+                # unidade: sim publica metros*38 (valores baixos); robô real publica mm.
+                # detecta pela magnitude e converte pra metros.
+                scale = 38.0 if float(depth[valid].max()) < 150.0 else 1000.0
+                depth_m = depth.astype(np.float32) / scale
+                norm = np.clip((depth_m - vis_min) / (vis_max - vis_min), 0.0, 1.0)
+                # JET: 0=azul, 255=vermelho → perto (norm baixo) vira vermelho. Daí (1-norm).
                 d_vis = ((1.0 - norm) * 255).astype(np.uint8)
                 d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_JET)
                 d_color[~valid] = (0, 0, 0)   # inválidos PRETOS (não vermelhos)
-                lab_lo, lab_hi = int(depth[valid].min()), int(depth[valid].max())
+                lab_lo, lab_hi = float(depth_m[valid].min()), float(depth_m[valid].max())
+                label = (f"Depth real [{lab_lo:.2f}-{lab_hi:.2f}m] | "
+                         f"escala fixa {vis_min:.1f}-{vis_max:.1f}m  vermelho=perto azul=longe")
             else:
                 d_color = np.zeros((*depth.shape, 3), dtype=np.uint8)
-                lab_lo, lab_hi = 0, 0
-            label = f"Depth [{lab_lo}-{lab_hi}]  vermelho=perto azul=longe"
+                label = "Depth [sem dados]"
             panels.append((label, d_color))
 
         if not panels:

@@ -239,11 +239,11 @@
 
 
           <body name="torso_link" pos="0 0 0.019">
-            <camera name="head_camera" pos="0.06 0.0 0.45" euler="0 -0.3 -1.57" fovy="43"/>
+            <camera name="head_camera" pos="0.06 0.0 0.45" euler="0 -0.45 -1.57" fovy="43"/>
 
-            <camera name="head_camera_depth"    pos="0.06 0.0175 0.45" euler="0 -0.3 -1.57" fovy="58" />
-            <camera name="d435i_ir_left"  pos="0.06 0.032 0.45" euler="0 -0.3 -1.57" fovy="58" />
-            <camera name="d435i_ir_right" pos="0.06 -0.0175 0.45" euler="0 -0.3 -1.57" fovy="58" />
+            <camera name="head_camera_depth"    pos="0.06 0.0175 0.45" euler="0 -0.45 -1.57" fovy="58" />
+            <camera name="d435i_ir_left"  pos="0.06 0.032 0.45" euler="0 -0.45 -1.57" fovy="58" />
+            <camera name="d435i_ir_right" pos="0.06 -0.0175 0.45" euler="0 -0.45 -1.57" fovy="58" />
 
 
             <inertial pos="0.00331658 0.000261533 0.179856"
