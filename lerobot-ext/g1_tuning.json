@@ -1,5 +1,15 @@
 {
-  "arm_kp": 100.0,
-  "smoothing_alpha": 0.2,
-  "max_delta": 0.06
+  "arm_kp_shoulder": 80.0,
+  "arm_kp_elbow": 80.0,
+  "arm_kp_wrist": 40.0,
+  "arm_kd_shoulder": 3.0,
+  "arm_kd_elbow": 3.0,
+  "arm_kd_wrist": 1.5,
+  "arm_velocity_limit": 20.0,
+  "smoothing_alpha": 0.7,
+  "max_delta": 0.12,
+  "hand_smoothing_alpha": 0.4,
+  "hand_max_delta": 0.5,
+  "hand_velocity_limit": 10.0,
+  "wrist_filter_alpha": 0.4
 }
