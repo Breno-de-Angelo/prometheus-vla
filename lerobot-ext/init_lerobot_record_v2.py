@@ -89,7 +89,7 @@ def patched_hw_to_dataset_features(features, feature_type, use_videos):
             print("[HACK LEROBOT] Depth -> PNG uint16 1-canal (mm)")
             dataset_features[chave_depth] = {
                 "dtype": "image",
-                "shape": (480, 640, 1),
+                "shape": (480, 848, 1),
                 "names": ["height", "width", "channels"],
             }
             

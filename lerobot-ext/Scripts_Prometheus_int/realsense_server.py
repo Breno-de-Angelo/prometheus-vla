@@ -14,8 +14,8 @@ def start_realsense_zmq():
     cfg = rs.config()
 
     # RGB + Depth streams da D435i
-    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    cfg.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
+    cfg.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
 
     try:
         profile = pipeline.start(cfg)
