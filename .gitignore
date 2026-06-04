@@ -21,6 +21,18 @@ models/
 # Dataset / treino
 */meu_dataset/
 lerobot-ext/train_output/
+# Gravacoes de coleta (mp4/parquet) — NUNCA subir (sao GBs de dados)
+datasets/
+**/datasets/
+*.mp4
+*.parquet
+
+# Caches / temporarios
+g1_29_model_cache.pkl
+*.pkl
+.omg/
+unitree-g1-mujoco/dds_sn
+**/_sweep_tmp.xml
 
 # Submodules / libs locais
 #lerobot-ext/tracelr/
@@ -33,3 +45,6 @@ lerobot-ext/train_output/
 .vscode/
 lerobot-ext/g1_env.tar.gz
 *.tar.gz
+
+# Notas internas do Claude (NUNCA subir) — handoff/docs de trabalho
+_claude_notes/
