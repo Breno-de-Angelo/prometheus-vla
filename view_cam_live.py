@@ -94,9 +94,11 @@ def main():
                 scale = 38.0 if float(depth[valid].max()) < 150.0 else 1000.0
                 depth_m = depth.astype(np.float32) / scale
                 norm = np.clip((depth_m - vis_min) / (vis_max - vis_min), 0.0, 1.0)
-                # JET: 0=azul, 255=vermelho → perto (norm baixo) vira vermelho. Daí (1-norm).
+                # TURBO: mesmo colormap que o rerun (viz do LeRobot) usa por padrão p/ depth.
+                # TURBO: 0=azul, 255=vermelho → perto (norm baixo) vira vermelho. Daí (1-norm).
+                # (rerun usa o inverso: perto=azul; aqui mantemos perto=vermelho a seu pedido.)
                 d_vis = ((1.0 - norm) * 255).astype(np.uint8)
-                d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_JET)
+                d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO)
                 d_color[~valid] = (0, 0, 0)   # inválidos PRETOS (não vermelhos)
                 lab_lo, lab_hi = float(depth_m[valid].min()), float(depth_m[valid].max())
                 label = (f"Depth real [{lab_lo:.2f}-{lab_hi:.2f}m] | "
