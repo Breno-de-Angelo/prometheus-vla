@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import json
+import base64
 import numpy as np
 import cv2
 from pathlib import Path
@@ -59,7 +60,11 @@ def main():
 
         if depth is not None:
             if isinstance(depth, str):
-                depth = ImageUtils.decode_image(depth)
+                # depth e PNG uint16 (mm). IMREAD_UNCHANGED preserva os 16 bits.
+                # decode_image usa IMREAD_COLOR (8-bit) e DESTROI a profundidade
+                # (vira ~mm/256 → valores ~2-3 → ÷38 da 0.03-0.05m → tela toda vermelha).
+                depth = cv2.imdecode(np.frombuffer(base64.b64decode(depth), np.uint8),
+                                     cv2.IMREAD_UNCHANGED)
             if depth.ndim == 3:
                 depth = depth[:, :, 0]
             # ──────────────────────────────────────────────────────────────────
