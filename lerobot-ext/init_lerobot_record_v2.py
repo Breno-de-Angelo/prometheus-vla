@@ -208,6 +208,73 @@ def _patched_write_image(image, fpath, compress_level=1):
 _img_writer_mod.write_image = _patched_write_image
 
 # =========================================================================
+# 💉 INJEÇÃO 3.3: FIX do batch encoding do LeRobot v3.0
+# BUG do core: _batch_save_episode_video monta o path do META/EPISODES file
+# usando o índice do DATA file (data/chunk_index, data/file_index). O data
+# pagina a cada ~5 episódios (depth uint16 embutido é grande), mas o
+# meta/episodes cabe muitos episódios em file-000 → no episódio 5 ele tenta
+# ler meta/episodes/chunk-000/file-001.parquet (inexistente) →
+# FileNotFoundError no encoding final. TODA gravação com >5 episódios crashava
+# ao encerrar (os dados ficavam salvos, mas o vídeo RGB não era encodado).
+# FIX: usar o índice de meta/episodes (o correto para esse path).
+# =========================================================================
+import pandas as _pd_enc_fix
+import logging as _lg_enc_fix
+import lerobot.datasets.lerobot_dataset as _ld_mod
+from lerobot.datasets.utils import (
+    DEFAULT_EPISODES_PATH as _DEF_EP_PATH,
+    load_episodes as _load_eps_fix,
+)
+
+def _patched_batch_save_episode_video(self, start_episode, end_episode=None):
+    if end_episode is None:
+        end_episode = self.num_episodes
+    _lg_enc_fix.info(f"[FIX-ENC] batch encoding episodios {start_episode}..{end_episode - 1}")
+    if self.meta.episodes is None:
+        if hasattr(self.meta, "_flush_metadata_buffer"):
+            self.meta._flush_metadata_buffer()
+        if hasattr(self.meta, "_close_writer"):
+            self.meta._close_writer()
+        self.meta.episodes = _load_eps_fix(self.root)
+
+    def _meta_idx(ep):
+        e = self.meta.episodes[ep]
+        return e["meta/episodes/chunk_index"], e["meta/episodes/file_index"]
+
+    chunk_idx, file_idx = _meta_idx(start_episode)
+    episode_df_path = self.root / _DEF_EP_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+    episode_df = _pd_enc_fix.read_parquet(episode_df_path)
+
+    for ep_idx in range(start_episode, end_episode):
+        _lg_enc_fix.info(f"[FIX-ENC] encoding videos do episodio {ep_idx}")
+        c2, f2 = _meta_idx(ep_idx)
+        if c2 != chunk_idx or f2 != file_idx:
+            episode_df.to_parquet(episode_df_path)
+            self.meta.episodes = _load_eps_fix(self.root)
+            chunk_idx, file_idx = c2, f2
+            episode_df_path = self.root / _DEF_EP_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+            episode_df = _pd_enc_fix.read_parquet(episode_df_path)
+
+        video_ep_metadata = {}
+        for video_key in self.meta.video_keys:
+            video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
+        video_ep_metadata.pop("episode_index")
+        if self.meta.latest_episode is None:
+            self.meta.latest_episode = {}
+        self.meta.latest_episode.update(
+            {k: [v] if not isinstance(v, list) else v for k, v in video_ep_metadata.items()})
+        video_ep_df = _pd_enc_fix.DataFrame(
+            {k: ([float(v)] if "timestamp" in k else [v]) for k, v in video_ep_metadata.items()},
+            index=[ep_idx],
+        ).convert_dtypes(dtype_backend="pyarrow")
+        episode_df = episode_df.combine_first(video_ep_df)
+        episode_df.to_parquet(episode_df_path)
+        self.meta.episodes = _load_eps_fix(self.root)
+
+_ld_mod.LeRobotDataset._batch_save_episode_video = _patched_batch_save_episode_video
+print("[INJEÇÃO 3.3] FIX do batch encoding aplicado (usa meta/episodes index, não data)")
+
+# =========================================================================
 # 🎤 INJEÇÃO 4: Comandos de Voz e Teclado (Setas, Pulo Duplo e PAUSE!)
 # =========================================================================
 import lerobot.utils.control_utils
