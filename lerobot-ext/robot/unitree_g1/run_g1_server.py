@@ -86,7 +86,14 @@ RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "1") not in ("", "0", "fal
 #               de 30Hz em qualquer velocidade). Clip de velocidade como backstop.
 #   "unitree" = FIEL ao G1_29_ArmController: clip de velocidade puro contra a posição
 #               MEDIDA (get_current_dual_arm_q), sem interpolação temporal.
-RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "interp").strip().lower()
+RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "unitree").strip().lower()
+
+# WATCHDOG DE SEGURANÇA: se o laptop para de mandar comando por > STALE_S (encoding
+# de save, Ctrl-C, crash, queda de rede), a rampa SOLTA o braço suavemente decaindo
+# kp→0 em RELEASE_S (em vez de segurar a pose rígida pra sempre, que obrigava a matar
+# o server). kd é mantido → o braço desce amortecido, não em queda livre.
+STALE_S = float(_os_top.environ.get("G1_STALE_S", "2.0"))
+RELEASE_S = float(_os_top.environ.get("G1_RELEASE_S", "1.5"))
 
 
 def _scale_clip(cur, tgt, vmax):
@@ -114,7 +121,7 @@ class _Holder:
     reconstruir o struct — assim o dict_to_*cmd (caro) só roda a 30Hz, não a 250Hz."""
     __slots__ = (
         "lock", "left", "right", "body", "left_ver", "right_ver", "body_ver",
-        "meas_body", "meas_left", "meas_right",
+        "meas_body", "meas_left", "meas_right", "body_ts", "left_ts", "right_ts",
     )
 
     def __init__(self):
@@ -125,6 +132,10 @@ class _Holder:
         self.left_ver = 0
         self.right_ver = 0
         self.body_ver = 0
+        # perf_counter do último comando recebido (watchdog de staleness/release).
+        self.body_ts = 0.0
+        self.left_ts = 0.0
+        self.right_ts = 0.0
         # Posição MEDIDA (q) p/ o modo "unitree" (clip contra o medido). Listas
         # alinhadas a ARM_JOINT_IDS / HAND_JOINT_IDS; None até o 1º estado chegar.
         self.meas_body = None   # q medido das juntas do braço (ordem ARM_JOINT_IDS)
@@ -334,6 +345,7 @@ def cmd_receiver_loop(
         with holder.lock:
             holder.body = msg_dict.get("data", {})
             holder.body_ver += 1
+            holder.body_ts = time.perf_counter()
 
 
 def cmd_ramp_loop(
@@ -357,7 +369,9 @@ def cmd_ramp_loop(
     goal_q = None     # alvo do segmento
     seg_t0 = 0.0
     cmd = None
+    base_kp = None    # kp original do braço (p/ o decay do watchdog)
     seen_ver = -1
+    released = False  # já avisou que soltou?
     fails = 0
     while not shutdown_event.is_set():
         t0 = time.perf_counter()
@@ -365,11 +379,36 @@ def cmd_ramp_loop(
             with holder.lock:
                 data = holder.body
                 ver = holder.body_ver
+                body_ts = holder.body_ts
+            stale_for = (t0 - body_ts) if body_ts else 0.0
+
+            # WATCHDOG: laptop parou de comandar → solta o braço suave (kp→0).
+            if cmd is not None and body_ts and stale_for > STALE_S:
+                rel = 1.0 - (stale_for - STALE_S) / RELEASE_S if RELEASE_S > 0 else 0.0
+                if rel < 0.0:
+                    rel = 0.0
+                if base_kp is not None:
+                    for k, j in enumerate(ARM_JOINT_IDS):
+                        cmd.motor_cmd[j].kp = base_kp[k] * rel  # q mantido (cur_q)
+                cmd.crc = crc.Crc(cmd)
+                lowcmd_pub_debug.Write(cmd)
+                if not released:
+                    print(f"[arm-ramp] WATCHDOG: sem comando há {stale_for:.1f}s — "
+                          f"soltando o braço (kp→0 em {RELEASE_S:.1f}s).", flush=True)
+                    released = True
+                fails = 0
+                elapsed = time.perf_counter() - t0
+                if dt - elapsed > 0:
+                    shutdown_event.wait(dt - elapsed)
+                continue
+            released = False
+
             if data is not None:
                 if ver != seen_ver:
                     # Alvo novo (30Hz): json já foi no receiver; reconstrói struct 1x.
                     cmd = dict_to_lowcmd(data)
                     goal_new = [cmd.motor_cmd[j].q for j in ARM_JOINT_IDS]
+                    base_kp = [cmd.motor_cmd[j].kp for j in ARM_JOINT_IDS]
                     if cur_q is None:
                         cur_q = list(goal_new)  # 1º alvo ≈ pose medida → sem salto.
                     start_q = list(cur_q)       # novo segmento começa do q atual
@@ -457,10 +496,12 @@ def handcmd_receiver_loop(
             with holder.lock:
                 holder.left = data
                 holder.left_ver += 1
+                holder.left_ts = time.perf_counter()
         elif topic == kTopicDex3RightCommand:
             with holder.lock:
                 holder.right = data
                 holder.right_ver += 1
+                holder.right_ts = time.perf_counter()
 
 
 def handcmd_ramp_loop(
