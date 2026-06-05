@@ -176,7 +176,12 @@ class G1_29_ArmIK:
         self.opti.solver("ipopt", opts)
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
-        self.smooth_filter = WeightedMovingFilter(np.array([0.7, 0.3]), 14)  # 4->2 taps: ~23ms menos lag de fase a 30Hz; clip de 250Hz (streamer) ja suaviza o degrau e warm-start reduz salto do IPOPT
+        # 4 taps (RESTAURADO). O 2-tap [0.7,0.3] de c4fb596 partia da premissa de que o
+        # "clip de 250Hz do streamer suaviza o degrau" — mas no ROBÔ REAL o streamer publica
+        # via ponte JSON+ZMQ(CONFLATE)+DDS no Jetson, que não aguenta 250Hz → a rampa é
+        # descartada e NÃO chega suave ao firmware. Logo reduzir o filtro do IK só tirou
+        # suavização → reintroduziu o tremor do punho. 4 taps = estado bom de 2026-06-03.
+        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
         self.vis = None
 
         if self.Visualization:
