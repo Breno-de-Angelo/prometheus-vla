@@ -372,6 +372,31 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         else:
             val_dataset = None
 
+    # ── Correção ACT-D: neutraliza stats ImageNet do depth ───────────────
+    # O factory.py do LeRobot (linha 128) sobrescreve as stats de TODAS as
+    # camera_keys com ImageNet quando use_imagenet_stats=True. O depth entra
+    # como VISUAL e recebe mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225].
+    # O NormalizerProcessorStep usaria isso para normalizar o depth, fazendo
+    # todos os valores de Z ficarem negativos e a PointNet colapsar.
+    #
+    # Solução: substituímos as stats do depth por identidade (mean=0, std=1)
+    # para que passe pelo normalizador sem alteração, chegando em [0,1] na
+    # depth_to_pointcloud — exatamente como foi gravado pelo sensor.
+    #
+    # Não modificamos o LeRobot — corrigimos externamente aqui.
+    _DEPTH_KEY = "observation.images.head_camera_depth"
+    _datasets_to_fix = [d for d in [dataset, val_dataset] if d is not None]
+    for _ds in _datasets_to_fix:
+        if _DEPTH_KEY in _ds.meta.stats:
+            _ds.meta.stats[_DEPTH_KEY]["mean"] = torch.zeros(3, 1, 1)
+            _ds.meta.stats[_DEPTH_KEY]["std"]  = torch.ones(3, 1, 1)
+    if any(_DEPTH_KEY in _ds.meta.stats for _ds in _datasets_to_fix):
+        logging.info(
+            "[ACT-D] Stats do depth resetadas para identidade (mean=0, std=1). "
+            "Depth chega na PointNet em [0,1] sem distorção ImageNet."
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Criando ambiente de avaliação")

@@ -137,10 +137,11 @@ class VideoControlWindow:
         self._lock       = threading.Lock()
 
     # ── Criação da janela ─────────────────────────────────────────────
-    # Só namedWindow — nenhuma outra API de janela Qt aqui.
+    # WINDOW_NORMAL sem flags extras: o Qt backend escala o frame para
+    # preencher a janela inteira quando ela é redimensionada/maximizada.
     def create(self):
         cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.win, 960, 600)
+        cv2.resizeWindow(self.win, 640, 480)
 
     # ── Aplica contraste e brilho ao frame ────────────────────────────
     def process(self, frame_rgb: np.ndarray) -> np.ndarray:
@@ -213,6 +214,7 @@ class VideoControlWindow:
     def show(self, frame_rgb: np.ndarray) -> bool:
         bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         bgr = self._draw_panel(bgr)
+
         cv2.imshow(self.win, bgr)
 
         with self._lock:
@@ -270,150 +272,503 @@ class VideoControlWindow:
 
 # ─────────────────────────────────────────────────────────────────────
 # 1b. JANELA DE ATTENTION MAP (--v-attn)
+#
+# Abre DUAS janelas separadas:
+#
+#   "Attention Map — RGB"
+#     Heatmap INFERNO sobreposto na câmera, normalizado SOMENTE dentro
+#     dos tokens de imagem (min/max dos 300 patches RGB). Isso garante
+#     que regiões quentes correspondem a patches que o decoder realmente
+#     olhou — sem contaminação dos valores de state/latente, que são
+#     escalares muito maiores e antes deixavam tudo "flat".
+#
+#   "Attention Map — Analise"
+#     Painel dividido em 3 seções ocupando 100% da janela:
+#
+#     ① Comparação de tokens (barras horizontais — mesma escala entre si)
+#        RGB médio | Depth 3D | State (1 token) | Latente z
+#        → responde: "o modelo usa a câmera ou decorou o movimento?"
+#        → escala local: min/max dos 4 escalares (não contamina o heatmap)
+#
+#     ② Ação predita por junta (chunk completo)
+#        28 linhas coloridas, eixo X = tempo (steps do chunk)
+#        Cada grupo de juntas em cor diferente:
+#          braço esq (0-6)  | braço dir (7-13) | mão esq (14-20) | mão dir (21-27)
+#        → responde: "o modelo está abrindo a mão? fazendo o gesto certo?"
+#
+#     ③ Histórico de atenção ao longo das últimas inferências
+#        Linhas: RGB | State | Depth — na mesma escala relativa
+#        → responde: "a atenção muda quando a cena muda?"
+#
+# Sem nenhuma modificação no modelo.
 # ─────────────────────────────────────────────────────────────────────
 
 class AttnMapWindow:
     """
-    Janela OpenCV que exibe o attention map do decoder ACT-D sobreposto
-    na imagem RGB ao vivo.
+    Duas janelas OpenCV para análise de atenção e ação do ACT-D.
+    Sem modificação no modelo — lê apenas last_attn_weights e _last_action_chunk_np.
 
-    Como funciona:
-      - Após cada inferência, `policy.last_attn_weights` contém
-        [B, chunk_size, num_encoder_tokens].
-      - Os primeiros tokens correspondem aos patches de imagem (h*w por câmera).
-      - Fazemos a média dos pesos sobre o chunk, redimensionamos para a
-        resolução da imagem e sobrepõemos como heatmap JET.
+    Ordem dos tokens no encoder (ACT-D):
+      [0 .. n_rgb-1]   → patches RGB ResNet18 (15×20 = 300 para 480×640)
+      [n_rgb]          → depth token   (se use_depth_3d)
+      [n_rgb + d]      → state token   (sempre — 1 único token para todas as juntas)
+      [n_rgb + d + 1]  → latente z     (se use_vae)
 
-    Uso:
-      aw = AttnMapWindow("Attention Map — ACT-D")
-      aw.create()
-      aw.update(policy, rgb_frame)   # chame após cada inferência
-      alive = aw.show()              # False → fechar
+    Grupos de juntas para o gráfico de ação (28 juntas, G1 upper body):
+      0-6   braço esquerdo  (shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw)
+      7-13  braço direito
+      14-20 mão esquerda    (thumb 0/1/2, middle 0/1, index 0/1)
+      21-27 mão direita
     """
 
-    # Tokens de imagem no encoder: h*w do backbone (feature map final do ResNet18)
-    # Para entrada 480×640 com ResNet18: feature map = 15×20 = 300 patches por câmera
-    # Calculamos dinamicamente no primeiro update.
     _img_token_h: int | None = None
     _img_token_w: int | None = None
+    _HISTORY_LEN = 120   # pontos no gráfico de histórico
 
-    def __init__(self, window_name: str = "Attention Map — ACT-D"):
-        self.win = window_name
-        self._last_display: np.ndarray | None = None
+    # Grupos e cores BGR para o gráfico de ação
+    _JOINT_GROUPS = [
+        ("Braco Esq",  range(0,  7),  (60,  200,  60)),   # verde
+        ("Braco Dir",  range(7,  14), (60,  160, 240)),   # azul
+        ("Mao Esq",    range(14, 21), (220, 120,  60)),   # laranja
+        ("Mao Dir",    range(21, 28), (180,  60, 220)),   # roxo
+    ]
+
+    def __init__(
+        self,
+        window_name: str = "Attention Map",
+        use_depth: bool = False,
+        use_vae: bool = True,
+        action_dim: int = 28,
+    ):
+        self.win_rgb   = window_name + " — RGB"
+        self.win_panel = window_name + " — Analise"
+        self.use_depth  = use_depth
+        self.use_vae    = use_vae
+        self.action_dim = action_dim
+
+        self._last_rgb_display:   np.ndarray | None = None
+        self._last_panel_display: np.ndarray | None = None
         self._lock = threading.Lock()
 
+        self._state_history = []
+        self._depth_history = []
+        self._rgb_history   = []
+
     def create(self):
-        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.win, 640, 480)
+        # WINDOW_NORMAL: o Qt backend escala o frame para preencher a janela
+        # inteira ao redimensionar — sem bordas brancas, sem distorção.
+        cv2.namedWindow(self.win_rgb, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.win_rgb, 640, 545)
+
+        cv2.namedWindow(self.win_panel, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.win_panel, 1200, 900)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hline(canvas, y, color=(70, 70, 70)):
+        cv2.line(canvas, (0, y), (canvas.shape[1], y), color, 1)
+
+    @staticmethod
+    def _label(canvas, txt, x, y, scale=0.42, color=(180, 180, 180), bold=False):
+        th = 2 if bold else 1
+        cv2.putText(canvas, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, th, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_bar(canvas, x0, y, bar_w, fill_frac, label, raw_val, color_bgr, bar_h=16):
+        """Barra horizontal: Agora o texto fica ACIMA da barra para não cortar no layout."""
+        cv2.putText(canvas, f"{label}: {raw_val:.5f}",
+                    (x0, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (x0, y), (x0 + bar_w, y + bar_h), (45, 45, 45), -1)
+        fw = max(1, int(fill_frac * bar_w))
+        cv2.rectangle(canvas, (x0, y), (x0 + fw, y + bar_h), color_bgr, -1)
+
+    @staticmethod
+    def _draw_action_group(canvas, chunk, joint_range, x0, y0, w, h, color_bgr, label):
+        """Modo dinâmico: Se T > 1, divide o espaço e cria um mini-gráfico (sparkline) separado para cada junta."""
+        chunk = np.array(chunk)
+        T = chunk.shape[0]
+
+        cv2.rectangle(canvas, (x0, y0), (x0 + w, y0 + h), (22, 22, 22), -1)
+        cv2.putText(canvas, label, (x0 + 4, y0 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color_bgr, 1, cv2.LINE_AA)
+
+        sub = chunk[:, list(joint_range)]
+        n_joints = sub.shape[1]
+
+        if T == 1:
+            # ── Modo estático (chunk=1): Barras horizontais instantâneas
+            bar_area_y0 = y0 + 25
+            avail_h = h - 30
+            bar_h = max(4, avail_h // n_joints - 2)
+            vmin, vmax = sub.min(), sub.max()
+            rng = vmax - vmin if abs(vmax - vmin) > 1e-6 else 1.0
+
+            for j in range(n_joints):
+                alpha = 0.45 + 0.55 * (j / max(n_joints - 1, 1))
+                col   = tuple(int(c * alpha) for c in color_bgr)
+                by    = bar_area_y0 + j * (bar_h + 2)
+                val   = float(sub[0, j])
+                frac  = (val - vmin) / rng
+
+                cv2.rectangle(canvas, (x0 + 4, by), (x0 + w - 4, by + bar_h), (40, 40, 40), -1)
+                fw = max(1, int(frac * (w - 8)))
+                cv2.rectangle(canvas, (x0 + 4, by), (x0 + 4 + fw, by + bar_h), col, -1)
+                cv2.putText(canvas, f"{val:.3f}", (x0 + w - 42, by + bar_h - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (180, 180, 180), 1, cv2.LINE_AA)
+            return
+
+        # ── Modo temporal (chunk > 1): Sparklines empilhadas
+        row_h = (h - 25) / n_joints
+        start_y = y0 + 22
+
+        for j in range(n_joints):
+            ry = start_y + j * row_h
+            # Linha divisória suave entre as juntas
+            cv2.line(canvas, (x0 + 2, int(ry + row_h)), (x0 + w - 2, int(ry + row_h)), (35, 35, 35), 1)
+
+            j_vals = sub[:, j]
+            # Escala local: cada junta normaliza contra seu próprio min/max daquele chunk
+            vmin, vmax = j_vals.min(), j_vals.max()
+            rng = vmax - vmin if abs(vmax - vmin) > 1e-6 else 1.0
+
+            pts = []
+            for t in range(T):
+                px = x0 + int(t / (T - 1) * (w - 4)) + 2
+                py = ry + row_h - ((j_vals[t] - vmin) / rng * (row_h - 4)) - 2
+                pts.append((px, int(py)))
+
+            alpha = 0.4 + 0.6 * (j / max(n_joints - 1, 1))
+            col = tuple(int(c * alpha) for c in color_bgr)
+            for i in range(1, len(pts)):
+                cv2.line(canvas, pts[i - 1], pts[i], col, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_history(canvas, histories_and_colors, x0, y0, w, h):
+        """Desenha históricos com escalas Y completamente independentes."""
+        cv2.rectangle(canvas, (x0, y0), (x0 + w, y0 + h), (22, 22, 22), -1)
+        
+        for history, color_bgr in histories_and_colors:
+            if len(history) < 2:
+                continue
+            
+            # NORMALIZAÇÃO INDIVIDUAL: O State e Depth agora vão oscilar e 
+            # preencher toda a altura do quadro baseados nos seus próprios valores.
+            vmin, vmax = min(history), max(history)
+            rng = vmax - vmin if abs(vmax - vmin) > 1e-8 else 1.0
+            
+            pts = []
+            n = len(history)
+            for i, v in enumerate(history):
+                px = x0 + int(i / (n - 1) * (w - 2)) + 1
+                py = y0 + h - int((v - vmin) / rng * (h - 4)) - 2
+                py = max(y0 + 1, min(y0 + h - 1, py))
+                pts.append((px, py))
+                
+            for i in range(1, len(pts)):
+                cv2.line(canvas, pts[i - 1], pts[i], color_bgr, 1, cv2.LINE_AA)
+
+    # ─────────────────────────────────────────────────────────────────
+    # update() — thread de inferência
+    # ─────────────────────────────────────────────────────────────────
 
     def update(self, policy, rgb_frame: np.ndarray | None):
-        """
-        Processa `policy.last_attn_weights` e prepara o frame para exibição.
-        Pode ser chamado da thread de inferência (tem lock interno).
-
-        Args:
-            policy: ACTPolicy com `last_attn_weights` populado.
-            rgb_frame: imagem RGB [H, W, 3] uint8 — pode ser None se não houver câmera.
-        """
         attn = getattr(policy, "last_attn_weights", None)
         if attn is None or rgb_frame is None:
             return
 
+        action_chunk = getattr(policy, "_last_action_chunk_np", None)
+
         try:
-            # attn: [B, chunk_size, num_encoder_tokens]  (pode ser Tensor ou ndarray)
             if isinstance(attn, torch.Tensor):
                 attn_np = attn.detach().cpu().float().numpy()
             else:
                 attn_np = np.array(attn, dtype=np.float32)
 
-            # Média sobre batch e chunk → [num_encoder_tokens]
-            weights = attn_np[0].mean(axis=0)  # [num_encoder_tokens]
+            # max sobre as queries do decoder → [N_tokens]
+            # Usamos max (não mean) para preservar os picos de atenção.
+            # A mean de 100 queries suaviza tudo — o range encolhe para ~0.001
+            # e o heatmap fica flat. O max mostra qual token alguma query
+            # realmente priorizou, que é o sinal visual que queremos.
+            weights = attn_np[0].max(axis=0) if attn_np.ndim == 3 else attn_np.max(axis=0)
+            N = weights.shape[0]
 
-            # ── Descobre a geometria do feature map de imagem ────────────
-            # Tokens de imagem ficam no início do encoder.
-            # Heurística: raiz quadrada do número de tokens por câmera.
-            # Para ResNet18 com entrada 480×640: backbone layer4 → 15×20 = 300.
-            # Para entradas diferentes, tentamos o split mais quadrado possível.
-            n_img_tokens = weights.shape[0]
-            # Pega só tokens de imagem (descarta state/latent/depth extras no final)
-            # Estimativa conservadora: descartamos os últimos 3 tokens
-            # (state, latent, latent_pos). Ajuste se tiver mais modalidades.
-            n_extra = 3  # state token + 2 latent pos tokens
-            n_img = max(n_img_tokens - n_extra, 1)
+            # ── Descobre geometria ────────────────────────────────────
+            n_extra = int(self.use_depth) + 1 + int(self.use_vae)
+            n_img   = max(N - n_extra, 1)
 
-            # Tenta encontrar dimensões h×w para o feature map
-            if self._img_token_h is None or self._img_token_w is None:
-                # Tenta resolução conhecida primeiro, senão usa sqrt
-                if n_img == 300:        # ResNet18, 480×640 → 15×20
+            if self._img_token_h is None:
+                if n_img == 300:
                     self._img_token_h, self._img_token_w = 15, 20
-                elif n_img == 225:      # ResNet18, 360×480 → 15×15 (approx)
+                elif n_img == 225:
                     self._img_token_h, self._img_token_w = 15, 15
                 else:
                     side = int(n_img ** 0.5)
-                    self._img_token_h = side
-                    self._img_token_w = side
+                    self._img_token_h = self._img_token_w = side
 
             h_feat, w_feat = self._img_token_h, self._img_token_w
-            n_use = h_feat * w_feat
+            n_rgb_tokens   = h_feat * w_feat
 
-            img_weights = weights[:n_use]  # [h_feat * w_feat]
+            # ── Fatia tokens não-visuais ──────────────────────────────
+            off = n_rgb_tokens
+            attn_depth  = float(weights[off])     if self.use_depth else 0.0
+            off        += int(self.use_depth)
+            attn_state  = float(weights[off])
+            off        += 1
+            attn_latent = float(weights[off])     if self.use_vae   else 0.0
+            attn_rgb_mean = float(weights[:n_rgb_tokens].mean())
+            attn_rgb_max  = float(weights[:n_rgb_tokens].max())
+            # Para o histórico e comparação de tokens usamos attn_rgb_max:
+            # a média de 300 tokens após softmax é ~1/N e varia pouquíssimo
+            # entre inferências — o máximo preserva o pico de atenção real.
+            attn_rgb_scalar = attn_rgb_max
 
-            # Normaliza para [0, 1]
-            w_min, w_max = img_weights.min(), img_weights.max()
-            if w_max - w_min > 1e-6:
-                img_weights = (img_weights - w_min) / (w_max - w_min)
+            # ── Histórico ─────────────────────────────────────────────
+            self._rgb_history.append(attn_rgb_scalar)
+            self._state_history.append(attn_state)
+            self._depth_history.append(attn_depth)
+            for lst in (self._rgb_history, self._state_history, self._depth_history):
+                if len(lst) > self._HISTORY_LEN:
+                    lst.pop(0)
+
+            # ══════════════════════════════════════════════════════════
+            # JANELA 1 — Heatmap RGB
+            # Normaliza APENAS dentro dos tokens de imagem (não contamina
+            # com escalares de state/latente que são muito maiores).
+            # ══════════════════════════════════════════════════════════
+            img_w = weights[:n_rgb_tokens].copy()
+            i_min, i_max = img_w.min(), img_w.max()
+            if i_max - i_min > 1e-8:
+                img_w = (img_w - i_min) / (i_max - i_min)
             else:
-                img_weights = np.zeros_like(img_weights)
+                img_w = np.zeros_like(img_w)
 
-            # Reshape → [h_feat, w_feat]
-            attn_map = img_weights.reshape(h_feat, w_feat)
+            attn_map     = img_w.reshape(h_feat, w_feat)
+            H, W         = rgb_frame.shape[:2]
+            attn_resized = cv2.resize(attn_map.astype(np.float32), (W, H),
+                                      interpolation=cv2.INTER_LINEAR)
+            attn_uint8   = (attn_resized * 255).astype(np.uint8)
+            heat_bgr     = cv2.applyColorMap(attn_uint8, cv2.COLORMAP_INFERNO)
+            heat_rgb     = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
 
-            # Upscale para resolução da imagem original
-            H, W = rgb_frame.shape[:2]
-            attn_resized = cv2.resize(attn_map, (W, H), interpolation=cv2.INTER_LINEAR)
 
-            # Converte para heatmap colorido (JET)
-            attn_uint8 = (attn_resized * 255).astype(np.uint8)
-            heatmap_bgr = cv2.applyColorMap(attn_uint8, cv2.COLORMAP_JET)
-            heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+            blended      = (0.55 * heat_rgb + 0.45 * rgb_frame).astype(np.uint8)
 
-            # Sobrepõe na imagem RGB original
-            alpha = 0.55
-            blended = (alpha * heatmap_rgb + (1 - alpha) * rgb_frame).astype(np.uint8)
+            self._label(blended, "Cross-Attention decoder (tokens RGB)", 8, 22,
+                        0.5, (255, 255, 255), bold=True)
+            self._label(blended,
+                        f"RGB max: {attn_rgb_max:.5f}  mean: {attn_rgb_mean:.5f}"
+                        f"  |  State: {attn_state:.5f}"
+                        + (f"  |  Depth: {attn_depth:.5f}" if self.use_depth else ""),
+                        8, 44, 0.38, (200, 200, 200))
 
-            # Legenda
-            cv2.putText(
-                blended, "Decoder Cross-Attention (media chunk)",
-                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+            # ══════════════════════════════════════════════════════════
+            # NOVO: Barra inferior com quadrados de State e Depth
+            # Compartilhando a MESMA escala de cor e normalização do RGB
+            # ══════════════════════════════════════════════════════════
+            BAR_H = 65
+            new_H = H + BAR_H
+            canvas_rgb = np.zeros((new_H, W, 3), dtype=np.uint8)
+            
+            # Copia a imagem sobreposta para o topo do novo canvas
+            canvas_rgb[:H, :W] = blended
+            
+            # Desenha fundo da barra inferior
+            cv2.rectangle(canvas_rgb, (0, H), (W, new_H), (20, 20, 20), -1)
+            cv2.line(canvas_rgb, (0, H), (W, H), (50, 50, 50), 1)
+
+            def get_color_from_val(val):
+                """Aplica a MESMA normalização (min/max) da matriz RGB e o colormap."""
+                if i_max - i_min > 1e-8:
+                    norm = (val - i_min) / (i_max - i_min)
+                else:
+                    norm = 0.0
+                
+                # Se o token de state/depth for muito maior que o max do RGB, ele trava em 1.0 (cor mais quente)
+                norm = np.clip(norm, 0.0, 1.0)
+                
+                # Gera 1 pixel e passa pelo colormap OpenCV
+                arr = np.array([[int(norm * 255)]], dtype=np.uint8)
+                color_bgr = cv2.applyColorMap(arr, cv2.COLORMAP_INFERNO)[0, 0]
+                
+                # Converte BGR para RGB (pois o canvas_rgb está em formato RGB)
+                return (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]))
+
+            sq_size = 28
+            y_pad = H + (BAR_H - sq_size) // 2
+
+            # Quadrado 1: State
+            x1 = 20
+            color_state = get_color_from_val(attn_state)
+            cv2.rectangle(canvas_rgb, (x1, y_pad), (x1 + sq_size, y_pad + sq_size), color_state, -1)
+            cv2.rectangle(canvas_rgb, (x1, y_pad), (x1 + sq_size, y_pad + sq_size), (150, 150, 150), 1) # Borda
+            self._label(canvas_rgb, f"State Token", x1 + sq_size + 12, y_pad + 20, 0.45, (220, 220, 220))
+
+            # Quadrado 2: Depth (só desenha se o modelo usar depth)
+            if self.use_depth:
+                x2 = x1 + sq_size + 150
+                color_depth = get_color_from_val(attn_depth)
+                cv2.rectangle(canvas_rgb, (x2, y_pad), (x2 + sq_size, y_pad + sq_size), color_depth, -1)
+                cv2.rectangle(canvas_rgb, (x2, y_pad), (x2 + sq_size, y_pad + sq_size), (150, 150, 150), 1)
+                self._label(canvas_rgb, f"Depth Token", x2 + sq_size + 12, y_pad + 20, 0.45, (220, 220, 220))
+
+            # Redireciona a variável blended para o nosso novo canvas expandido
+            blended = canvas_rgb
+
+            # ══════════════════════════════════════════════════════════
+            # JANELA 2 — Painel de análise
+            # Aumentamos o canvas nativo para 1200x900 para caber o texto com folga.
+            # O cv2.WINDOW_NORMAL fará o downscale sem cortar nada.
+            # ══════════════════════════════════════════════════════════
+            PW, PH = 1200, 900
+            panel = np.zeros((PH, PW, 3), dtype=np.uint8)
+
+            PAD  = 15
+            INNER_W = PW - 2 * PAD
+            y = 0
+
+            # ── SEÇÃO 1: Comparação de tokens (25% da altura) ─────────
+            sec1_h = PH * 25 // 100
+            cv2.rectangle(panel, (0, 0), (PW, sec1_h), (18, 18, 18), -1)
+            self._label(panel, "Atencao por tipo de token (escala relativa ao proprio pico recente)",
+                        PAD, 25, 0.48, (220, 220, 220), bold=True)
+
+            bar_w   = INNER_W // 2 - 40
+            bar_h   = 16
+            bar_gap = 30  # Mais espaço vertical para o texto que agora fica em cima
+            by      = 65
+
+            # Atrelamos cada métrica ao seu próprio histórico para calcular quão cheia a barra fica
+            token_specs = [
+                ("RGB (max patch)",       attn_rgb_scalar, self._rgb_history,   (60,  200,  60)),
+                ("State (1 tok)",         attn_state,      self._state_history, (220, 180,  60)),
+                ("Latente z",             attn_latent,     [attn_latent],       (60,  160, 220)),
+            ]
+            if self.use_depth:
+                token_specs.insert(2, ("Depth 3D", attn_depth, self._depth_history, (180, 80, 220)))
+
+            col_xs = [PAD, PAD + bar_w + 60]
+            for idx, (lbl, raw, hist, col) in enumerate(token_specs):
+                cx = col_xs[idx % 2]
+                cy = by + (idx // 2) * (bar_h + bar_gap)
+                
+                # A barra enche em relação ao maior valor recente DAQUELA métrica específica
+                h_max = max(hist) if hist else raw
+                fill_frac = raw / h_max if h_max > 1e-8 else 0.0
+                
+                self._draw_bar(panel, cx, cy, bar_w, fill_frac, lbl, raw, col, bar_h)
+
+            y = sec1_h
+            self._hline(panel, y)
+
+            # ── SEÇÃO 2: Ação predita por grupo de juntas (50% da altura)
+            sec2_h = PH * 50 // 100
+            cv2.rectangle(panel, (0, y), (PW, y + sec2_h), (15, 15, 15), -1)
+
+            chunk_t = len(action_chunk) if action_chunk is not None else 0
+            sec2_title = (
+                f"Acao predita — barras estaticas (chunk=1, 1 timestep)"
+                if chunk_t == 1 else
+                f"Acao predita — chunk completo por grupo de juntas ({chunk_t} steps)"
             )
-            cv2.putText(
-                blended, "QUENTE = maior atencao",
-                (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA,
+            self._label(panel, sec2_title, PAD, y + 18, 0.42, (220, 220, 220), bold=True)
+
+            if action_chunk is not None and len(action_chunk) >= 1:
+                n_groups  = len(self._JOINT_GROUPS)
+                grp_w     = (INNER_W - (n_groups - 1) * 6) // n_groups
+                grp_h     = sec2_h - 30
+                grp_y     = y + 26
+
+                for gi, (grp_label, jrange, gcol) in enumerate(self._JOINT_GROUPS):
+                    grp_x = PAD + gi * (grp_w + 6)
+                    self._draw_action_group(
+                        panel, action_chunk, jrange,
+                        grp_x, grp_y, grp_w, grp_h, gcol, grp_label
+                    )
+
+                # Legenda simples
+                lx = PAD
+                for grp_label, _, gcol in self._JOINT_GROUPS:
+                    cv2.rectangle(panel, (lx, y + sec2_h - 12),
+                                  (lx + 10, y + sec2_h - 2), gcol, -1)
+                    self._label(panel, grp_label, lx + 14, y + sec2_h - 3,
+                                0.33, (160, 160, 160))
+                    lx += 140
+            else:
+                self._label(panel, "Aguardando chunk...", PAD + 10, y + sec2_h // 2,
+                            0.5, (80, 80, 80))
+
+            y += sec2_h
+            self._hline(panel, y)
+
+            # ── SEÇÃO 3: Histórico de atenção (25% restante) ──────────
+            sec3_h = PH - y
+            cv2.rectangle(panel, (0, y), (PW, PH), (18, 18, 18), -1)
+            self._label(panel, "Historico de atencao ao longo das inferencias",
+                        PAD, y + 18, 0.45, (220, 220, 220), bold=True)
+
+            hist_series = [
+                (self._rgb_history,   (60,  200,  60)),
+                (self._state_history, (220, 180,  60)),
+            ]
+            if self.use_depth:
+                hist_series.append((self._depth_history, (180, 80, 220)))
+
+            self._draw_history(
+                panel, hist_series,
+                PAD, y + 24, INNER_W, sec3_h - 40
             )
+
+            # Legenda do histórico
+            lx = PAD
+            for lbl, col in [("RGB", (60, 200, 60)), ("State", (220, 180, 60)),
+                              ("Depth", (180, 80, 220))]:
+                if lbl == "Depth" and not self.use_depth:
+                    continue
+                cv2.rectangle(panel, (lx, PH - 14), (lx + 10, PH - 4), col, -1)
+                self._label(panel, lbl, lx + 14, PH - 5, 0.33, (160, 160, 160))
+                lx += 90
+
+            self._label(panel, "[Q/ESC] Fechar", PW - 90, PH - 5,
+                        0.33, (80, 80, 80))
 
             with self._lock:
-                self._last_display = blended
+                self._last_rgb_display   = blended
+                self._last_panel_display = panel
 
         except Exception as e:
-            # Nunca deixa a thread de inferência crashar por causa do visual
-            print(f"[AttnMapWindow] Erro ao processar attention: {e}")
+            print(f"[AttnMapWindow] Erro: {e}")
+            import traceback; traceback.print_exc()
+
+    # ─────────────────────────────────────────────────────────────────
+    # show() — loop principal
+    # ─────────────────────────────────────────────────────────────────
 
     def show(self) -> bool:
-        """Exibe o último frame processado. Retorna False se janela fechada."""
         with self._lock:
-            frame = self._last_display
+            frame_rgb   = self._last_rgb_display
+            frame_panel = self._last_panel_display
 
-        if frame is None:
-            # Ainda sem dados — exibe tela preta com mensagem
-            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(
-                placeholder, "Aguardando 1a inferencia...",
-                (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 1,
-            )
-            cv2.imshow(self.win, placeholder)
-        else:
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            cv2.imshow(self.win, bgr)
+        # ── placeholder enquanto não há dados ─────────────────────────
+        ph_rgb = np.zeros((545, 640, 3), dtype=np.uint8)
+        cv2.putText(ph_rgb, "Aguardando 1a inferencia...",
+                    (110, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 1)
+
+        ph_panel = np.zeros((900, 1200, 3), dtype=np.uint8)
+        cv2.putText(ph_panel, "Aguardando 1a inferencia...",
+                    (350, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 80, 80), 1)
+
+        src_rgb   = frame_rgb   if frame_rgb   is not None else ph_rgb
+        src_panel = frame_panel if frame_panel is not None else ph_panel
+
+        # WINDOW_NORMAL faz o Qt backend escalar o frame para preencher
+        # a janela automaticamente — não precisamos de resize manual.
+        cv2.imshow(self.win_rgb,   cv2.cvtColor(src_rgb, cv2.COLOR_RGB2BGR))
+        cv2.imshow(self.win_panel, src_panel)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
@@ -421,10 +776,11 @@ class AttnMapWindow:
         return True
 
     def destroy(self):
-        try:
-            cv2.destroyWindow(self.win)
-        except Exception:
-            pass
+        for win in (self.win_rgb, self.win_panel):
+            try:
+                cv2.destroyWindow(win)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1027,7 +1383,12 @@ def inference_worker(
                         action = action["action"]
                     chunk_np = [action.squeeze(0).cpu().numpy()]
 
-            # 3b. Atualiza o attention map (não bloqueia — tem lock interno)
+            # 3b. Salva o chunk de ação na policy para o AttnMapWindow ler
+            #     (lista de arrays numpy — o painel de ação mostra o chunk completo)
+            if attn_window is not None:
+                policy._last_action_chunk_np = chunk_np   # sem torch, só numpy
+
+            # 3c. Atualiza o attention map (não bloqueia — tem lock interno)
             if attn_window is not None and _last_rgb is not None:
                 attn_window.update(policy, _last_rgb)
 
@@ -1188,7 +1549,13 @@ def main():
 
     aw = None
     if show_attn:
-        aw = AttnMapWindow("Attention Map — ACT-D")
+        _action_dim = list(policy.config.output_features.values())[0].shape[0]
+        aw = AttnMapWindow(
+            "Attention Map",
+            use_depth=has_depth,
+            use_vae=getattr(policy.config, "use_vae", True),
+            action_dim=_action_dim,
+        )
         aw.create()
 
     dw = None
@@ -1239,6 +1606,8 @@ def main():
         print("      Trackbars: Contraste e Brilho para simular degradação de vídeo.")
     elif show_video:
         print("   📺 Janela de câmera ativa.")
+        cv2.namedWindow("Visao da IA", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Visao da IA", 640, 480)
     if show_attn:
         print("   🔥 Janela de Attention Map ativa (--v-attn).")
         print("      Atualiza a cada inferência. [Q/ESC] na janela de attn para fechar.")
