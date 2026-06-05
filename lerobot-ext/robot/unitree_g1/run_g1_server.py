@@ -81,6 +81,12 @@ HAND_VEL_LIMIT = float(_os_top.environ.get("G1_HAND_VEL_LIMIT", "10.0"))  # rad/
 HAND_STREAM_HZ = float(_os_top.environ.get("G1_HAND_STREAM_HZ", "100.0"))
 # Liga/desliga a rampa onboard. =0 volta ao forward direto (degrau cru a 30Hz).
 RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "1") not in ("", "0", "false", "False")
+# Modo da rampa:
+#   "interp"  = interpolação temporal q_atual→q_alvo em ~INTERP_S (suaviza o staircase
+#               de 30Hz em qualquer velocidade). Clip de velocidade como backstop.
+#   "unitree" = FIEL ao G1_29_ArmController: clip de velocidade puro contra a posição
+#               MEDIDA (get_current_dual_arm_q), sem interpolação temporal.
+RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "interp").strip().lower()
 
 
 def _scale_clip(cur, tgt, vmax):
@@ -106,7 +112,10 @@ class _Holder:
     """Caixa thread-safe para o último alvo recebido (dict do JSON). As versões
     (incrementadas pelo receiver a cada alvo novo) deixam a rampa saber quando
     reconstruir o struct — assim o dict_to_*cmd (caro) só roda a 30Hz, não a 250Hz."""
-    __slots__ = ("lock", "left", "right", "body", "left_ver", "right_ver", "body_ver")
+    __slots__ = (
+        "lock", "left", "right", "body", "left_ver", "right_ver", "body_ver",
+        "meas_body", "meas_left", "meas_right",
+    )
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -116,6 +125,11 @@ class _Holder:
         self.left_ver = 0
         self.right_ver = 0
         self.body_ver = 0
+        # Posição MEDIDA (q) p/ o modo "unitree" (clip contra o medido). Listas
+        # alinhadas a ARM_JOINT_IDS / HAND_JOINT_IDS; None até o 1º estado chegar.
+        self.meas_body = None   # q medido das juntas do braço (ordem ARM_JOINT_IDS)
+        self.meas_left = None   # q medido dos dedos esq (ordem HAND_JOINT_IDS)
+        self.meas_right = None  # q medido dos dedos dir
 
 
 def lowstate_to_dict(msg: hg_LowState) -> dict[str, Any]:
@@ -213,6 +227,7 @@ def state_forward_loop(
     lowstate_sock: zmq.Socket,
     state_period: float,
     shutdown_event: threading.Event,
+    holder: _Holder | None = None,
 ) -> None:
     """Read observation from DDS and forward to ZMQ clients."""
     last_state_time = 0.0
@@ -222,6 +237,15 @@ def state_forward_loop(
         msg = lowstate_sub.Read()
         if msg is None:
             continue
+
+        # Captura o q MEDIDO das juntas do braço p/ o modo "unitree" (clip contra medido).
+        if holder is not None:
+            try:
+                mb = [float(msg.motor_state[j].q) for j in ARM_JOINT_IDS]
+                with holder.lock:
+                    holder.meas_body = mb
+            except Exception:
+                pass
 
         now = time.time()
         # optional downsampling (if robot dds rate > state_period)
@@ -241,6 +265,7 @@ def handstate_forward_loop(
     handstate_sock: zmq.Socket,
     state_period: float,
     shutdown_event: threading.Event,
+    holder: _Holder | None = None,
 ) -> None:
     """Read hand state from DDS and forward to ZMQ clients."""
     last_left_time = 0.0
@@ -248,25 +273,41 @@ def handstate_forward_loop(
 
     while not shutdown_event.is_set():
         now = time.time()
-        
+
         # Read left hand state
         msg_left = left_sub.Read()
-        if msg_left is not None and (now - last_left_time >= state_period):
-            state_dict = handstate_to_dict(msg_left, "left")
-            payload = json.dumps({"topic": kTopicDex3LeftState, "data": state_dict}).encode("utf-8")
-            with contextlib.suppress(zmq.Again):
-                handstate_sock.send(payload, zmq.NOBLOCK)
-            last_left_time = now
-        
+        if msg_left is not None:
+            if holder is not None:
+                try:
+                    ml = [float(msg_left.motor_state[j].q) for j in HAND_JOINT_IDS]
+                    with holder.lock:
+                        holder.meas_left = ml
+                except Exception:
+                    pass
+            if now - last_left_time >= state_period:
+                state_dict = handstate_to_dict(msg_left, "left")
+                payload = json.dumps({"topic": kTopicDex3LeftState, "data": state_dict}).encode("utf-8")
+                with contextlib.suppress(zmq.Again):
+                    handstate_sock.send(payload, zmq.NOBLOCK)
+                last_left_time = now
+
         # Read right hand state
         msg_right = right_sub.Read()
-        if msg_right is not None and (now - last_right_time >= state_period):
-            state_dict = handstate_to_dict(msg_right, "right")
-            payload = json.dumps({"topic": kTopicDex3RightState, "data": state_dict}).encode("utf-8")
-            with contextlib.suppress(zmq.Again):
-                handstate_sock.send(payload, zmq.NOBLOCK)
-            last_right_time = now
-        
+        if msg_right is not None:
+            if holder is not None:
+                try:
+                    mr = [float(msg_right.motor_state[j].q) for j in HAND_JOINT_IDS]
+                    with holder.lock:
+                        holder.meas_right = mr
+                except Exception:
+                    pass
+            if now - last_right_time >= state_period:
+                state_dict = handstate_to_dict(msg_right, "right")
+                payload = json.dumps({"topic": kTopicDex3RightState, "data": state_dict}).encode("utf-8")
+                with contextlib.suppress(zmq.Again):
+                    handstate_sock.send(payload, zmq.NOBLOCK)
+                last_right_time = now
+
         time.sleep(0.001)  # Small sleep to avoid busy loop
 
 
@@ -336,11 +377,19 @@ def cmd_ramp_loop(
                     seg_t0 = t0
                     seen_ver = ver
                 if goal_q is not None:
-                    alpha = (t0 - seg_t0) / interp_s if interp_s > 0 else 1.0
-                    if alpha > 1.0:
-                        alpha = 1.0
-                    interp_q = [s + alpha * (g - s) for s, g in zip(start_q, goal_q)]
-                    cur_q = _scale_clip(cur_q, interp_q, vmax)  # backstop de velocidade
+                    if RAMP_MODE == "unitree":
+                        # FIEL: clip de velocidade puro contra o MEDIDO (clip_arm_q_target).
+                        with holder.lock:
+                            meas = holder.meas_body
+                        base = meas if meas is not None else cur_q
+                        cur_q = _scale_clip(base, goal_q, vmax)
+                    else:
+                        # interp: rampa temporal q_atual→q_alvo em interp_s (+ backstop).
+                        alpha = (t0 - seg_t0) / interp_s if interp_s > 0 else 1.0
+                        if alpha > 1.0:
+                            alpha = 1.0
+                        interp_q = [s + alpha * (g - s) for s, g in zip(start_q, goal_q)]
+                        cur_q = _scale_clip(cur_q, interp_q, vmax)
                     for k, j in enumerate(ARM_JOINT_IDS):
                         cmd.motor_cmd[j].q = cur_q[k]
                     cmd.crc = crc.Crc(cmd)
@@ -430,7 +479,7 @@ def handcmd_ramp_loop(
     # estado por mão: (cur, start, goal, seg_t0, cmd, seen_ver)
     st = {"l": [None, None, None, 0.0, None, -1], "r": [None, None, None, 0.0, None, -1]}
 
-    def _step(side, data, ver, pub, t0):
+    def _step(side, data, ver, meas, pub, t0):
         s = st[side]
         if data is None:
             return
@@ -445,11 +494,15 @@ def handcmd_ramp_loop(
             s[5] = ver
         if s[2] is None:
             return
-        alpha = (t0 - s[3]) / interp_s if interp_s > 0 else 1.0
-        if alpha > 1.0:
-            alpha = 1.0
-        interp_q = [a + alpha * (g - a) for a, g in zip(s[1], s[2])]
-        s[0] = _scale_clip(s[0], interp_q, vmax)
+        if RAMP_MODE == "unitree":
+            base = meas if meas is not None else s[0]
+            s[0] = _scale_clip(base, s[2], vmax)
+        else:
+            alpha = (t0 - s[3]) / interp_s if interp_s > 0 else 1.0
+            if alpha > 1.0:
+                alpha = 1.0
+            interp_q = [a + alpha * (g - a) for a, g in zip(s[1], s[2])]
+            s[0] = _scale_clip(s[0], interp_q, vmax)
         for k, j in enumerate(HAND_JOINT_IDS):
             s[4].motor_cmd[j].q = s[0][k]
         pub.Write(s[4])
@@ -460,8 +513,9 @@ def handcmd_ramp_loop(
             with holder.lock:
                 dl, vl = holder.left, holder.left_ver
                 dr, vr = holder.right, holder.right_ver
-            _step("l", dl, vl, left_pub, t0)
-            _step("r", dr, vr, right_pub, t0)
+                ml, mr = holder.meas_left, holder.meas_right
+            _step("l", dl, vl, ml, left_pub, t0)
+            _step("r", dr, vr, mr, right_pub, t0)
         except Exception as e:  # noqa: BLE001
             print(f"[hand-ramp] erro: {type(e).__name__}: {e}", flush=True)
         elapsed = time.perf_counter() - t0
@@ -572,10 +626,10 @@ def main() -> None:
     # Start forwarding threads
     # =========================================================================
 
-    # Body state forwarding
+    # Body state forwarding (passa holder p/ capturar o q medido no modo "unitree")
     t_state = threading.Thread(
         target=state_forward_loop,
-        args=(lowstate_sub, lowstate_sock, state_period, shutdown_event),
+        args=(lowstate_sub, lowstate_sock, state_period, shutdown_event, holder),
         name="BodyStateForward",
     )
     t_state.start()
@@ -583,7 +637,7 @@ def main() -> None:
     # Hand state forwarding
     t_handstate = threading.Thread(
         target=handstate_forward_loop,
-        args=(left_hand_state_sub, right_hand_state_sub, handstate_sock, state_period, shutdown_event),
+        args=(left_hand_state_sub, right_hand_state_sub, handstate_sock, state_period, shutdown_event, holder),
         name="HandStateForward",
     )
     t_handstate.start()
@@ -615,8 +669,11 @@ def main() -> None:
         t_arm_ramp.start()
         aux_threads += [t_handcmd, t_hand_ramp, t_arm_ramp]
 
+        _mode_desc = ("interp (rampa temporal + clip backstop)" if RAMP_MODE != "unitree"
+                      else "unitree (clip de velocidade puro contra o MEDIDO)")
         print(
-            f"bridge running [RAMPA ONBOARD: braço {ARM_STREAM_HZ:.0f}Hz/{ARM_VEL_LIMIT:.0f}rad/s, "
+            f"bridge running [RAMPA ONBOARD · modo={RAMP_MODE} → {_mode_desc}: "
+            f"braço {ARM_STREAM_HZ:.0f}Hz/{ARM_VEL_LIMIT:.0f}rad/s, "
             f"mãos {HAND_STREAM_HZ:.0f}Hz/{HAND_VEL_LIMIT:.0f}rad/s] — laptop manda alvo @30Hz",
             flush=True,
         )
