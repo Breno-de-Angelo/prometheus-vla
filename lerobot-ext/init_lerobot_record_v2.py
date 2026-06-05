@@ -13,7 +13,7 @@ import time
 frame_count = 0
 
 # Buffer global de contrabando
-buffer_pressao = {"left": np.zeros(33, dtype=np.float32), "right": np.zeros(33, dtype=np.float32)}
+buffer_pressao = {"left": np.zeros(108, dtype=np.float32), "right": np.zeros(108, dtype=np.float32)}
 
 try:
     import robot.unitree_g1
@@ -77,10 +77,10 @@ def patched_hw_to_dataset_features(features, feature_type, use_videos):
         dataset_features["observation.state"]["shape"] = (len(new_names),)
         
         dataset_features["observation.left_hand_pressure"] = {
-            "dtype": "float32", "shape": (33,), "names": [f"left_hand_pressure_{i}" for i in range(33)]
+            "dtype": "float32", "shape": (108,), "names": [f"left_hand_pressure_{i}" for i in range(108)]
         }
         dataset_features["observation.right_hand_pressure"] = {
-            "dtype": "float32", "shape": (33,), "names": [f"right_hand_pressure_{i}" for i in range(33)]
+            "dtype": "float32", "shape": (108,), "names": [f"right_hand_pressure_{i}" for i in range(108)]
         }
         
         chave_depth = "observation.images.head_camera_depth"
@@ -111,7 +111,7 @@ def patched_build_dataset_frame(features, obs_dict, prefix="observation."):
     lp = buffer_pressao["left"]
     rp = buffer_pressao["right"]
     
-    for i in range(33):
+    for i in range(108):
         obs_dict[f"left_hand_pressure_{i}"] = float(lp[i])
         obs_dict[f"right_hand_pressure_{i}"] = float(rp[i])
         

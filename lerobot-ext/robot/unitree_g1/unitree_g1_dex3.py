@@ -57,8 +57,8 @@ class HandState:
         default_factory=lambda: [HandMotorState() for _ in range(Dex3_Num_Motors)]
     )
     # Adicionando 27 sensores de pressão e 27 de temperatura por mão
-    pressure: np.ndarray = field(default_factory=lambda: np.zeros(33, dtype=np.float32))
-    temperature: np.ndarray = field(default_factory=lambda: np.zeros(33, dtype=np.float32))
+    pressure: np.ndarray = field(default_factory=lambda: np.zeros(108, dtype=np.float32))
+    temperature: np.ndarray = field(default_factory=lambda: np.zeros(108, dtype=np.float32))
 
 
 @RobotConfig.register_subclass("unitree_g1_dex3")
@@ -236,7 +236,7 @@ class UnitreeG1Dex3(UnitreeG1):
             left_msg = self._left_hand_state_sub.Read()
             if left_msg is not None:
                 # SALVA a pressão antiga para o HandState() novo não zerar tudo!
-                old_p = self._left_hand_state.pressure if self._left_hand_state else np.zeros(33, dtype=np.float32)
+                old_p = self._left_hand_state.pressure if self._left_hand_state else np.zeros(108, dtype=np.float32)
                 
                 left_state = HandState()
                 for idx, joint_id in enumerate(Dex3_1_Left_JointIndex):
@@ -247,7 +247,7 @@ class UnitreeG1Dex3(UnitreeG1):
             
             right_msg = self._right_hand_state_sub.Read()
             if right_msg is not None:
-                old_p = self._right_hand_state.pressure if self._right_hand_state else np.zeros(33, dtype=np.float32)
+                old_p = self._right_hand_state.pressure if self._right_hand_state else np.zeros(108, dtype=np.float32)
                 
                 right_state = HandState()
                 for idx, joint_id in enumerate(Dex3_1_Right_JointIndex):
@@ -272,14 +272,14 @@ class UnitreeG1Dex3(UnitreeG1):
                             flat_p = []
                             for area in sensors:
                                 flat_p.extend([float(x) for x in area.get("pressure", [])])
-                            while len(flat_p) < 33:
+                            while len(flat_p) < 108:
                                 flat_p.append(0.0)
                             
                             # Atualiza direto no estado atual
                             if side == "left" and self._left_hand_state:
-                                self._left_hand_state.pressure = np.array(flat_p[:33], dtype=np.float32)
+                                self._left_hand_state.pressure = np.array(flat_p[:108], dtype=np.float32)
                             elif side == "right" and self._right_hand_state:
-                                self._right_hand_state.pressure = np.array(flat_p[:33], dtype=np.float32)
+                                self._right_hand_state.pressure = np.array(flat_p[:108], dtype=np.float32)
                 except zmq.Again:
                     pass # Fila de pressão lida completamente
             
@@ -681,8 +681,8 @@ class UnitreeG1Dex3(UnitreeG1):
             left_p = self._left_hand_state.pressure
             right_p = self._right_hand_state.pressure
         else:
-            left_p = np.zeros(33, dtype=np.float32)
-            right_p = np.zeros(33, dtype=np.float32)
+            left_p = np.zeros(108, dtype=np.float32)
+            right_p = np.zeros(108, dtype=np.float32)
 
         # Injeta no dicionário 'obs' para o init_record pescar
         obs["left_hand_pressure"] = left_p.astype(np.float32)
