@@ -103,9 +103,22 @@ def handstate_to_dict(msg: HandState_, side: str) -> dict[str, Any]:
                 "tau_est": float(msg.motor_state[i].tau_est),
             }
         )
+    # FIX: inclui a pressão tátil (press_sensor_state). Sem isto o servidor
+    # publicava só side+motor_state e o cliente gravava pressure=0 — sensor tátil
+    # "zerado" no dataset, apesar do firmware Dex3 reportar valores reais.
+    press_sensors = []
+    if hasattr(msg, "press_sensor_state"):
+        for p in msg.press_sensor_state:
+            press_sensors.append(
+                {
+                    "pressure": list(p.pressure),
+                    "temperature": list(p.temperature),
+                }
+            )
     return {
         "side": side,
         "motor_state": motor_states,
+        "press_sensor_state": press_sensors,
     }
 
 
