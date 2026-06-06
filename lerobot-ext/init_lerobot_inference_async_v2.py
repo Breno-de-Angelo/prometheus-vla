@@ -1398,6 +1398,15 @@ def inference_worker(
                 has_attn = getattr(policy, "last_attn_weights", None) is not None
                 print(f"\n🧠 [inference] {t_inf_ms:.1f}ms | chunk={len(chunk_np)} ações | attn={'✓' if has_attn else '✗'}")
 
+                # debug temporário — imprime primeiro frame do chunk
+            if debug:
+                arr = np.array(chunk_np)   # converte lista para array aqui
+                print(f"\n[DEBUG] chunk shape={arr.shape} "
+                    f"min={arr.min():.4f} max={arr.max():.4f} "
+                    f"mean={arr.mean():.4f}")
+                print(f"[DEBUG] frame 0 bracos: {arr[0, :14].round(3).tolist()}")
+                print(f"[DEBUG] frame 0 maos:   {arr[0, 14:].round(3).tolist()}")
+
             # 4. Envia chunk para o loop de controle
             #    Se a fila estiver cheia, descarta o chunk antigo e insere o novo
             try:
@@ -1491,9 +1500,22 @@ def main():
     has_pressure = getattr(policy.config, "use_pressure", False)
     print(f"   Depth 3D: {has_depth} | Pressão: {has_pressure}")
 
+    # ── Scene Uncertainty Gate ───────────────────────────────────────────
+    # O config.json do checkpoint pode ter scene_uncertainty_threshold > 0
+    # salvo do treino. Forçamos 0.0 por padrão na inferência — o gate só
+    # ativa se o usuário passar --uncertainty= explicitamente.
+    # Motivo: a neutral_position não é salva no checkpoint (é um buffer
+    # calculado em runtime no run_train.py). Se o gate estiver ativo mas
+    # neutral_position = zeros, o robô é puxado para posição zeros (inválida).
+    policy.config.scene_uncertainty_threshold = 0.0
+
     if uncertainty_threshold > 0:
         policy.config.scene_uncertainty_threshold = uncertainty_threshold
         print(f"✅ Uncertainty Gate ativado: threshold={uncertainty_threshold}")
+    else:
+        saved_threshold = getattr(policy.config, "scene_uncertainty_threshold", 0.0)
+        print(f"   Uncertainty Gate: DESATIVADO (use --uncertainty=X para ativar)")
+        print(f"   (valor salvo no checkpoint era {saved_threshold:.2f} — ignorado sem --uncertainty)")
 
     # ── Preprocessor e Postprocessor (ACT e PI05) ─────────────────────
     preprocessor, postprocessor = load_pre_post_processors(checkpoint_dir, policy)

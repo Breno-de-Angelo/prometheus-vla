@@ -76,6 +76,11 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     neutral_position_loss_weight: float = 0.3
     # Limiar de incerteza para acionar posição neutra (0 = desligado)
     scene_uncertainty_threshold: float = 0.0
+    # ── Early Stopping ───────────────────────────────────────
+    # Número de avaliações consecutivas sem melhora antes de parar (0 = desligado)
+    early_stop_patience: int = 0
+    # Melhora mínima relativa para contar como progresso (ex: 0.001 = 0.1%)
+    early_stop_min_delta: float = 0.001
 
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
@@ -574,6 +579,22 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         total_steps=cfg.steps,
     )
 
+    # ── Early Stopping ────────────────────────────────────────
+    early_stop_patience  = getattr(cfg, "early_stop_patience",  0)      # 0 = desligado
+    early_stop_min_delta = getattr(cfg, "early_stop_min_delta", 0.001)
+    _es_best_val         = float("inf")
+    _es_patience_counter = 0
+    _es_triggered        = False
+
+    if is_main_process and early_stop_patience > 0:
+        logging.info(
+            colored(
+                f"[EarlyStopping] ATIVO — paciência={early_stop_patience} avaliações, "
+                f"min_delta={early_stop_min_delta} ({early_stop_min_delta*100:.1f}% de melhora mínima)",
+                "cyan"
+            )
+        )
+
     # ── Neutral Position Curriculum ───────────────────────────
     neutral_curriculum = None
     if getattr(cfg, "neutral_position_loss_weight", 0.0) > 0:
@@ -781,6 +802,42 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                                 {"best_val_loss": val_loss_meter.avg, "best_val_step": step},
                                 step, mode="eval"
                             )
+
+                    # ── Early Stopping ────────────────────────
+                    if early_stop_patience > 0:
+                        val_loss_mean = val_loss_meter.avg
+                        if val_loss_mean < _es_best_val * (1 - early_stop_min_delta):
+                            _es_best_val = val_loss_mean
+                            _es_patience_counter = 0
+                        else:
+                            _es_patience_counter += 1
+                            logging.info(
+                                colored(
+                                    f"[EarlyStopping] Sem melhora por {_es_patience_counter}/"
+                                    f"{early_stop_patience} avaliações. "
+                                    f"Melhor val_loss={_es_best_val:.5f}",
+                                    "yellow"
+                                )
+                            )
+                            if _es_patience_counter >= early_stop_patience:
+                                logging.info(
+                                    colored(
+                                        f"[EarlyStopping] Paciência esgotada no step {step}. "
+                                        f"Encerrando treino. Melhor val_loss={_es_best_val:.5f}",
+                                        "red", attrs=["bold"]
+                                    )
+                                )
+                                _es_triggered = True
+                        if wandb_logger:
+                            wandb_logger.log_dict(
+                                {"es_patience_counter": _es_patience_counter,
+                                 "es_best_val": _es_best_val},
+                                step, mode="eval"
+                            )
+
+            # ── Sai do loop se early stopping foi acionado ───
+            if _es_triggered:
+                break
 
             # ── Checkpoint periódico normal ───────────────────
             if cfg.save_checkpoint and is_saving_step:

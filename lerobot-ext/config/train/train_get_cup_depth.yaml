@@ -109,19 +109,19 @@ policy:
   scene_uncertainty_threshold: 0.5
 
   # ── Anti-Overfitting (dataset pequeno) ─────────────────
-  dropout: 0.2
+  dropout: 0.4
   optimizer_weight_decay: 1e-3
-  kl_weight: 1.0
+  kl_weight: 20.0
 
   # ── Arquitetura Transformer ─────────────────────────────
-  dim_model: 512
+  dim_model: 256
   n_heads: 8
-  dim_feedforward: 3200
+  dim_feedforward: 1024
   n_encoder_layers: 4
   n_decoder_layers: 1
   use_vae: true
   latent_dim: 32
-  n_vae_encoder_layers: 4
+  n_vae_encoder_layers: 3
 
   # ── Backbone Visual ────────────────────────────────────
   vision_backbone: resnet18
@@ -131,14 +131,16 @@ policy:
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_depth-260603"
-steps: 100000
+output_dir: "train_output/pick_up_the_cup_depth-260606"
+steps: 15000
 
 batch_size: 128
 num_workers: 10
 log_freq: 25
-save_freq: 10000
-save_checkpoint: false
+save_freq: 1000
+save_checkpoint: true
+early_stop_patience: 20
+early_stop_min_delta: 0.001
 
 # ── Best-Val Checkpoint ────────────────────────────────────
 # Salva automaticamente em 'output_dir/best_val_checkpoint/'
