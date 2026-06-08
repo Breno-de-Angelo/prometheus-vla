@@ -81,20 +81,16 @@ HAND_VEL_LIMIT = float(_os_top.environ.get("G1_HAND_VEL_LIMIT", "10.0"))  # rad/
 HAND_STREAM_HZ = float(_os_top.environ.get("G1_HAND_STREAM_HZ", "100.0"))
 # Liga/desliga a rampa onboard (no robô). DEFAULT=0: a rampa já é feita NO HOST
 # (laptop) pelo arm-streamer 250Hz + hand-streamer 100Hz, que clipam contra o
-# DEFAULT=1 + RAMP_MODE=interp: o robô interpola temporalmente q_atual→q_alvo a
-# 250Hz (braço) / 100Hz (mão), suavizando o staircase do IK a 30Hz. O clip de
-# velocidade é só backstop contra glitches — não causa lentidão.
-#
-# NÃO usar RAMP_MODE=unitree com RAMP_ONBOARD=1: esse modo clipa contra a posição
-# MEDIDA → erro ≤ vmax/ciclo → torque = kp × erro_minúsculo → mão lenta E fraca.
-# Se quiser desabilitar toda a rampa onboard (degrau cru a 30Hz), use RAMP_ONBOARD=0.
-RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "1") not in ("", "0", "false", "False")
-# Modo da rampa:
+# DEFAULT=0: a rampa já é feita NO HOST (laptop) pelo arm-streamer 250Hz +
+# hand-streamer 100Hz, que clipam contra o COMANDO anterior (convergem ao alvo,
+# mantêm a força do aperto). Ligar aqui (=1) com modo "unitree" cria rampa DUPLA:
+# re-clipa contra o MEDIDO → mão lenta E fraca (torque = kp × erro_minúsculo).
+RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "0") not in ("", "0", "false", "False")
+# Modo da rampa (só relevante se RAMP_ONBOARD=1):
 #   "interp"  = interpolação temporal q_atual→q_alvo em ~INTERP_S (suaviza o staircase
 #               de 30Hz em qualquer velocidade). Clip de velocidade como backstop.
-#   "unitree" = clip de velocidade puro contra a posição MEDIDA — NÃO usar com
-#               RAMP_ONBOARD=1 (veja nota acima).
-RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "interp").strip().lower()
+#   "unitree" = clip de velocidade puro contra a posição MEDIDA — causa mão lenta/fraca.
+RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "unitree").strip().lower()
 
 # WATCHDOG DE SEGURANÇA: se o laptop para de mandar comando por > STALE_S (encoding
 # de save, Ctrl-C, crash, queda de rede), a rampa SOLTA o braço suavemente decaindo
