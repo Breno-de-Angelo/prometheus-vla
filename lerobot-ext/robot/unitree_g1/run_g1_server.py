@@ -79,8 +79,13 @@ ARM_VEL_LIMIT = float(_os_top.environ.get("G1_ARM_VEL_LIMIT", "20.0"))   # rad/s
 ARM_STREAM_HZ = float(_os_top.environ.get("G1_ARM_STREAM_HZ", "250.0"))
 HAND_VEL_LIMIT = float(_os_top.environ.get("G1_HAND_VEL_LIMIT", "10.0"))  # rad/s
 HAND_STREAM_HZ = float(_os_top.environ.get("G1_HAND_STREAM_HZ", "100.0"))
-# Liga/desliga a rampa onboard. =0 volta ao forward direto (degrau cru a 30Hz).
-RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "1") not in ("", "0", "false", "False")
+# Liga/desliga a rampa onboard (no robô). DEFAULT=0: a rampa já é feita NO HOST
+# (laptop) pelo arm-streamer 250Hz + hand-streamer 100Hz, que clipam contra o
+# COMANDO anterior (convergem ao alvo, mantêm a força do aperto). Ligar aqui (=1)
+# cria rampa DUPLA: o modo "unitree" re-clipa contra o MEDIDO, prendendo o erro de
+# posição em <=vmax/ciclo → mão lenta E fraca (torque = kp * erro_minúsculo). Só
+# ligue (=1) se o host NÃO estiver rodando os streamers (G1_HAND_STREAMER=0).
+RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "0") not in ("", "0", "false", "False")
 # Modo da rampa:
 #   "interp"  = interpolação temporal q_atual→q_alvo em ~INTERP_S (suaviza o staircase
 #               de 30Hz em qualquer velocidade). Clip de velocidade como backstop.
