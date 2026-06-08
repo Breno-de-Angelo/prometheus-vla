@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>G1 Teleop — Fluxo de Controle &amp; Gargalo dos "Degraus"</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2530; --border:#30363d;
+    --txt:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --accent2:#79c0ff;
+    --crit:#f85149; --mod:#d29922; --min:#3fb950; --debunk:#8b949e;
+    --green:#3fb950; --purple:#bc8cff; --code:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6;font-size:15px}
+  .wrap{max-width:1180px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.5px}
+  h2{font-size:22px;margin:46px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+  h3{font-size:17px;margin:26px 0 10px;color:var(--accent2)}
+  code,.mono{font-family:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace}
+  code{background:var(--code);padding:2px 6px;border-radius:5px;font-size:.86em;color:#ffa657;border:1px solid #21262d}
+  .sub{color:var(--muted);font-size:15px;margin:0 0 4px}
+  .hero{background:linear-gradient(135deg,#161b22,#1c2530);border:1px solid var(--border);
+    border-radius:14px;padding:26px 28px;margin-top:18px}
+  .cmd{background:var(--code);border:1px solid #21262d;border-radius:8px;padding:12px 14px;
+    margin-top:14px;font-size:13px;color:#7ee787;overflow-x:auto;white-space:pre}
+  .tldr{background:#10231c;border:1px solid #1d4a37;border-left:4px solid var(--green);
+    border-radius:10px;padding:18px 22px;margin:18px 0}
+  .tldr b{color:#7ee787}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.grid2{grid-template-columns:1fr}}
+  /* pipeline */
+  .pipe{display:flex;flex-direction:column;gap:0;margin:18px 0}
+  .stage{display:grid;grid-template-columns:64px 1fr;gap:0;position:relative}
+  .stage .hz{display:flex;align-items:flex-start;justify-content:center;padding-top:16px}
+  .hzbadge{background:var(--panel2);border:1px solid var(--border);border-radius:20px;
+    padding:3px 9px;font-size:11px;font-weight:700;color:var(--accent2);white-space:nowrap;font-family:monospace}
+  .stage .body{border-left:2px solid var(--border);padding:0 0 22px 22px;position:relative}
+  .stage .body::before{content:"";position:absolute;left:-7px;top:16px;width:12px;height:12px;
+    border-radius:50%;background:var(--accent);border:2px solid var(--bg)}
+  .stage.crit .body::before{background:var(--crit)}
+  .stage.crit .body{border-left-color:var(--crit)}
+  .stage .name{font-weight:650;font-size:15px}
+  .stage .comp{color:var(--muted);font-size:12.5px;font-family:monospace;margin:3px 0 6px}
+  .stage .mec{font-size:13.5px;color:#c9d1d9}
+  .flag{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px;margin-left:6px;vertical-align:middle}
+  .flag.c{background:#3d1418;color:#ff7b72;border:1px solid #6e2329}
+  /* tables */
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--panel2);color:var(--accent2);font-weight:650;font-size:12.5px;text-transform:uppercase;letter-spacing:.4px}
+  tr:hover td{background:#11161d}
+  .us{color:#ff9e64;font-weight:600}
+  .un{color:#7ee787;font-weight:600}
+  /* bottleneck cards */
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .card.crit{border-left:4px solid var(--crit)}
+  .card.mod{border-left:4px solid var(--mod)}
+  .card.min{border-left:4px solid var(--min)}
+  .card.debunk{border-left:4px solid var(--debunk);opacity:.85}
+  .badge{display:inline-block;font-size:11px;font-weight:700;padding:3px 10px;border-radius:6px;text-transform:uppercase;letter-spacing:.4px}
+  .b-crit{background:#3d1418;color:#ff7b72}
+  .b-mod{background:#3a2d10;color:#e3b341}
+  .b-min{background:#10301c;color:#56d364}
+  .b-debunk{background:#21262d;color:#8b949e}
+  .b-prova{background:#16263d;color:#79c0ff}
+  .b-hip{background:#2d2140;color:#d2a8ff}
+  .card h3{margin:8px 0 10px;color:var(--txt)}
+  .proof{background:var(--code);border:1px solid #21262d;border-radius:8px;padding:11px 13px;margin:10px 0;
+    font-family:monospace;font-size:12px;color:#8b949e;overflow-x:auto;white-space:pre-wrap;word-break:break-word}
+  .proof b{color:#ffa657;font-weight:600}
+  .fix{background:#0f2027;border:1px solid #1f3d4a;border-radius:8px;padding:11px 14px;margin-top:10px;font-size:13.5px}
+  .fix b{color:#79c0ff}
+  . keycol{}
+  .answer{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:6px 22px;margin:14px 0}
+  .answer summary{cursor:pointer;font-weight:650;font-size:16px;padding:14px 0;color:var(--accent2);list-style:none}
+  .answer summary::-webkit-details-marker{display:none}
+  .answer summary::before{content:"▸ ";color:var(--accent)}
+  .answer[open] summary::before{content:"▾ "}
+  .answer .ans{padding:0 0 18px;font-size:14px}
+  .pill{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:20px;
+    padding:4px 12px;font-size:12px;margin:3px 5px 3px 0;font-family:monospace}
+  .note{font-size:12.5px;color:var(--muted);font-style:italic;margin-top:8px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 0;font-size:12px;color:var(--muted)}
+  .legend span{display:flex;align-items:center;gap:5px}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+  footer{margin-top:50px;padding-top:20px;border-top:1px solid var(--border);color:var(--muted);font-size:12.5px}
+  .warnbox{background:#2a1d10;border:1px solid #5c3d14;border-left:4px solid var(--mod);border-radius:10px;padding:14px 18px;margin:16px 0;font-size:13.5px}
+  .warnbox b{color:#e3b341}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="sub">Investigação factual · G1 · branch <code>Luiz-pi05d</code> · 2026-06-08</p>
+  <h1>Teleoperação G1 — Fluxo de Controle &amp; o Gargalo dos "Degraus"</h1>
+  <div class="hero">
+    <p style="margin:0 0 6px"><b>Pergunta:</b> a teleop estava fluindo bem; onde está o gargalo do controle, e se o Unitree faz 250&nbsp;Hz, por que dizem que limita a 30&nbsp;Hz?</p>
+    <p style="margin:0;color:var(--muted)">Comando em análise:</p>
+    <div class="cmd">python init_lerobot_record_v2.py \
+  --config_path config/record/record_televuer.yaml \
+  --quest-ip 192.168.68.61 --quest-adb-ip=192.168.68.51 \
+  --left-arm-limp</div>
+    <p class="note">Tudo abaixo tem prova <code>arquivo:linha</code> + citação verbatim. O que é hipótese está marcado como tal. Achados de 10 leitores de código (local + fontes originais Unitree/LeRobot) + 2 verificadores adversariais.</p>
+  </div>
+
+  <div class="tldr">
+    <p style="margin:0 0 8px"><b>TL;DR — o "30Hz" não é regressão, e o gargalo não é onde parecia.</b></p>
+    <p style="margin:0">① O loop de IK/teleop roda a <b>30&nbsp;Hz nos DOIS</b> (nosso <i>e</i> Unitree original). Os "250&nbsp;Hz" do Unitree <b>nunca foram IK a 250&nbsp;Hz</b> — são só uma thread dedicada que <b>re-publica</b> o último alvo ~8× entre updates do IK.<br>
+    ② A suavidade do Unitree vem dessa thread clipar contra a <b class="un">posição MEDIDA</b> (que evolui a cada ciclo → sub-passos reais). <b>A nossa thread existe e roda a 250Hz, mas clipa contra o <span class="us">COMANDO anterior</span></b> → em movimento suave ela só <b>repete o degrau de 30Hz 250×/s</b>. <b>Esse é o gargalo crítico.</b><br>
+    ③ O conserto é no <code>_arm_streamer_worker</code> do host — não no robô, não na rede.</p>
+  </div>
+
+  <h2>1 · O fluxo ponta-a-ponta (VR → motor)</h2>
+  <p>Cada estágio com sua frequência real e o mecanismo que a impõe. O ponto <span style="color:var(--crit)">vermelho</span> é o gargalo crítico.</p>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--accent)"></span> estágio normal</span>
+    <span><span class="dot" style="background:var(--crit)"></span> gargalo crítico</span>
+  </div>
+
+  <div class="pipe">
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">event-driven<br>~60Hz VR</span></div>
+      <div class="body">
+        <div class="name">1 · Captura de pose no Quest 2 (WebXR → Vuer)</div>
+        <div class="comp">Quest 2 → Vuer (Process separado) · handlers on_controller_move / on_hand_move</div>
+        <div class="mec">Handlers assíncronos escrevem a pose num <code>multiprocessing.Array</code> a cada evento WebXR. Sem throttle fixo.</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">30Hz<br>(lê snapshot)</span></div>
+      <div class="body">
+        <div class="name">2 · Leitura non-blocking da pose VR</div>
+        <div class="comp">xr_g1_arm.get_action → tv_wrapper.get_tele_data</div>
+        <div class="mec">Lê o <code>multiprocessing.Array</code> via <code>@property</code> (não bloqueia) — pega o último valor escrito. Não espera frame novo do VR.</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">30Hz<br>1 solve/tick</span></div>
+      <div class="body">
+        <div class="name">3 · Solve do IK (CasADi Opti + IPOPT, max_iter=30)</div>
+        <div class="comp">xr_g1_arm.py:415 · G1_29_ArmIK.solve_ik (robot_arm_ik.py)</div>
+        <div class="mec">Síncrono na main thread, 1 solve por iteração. <code>seed=None</code> → warm-start da própria solução anterior. <code>smooth_cost</code> + filtro 4-tap [0.4,0.3,0.2,0.1] reduzem a <i>amplitude</i> do salto — <b>não a taxa</b>.</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">30Hz<br>I/O câmera</span></div>
+      <div class="body">
+        <div class="name">4 · record_loop: get_observation → get_action → send_action → add_frame → sleep</div>
+        <div class="comp">lerobot_record.py (delegado por _patched_record_loop)</div>
+        <div class="mec">Loop único síncrono. <code>get_observation → cam.async_read()</code> faz <code>new_frame_event.wait()+clear()</code> e <b>BLOQUEIA</b> até o próximo frame da D435 (30 FPS fixos). É a câmera que pauta o loop — não o <code>precise_sleep</code> (que vira ~0).</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">30Hz<br>set alvo</span></div>
+      <div class="body">
+        <div class="name">5 · send_action escreve o ALVO RAW do braço (modo streamer, default)</div>
+        <div class="comp">UnitreeG1Dex3.send_action → UnitreeG1 → _arm_target[mv] = target_q</div>
+        <div class="mec">No modo streamer (default) <code>send_action</code> <b>não suaviza nem publica</b> — só grava <code>_arm_target</code> sob lock. A publicação fica na thread de 250Hz.</div>
+      </div>
+    </div>
+    <div class="stage crit">
+      <div class="hz"><span class="hzbadge" style="color:#ff7b72;border-color:#6e2329">250Hz<br>⚠ sem interp</span></div>
+      <div class="body">
+        <div class="name">6 · Thread _arm_streamer_worker @250Hz publica o braço <span class="flag c">GARGALO CRÍTICO</span></div>
+        <div class="comp">UnitreeG1._arm_streamer_worker → lowcmd_publisher.Write</div>
+        <div class="mec"><b>Clipa contra <span class="us">prev_cmd</span> (último comando), não contra o medido.</b> Em movimento suave (delta &lt; vmax = 20·(1/250) = 0,08 rad) → <code>scale=1</code> → salta o alvo inteiro no 1º ciclo e <b>repete o MESMO q</b> nos ~7 ciclos seguintes (delta=0). <b>Zero interpolação temporal</b> → o degrau de 30Hz é só republicado 250×/s.</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">100Hz<br>mão OK</span></div>
+      <div class="body">
+        <div class="name">7 · MÃO Dex3: hand-streamer @100Hz (default ON)</div>
+        <div class="comp">UnitreeG1Dex3._hand_streamer_worker → _ramp_hand</div>
+        <div class="mec">Clip de velocidade contra o comando anterior (<code>hand_velocity_limit=10</code>). <b>A mão NÃO faz staircase no default</b> — não é gargalo de suavidade. (Risco só no modo legado <code>G1_HAND_STREAMER=0</code>.)</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="hz"><span class="hzbadge">ZMQ+JSON<br>→ DDS</span></div>
+      <div class="body">
+        <div class="name">8 · Transporte até os motores (robô REAL)</div>
+        <div class="comp">unitree_sdk2_socket.Write (json+ZMQ PUSH, CONFLATE=1) → :6000 → run_g1_server cmd_forward_loop → DDS → PD onboard</div>
+        <div class="mec">No robô real (<code>is_simulation=False</code>, unitree_g1.py:186) o publish do host vira <code>json.dumps</code> + ZMQ PUSH com <code>CONFLATE=1</code> (descarta intermediários), atravessa a rede até o <code>run_g1_server</code> (forward transparente em <code>RAMP_ONBOARD=0</code>) e só então cai no DDS. O PD persegue o setpoint — que é o mesmo degrau repetido → movimento em escada.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <b>Correção de um erro da investigação automática:</b> um dos agentes afirmou que o record_v2 publica "DDS direto, sem passar pelo run_g1_server". Isso só vale na <b>simulação</b>. No <b>robô real</b> (seu caso — portas 6000-6003 nos seus logs), o caminho é <b>ZMQ+JSON via run_g1_server</b> (<code>unitree_g1.py:186</code> seleciona o wrapper <code>unitree_sdk2_socket</code> quando <code>is_simulation=False</code>). O achado crítico (clip vs prev_cmd) independe disso.
+  </div>
+
+  <h2>2 · Tabela de frequências — nós vs Unitree original</h2>
+  <table>
+    <thead><tr><th>Sinal</th><th>Nosso setup</th><th>Unitree original</th><th>Prova</th></tr></thead>
+    <tbody>
+      <tr><td>Loop IK / teleop (gera alvos)</td><td class="us">30Hz (cap; 29,9Hz medido)</td><td class="un">30Hz (--frequency=30.0)</td><td class="mono">lerobot_record.py:150 · teleop_hand_and_arm.py:76,477</td></tr>
+      <tr><td>Solve IK (IPOPT) por frame</td><td class="us">30 (1 solve/tick)</td><td class="un">30 (1 solve/tick)</td><td class="mono">xr_g1_arm.py:415 · teleop_hand_and_arm.py:329</td></tr>
+      <tr><td>Publish lowcmd DDS do braço</td><td class="us">250 nominal*</td><td class="un">250 (control_dt=1/250)</td><td class="mono">unitree_g1.py:534 · robot_arm.py:77,189</td></tr>
+      <tr style="background:#1a1012"><td><b>Alvo do clip @250Hz</b></td><td class="us">250Hz mas clip vs <b>COMANDO</b> → sem interp (repete degrau 30Hz)</td><td class="un">250Hz clip vs <b>MEDIDO</b> → sub-passos reais (suave)</td><td class="mono">unitree_g1.py:553 vs robot_arm.py:153</td></tr>
+      <tr><td>Publish DDS da mão (Dex3)</td><td class="us">100 (não faz staircase)</td><td class="un">Process separado</td><td class="mono">unitree_g1_dex3.py:543 · robot_hand_unitree.py:93</td></tr>
+      <tr><td>Subscribe estado motores</td><td class="us">250 (thread bg; loop só lê snapshot)</td><td class="un">~500 (sleep 0.002)</td><td class="mono">unitree_g1.py:130 · robot_arm.py:150</td></tr>
+      <tr><td>Câmera D435 → ZMQ</td><td class="us">30 fixo · async_read BLOQUEIA o loop</td><td class="un">ImageClient síncrono no loop</td><td class="mono">full_realsenser_server.py:19 · camera_zmq.py:216</td></tr>
+    </tbody>
+  </table>
+  <p class="note">* taxa REAL de publish do nosso streamer <b>nunca foi instrumentada</b> — pode haver jitter &lt;250Hz por GIL/rede (ver gargalo moderado).</p>
+
+  <h2>3 · Os gargalos (ranqueados, com prova)</h2>
+
+  <div class="card crit">
+    <span class="badge b-crit">crítico</span> <span class="badge b-prova">provado no código</span>
+    <h3>① Clip do arm-streamer é contra o COMANDO anterior, não contra a posição MEDIDA</h3>
+    <p>Esta é a <b>causa dominante</b> dos degraus — independe de GIL ou rede. Para um movimento suave (delta entre alvos de 30Hz &lt; vmax = 0,08 rad), <code>scale = max(|delta|/vmax, 1.0) = 1.0</code>, então no 1º ciclo de 250Hz: <code>newq = prev_cmd + delta = tgt</code> (salta o alvo inteiro). Nos ~7 ciclos seguintes <code>delta = tgt − prev_cmd = 0</code> → republica <b>exatamente o mesmo q</b>. Resultado: um degrau de 30Hz repetido 250×/s, sem interpolação.</p>
+    <p>O Unitree clipa contra a <b class="un">medida</b> (<code>current_q = get_current_dual_arm_q()</code>), que evolui a cada ciclo → cada sub-passo interpola <i>medido→alvo</i> de verdade = suavidade real de 250Hz.</p>
+    <div class="proof"><b>nosso:</b> unitree_g1.py:553  prev_cmd = np.array([self.msg.motor_cmd[mv].q for mv in mvs])
+        :554  delta = tgt - prev_cmd
+        :563  newq = prev_cmd + delta/scale      (vmax=0.08 com vlim=20, dt=1/250)
+<b>unitree:</b> robot_arm.py:153  current_q = self.get_current_dual_arm_q()   # DDS medido
+         :156  cliped = current_q + delta/max(motion_scale, 1.0)</div>
+    <p class="note">⚠ A docstring do host (<code>unitree_g1.py:528</code>) <b>afirma falsamente</b> que clipa contra a medida "réplica do G1_29_ArmController" — o código faz o oposto. O comentário nas linhas 548-552 admite que trocaram de propósito (clip-vs-medida criava assimetria gravitacional), mas a troca custou a suavidade.</p>
+    <div class="fix"><b>Conserto (2 opções comprovadas no próprio repo):</b><br>
+      (a) clipar contra a <b>medida</b> (<code>self._lowstate</code>, que o streamer já lê em :545) como o Unitree — restaura os sub-passos, mas reintroduz a assimetria gravitacional (mitigável com <code>tauff</code>/gravity-comp).<br>
+      (b) <b>interpolação temporal explícita</b> <code>prev_cmd→tgt</code> ao longo dos 33ms (linear por ciclo) — exatamente o que o <code>G1_RAMP_MODE=interp</code> já faz no bridge (run_g1_server.py:430-435). <b>Não depende da medida e evita a assimetria.</b> É a opção mais limpa, e mantém a rampa no host (sua preferência).</div>
+  </div>
+
+  <div class="card crit">
+    <span class="badge b-crit">crítico</span> <span class="badge b-prova">provado no código</span>
+    <h3>② IK gera 1 alvo cru a 30Hz e send_action o escreve sem suavização downstream</h3>
+    <p>O alvo de junta é recomputado só 30×/s e escrito <b>direto</b> em <code>body_joints</code> sem clip nem interpolação. Entre dois solves, o alvo é um degrau constante. Como tanto <code>send_action</code> quanto a gravação no dataset usam o <b>mesmo</b> alvo de 30Hz, o staircase nasce aqui e é gravado no parquet (alvo pré-filtro). Toda a suavidade de 250Hz teria que vir do downstream — que está quebrado por ①.</p>
+    <div class="proof"><b>prova:</b> xr_g1_arm.py:415  sol_q, _ = self.arm_ik.solve_ik(...)
+        xr_g1_arm.py:419-434  body_joints[...] = sol_q[0..13]   (nenhum clip/ramp)
+        lerobot_record.py:382  _sent_action = robot.send_action(...)   1×/tick @30Hz</div>
+    <div class="fix"><b>Conserto:</b> não mexer no IK (30Hz está OK e é a mesma taxa do Unitree). A suavidade tem que ser reintroduzida <b>downstream</b> — é o mesmo conserto de ①: fazer os ~8 ciclos de 250Hz produzirem sub-passos reais entre alvos de IK.</div>
+  </div>
+
+  <div class="card mod">
+    <span class="badge b-mod">moderado</span> <span class="badge b-prova">provado no código</span>
+    <h3>③ O loop trava em 30Hz pela câmera ZMQ (async_read bloqueante), não pelo precise_sleep</h3>
+    <p>O <code>async_read()</code> (cujo nome sugere "non-blocking") faz <code>new_frame_event.wait()+clear()</code>; como o evento é <b>limpo a cada leitura</b>, a próxima chamada bloqueia até a thread receber o próximo frame da D435 (30 FPS fixos). Logo o teto de 30Hz é <b>I/O da câmera</b>, não CPU: o corpo do loop cabe em <b>23,3ms (~43Hz)</b> e runs sem gate de câmera chegaram a &gt;300Hz. Quando a câmera cai (medido ~9Hz num run), os degraus ficam <b>maiores</b>.</p>
+    <div class="proof"><b>prova:</b> camera_zmq.py:216-221  if not new_frame_event.wait(...): ... new_frame_event.clear()
+        full_realsenser_server.py:19  FPS = 30      :62  pipeline.wait_for_frames(timeout_ms=1000)
+        run real ep25: n=1360 min=23.32ms mean=33.49ms (29.91Hz)</div>
+    <div class="fix"><b>Conserto:</b> desacoplar comando da câmera — já existe a thread de 250Hz; basta ela produzir sub-passos reais (conserto ①). Subir o fps do record só ajuda se a câmera também publicar ≥ esse valor.</div>
+  </div>
+
+  <div class="card mod">
+    <span class="badge b-mod">moderado</span> <span class="badge b-hip">hipótese — precisa medição</span>
+    <h3>④ GIL: a thread de 250Hz (Python puro) competindo com câmera + dataset + CRC no mesmo processo</h3>
+    <p>O <code>_arm_streamer_worker</code> é uma thread Python no mesmo GIL que: 2× decode de câmera (json+base64 <i>antes</i> do cv2 que libera GIL), o framing do dataset, e o próprio CRC pack (245 leituras + struct.pack por ciclo, dentro do lock). O IK (CasADi/IPOPT) e numpy <b>liberam</b> o GIL no C++, então não são os maiores seguradores. <b>Ressalva:</b> o Unitree tem a mesma topologia (thread 250Hz + IK 30Hz no mesmo processo) e é suave — a diferença é que ele isola a <b>mão em Process separado</b>, enquanto nós acumulamos mais threads Python no mesmo processo. Efeito real na taxa precisa medição.</p>
+    <div class="fix"><b>Como confirmar:</b> instrumentar <code>time.perf_counter</code> entre ciclos do streamer no robô real. Se confirmar jitter &lt;250Hz, mover o CRC pack pra fora do lock e/ou isolar as câmeras em processo. <b>Secundário</b> — mesmo a 250Hz perfeitos o staircase persiste por ①.</div>
+  </div>
+
+  <div class="card min">
+    <span class="badge b-min">menor</span> <span class="badge b-prova">provado no código</span>
+    <h3>⑤ CRC pack pure-Python dentro do _arm_lock a 250Hz</h3>
+    <p>Nosso <code>_arm_lock</code> segura o ciclo inteiro (CRC pack de 245 leituras + <code>Write</code>) <b>dentro</b> do lock; o Unitree segura o lock só pra copiar 2 variáveis e faz CRC+Write <b>fora</b>. Aumenta o lock-hold e atrasa o <code>send_action</code>, mas não starva o streamer. Higiene.</p>
+    <div class="proof"><b>prova:</b> unitree_g1.py:541-576 (CRC+Write dentro do lock) vs robot_arm.py:166-181 (lock só copia; CRC/Write fora)</div>
+  </div>
+
+  <div class="card debunk">
+    <span class="badge b-debunk">desmentido</span> <span class="badge b-prova">provado no código</span>
+    <h3>✗ run_g1_server NÃO é o gargalo (em RAMP_ONBOARD=0 é forward transparente)</h3>
+    <p>No default <code>RAMP_ONBOARD=0</code>, o <code>cmd_forward_loop</code> só repassa ZMQ→DDS sem reprocessar — não suaviza nem piora; apenas <b>propaga</b> o degrau que já vem do host. O conserto certo é no arm-streamer do host, não na ponte.</p>
+    <div class="proof"><b>prova:</b> run_g1_server.py:88 default '0' · :455 cmd_forward_loop recv() → DDS Write (sem reprocessamento)</div>
+  </div>
+
+  <h2>4 · Nós vs Unitree — o que realmente difere</h2>
+  <table>
+    <thead><tr><th>Aspecto</th><th>Unitree original</th><th>Nosso setup</th><th>Impacto</th></tr></thead>
+    <tbody>
+      <tr><td>Taxa do loop IK/teleop</td><td class="un">30Hz</td><td class="us">30Hz</td><td><b>IGUAL.</b> O "250Hz" nunca foi IK a 250Hz.</td></tr>
+      <tr><td>Quem publica o lowcmd</td><td class="un">Thread _ctrl_motor_state @250Hz</td><td class="us">Thread _arm_streamer_worker @250Hz</td><td><b>Topologia IGUAL.</b></td></tr>
+      <tr style="background:#1a1012"><td><b>Alvo do clip @250Hz</b></td><td class="un">posição MEDIDA → ~8 sub-passos reais</td><td class="us">comando anterior → salta no 1º, repete os 7</td><td><b>CRÍTICO.</b> A causa do staircase.</td></tr>
+      <tr><td>Lock no streamer</td><td class="un">só copia 2 vars; CRC/Write fora</td><td class="us">ciclo inteiro dentro do lock</td><td>Menor.</td></tr>
+      <tr><td>Isolamento da mão</td><td class="un">Process separado</td><td class="us">Threads no mesmo processo</td><td>Moderado / hipótese (GIL).</td></tr>
+      <tr><td>Câmera</td><td class="un">síncrona no loop</td><td class="us">async_read bloqueante (gate de 30Hz)</td><td>Moderado.</td></tr>
+      <tr><td>Transporte ao motor</td><td class="un">DDS direto (mesmo processo)</td><td class="us">JSON+ZMQ+CONFLATE via rede</td><td>Jitter/perda; não dominante.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>5 · Respostas diretas</h2>
+
+  <details class="answer" open>
+    <summary>Por que 30Hz, se o Unitree faz 250Hz?</summary>
+    <div class="ans">Porque o IK/teleop dos <b>dois</b> roda a 30Hz. No Unitree é o <code>--frequency default=30.0</code> (teleop_hand_and_arm.py:76,477); no nosso é o <code>fps=30</code> do record, reforçado pelo <code>async_read</code> bloqueante da câmera (30 FPS fixos). Os "250Hz" do Unitree são <b>exclusivamente</b> a thread dedicada <code>_ctrl_motor_state</code> que re-publica o último alvo ~8× entre updates do IK. <span class="pill">IK = 30Hz nos dois</span><span class="pill">250Hz = só republish</span></div>
+  </details>
+
+  <details class="answer">
+    <summary>O Unitree realmente faz 250Hz? Então onde está a diferença?</summary>
+    <div class="ans">Sim, mas 250Hz <b>de publish</b>, não de IK. A suavidade real vem da thread re-ler a <b class="un">posição medida</b> a cada ciclo e clipar <i>medido→alvo</i> com passo máx 0,08 rad — como a medida evolui, cada sub-passo interpola de verdade. <b>Nós temos a thread de 250Hz</b>, mas ela clipa contra o <b class="us">comando anterior</b>: em movimento suave salta o alvo no 1º ciclo e repete nos 7 seguintes → só repete o degrau de 30Hz. <span class="pill">unitree: clip vs MEDIDO ✓</span><span class="pill">nosso: clip vs COMANDO ✗</span></div>
+  </details>
+
+  <details class="answer">
+    <summary>Onde está o gargalo, afinal?</summary>
+    <div class="ans">Em <b>dois pontos do host</b> (não no transporte, não no robô): <b>(1)</b> o <code>_arm_streamer_worker</code> clipa contra <code>prev_cmd</code> em vez do medido → zero interpolação; <b>(2)</b> o IK escreve o alvo cru a 30Hz e o downstream (que deveria suavizar) está quebrado por (1). Não é o <code>run_g1_server</code> (forward transparente) nem a mão (já interpola). GIL é hipótese secundária — mesmo a 250Hz perfeitos, o staircase persiste por (1).</div>
+  </details>
+
+  <details class="answer">
+    <summary>O que medir no robô real para fechar a conta?</summary>
+    <div class="ans">
+      ① Instrumentar a taxa <b>real</b> de publish do <code>_arm_streamer_worker</code> (logar <code>perf_counter</code> entre ciclos) — fecha a hipótese de GIL.<br>
+      ② Logar <code>prev_cmd</code>, <code>tgt</code>, <code>newq</code> por ciclo num movimento suave — confirma que <code>delta</code> zera após o 1º ciclo.<br>
+      ③ Comparar q comandado × q medido no tempo — vê os platôs de 33ms.<br>
+      ④ Medir o dt real do record (há um <code>IgnoreFPSWarningFilter</code> escondendo o aviso "Record loop is running slower" em <code>init_lerobot_record_v2.py:853</code>).
+    </div>
+  </details>
+
+  <footer>
+    Gerado a partir de investigação multi-agente (10 leitores de código + 2 verificadores adversariais) sobre as fontes locais e os originais Unitree <code>xr_teleoperate</code> / LeRobot. Toda afirmação "provado no código" tem citação <code>arquivo:linha</code> verificável. Itens marcados como hipótese precisam de medição no robô real.<br>
+    G1 · branch <code>Luiz-pi05d</code> · 2026-06-08.
+  </footer>
+
+</div>
+</body>
+</html>

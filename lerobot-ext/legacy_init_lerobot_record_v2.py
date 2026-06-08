@@ -124,20 +124,40 @@ lerobot.datasets.utils.build_dataset_frame = patched_build_dataset_frame
 # A ZMQCamera.read padrão usa IMREAD_COLOR, que converteria a depth pra BGR 8-bit.
 # =========================================================================
 import lerobot.cameras.zmq.camera_zmq as _zmq_cam_mod
+import base64 as _b64_dep
+import json as _json_dep
 import cv2 as _cv2_dep
 
 _orig_zmq_read = _zmq_cam_mod.ZMQCamera.read
 
 def _patched_zmq_read(self, color_mode=None):
-    frame = _orig_zmq_read(self, color_mode)
-
     if "depth" not in getattr(self, "camera_name", ""):
         # CORREÇÃO DE COR: o servidor publica BGR (RealSense rs.format.bgr8) e o
         # ZMQCamera.read faz cv2.imdecode (retorna BGR) SEM converter → o dataset
         # ficava gravado em BGR. O LeRobot e os backbones das VLAs (ImageNet/SigLIP)
         # esperam RGB. Convertemos aqui para gravar RGB de verdade.
+        frame = _orig_zmq_read(self, color_mode)            # BGR (imdecode)
         return _cv2_dep.cvtColor(frame, _cv2_dep.COLOR_BGR2RGB)  # → RGB pro dataset
 
+    if not self.is_connected or self.socket is None:
+        from lerobot.utils.errors import DeviceNotConnectedError
+        raise DeviceNotConnectedError(f"{self} is not connected.")
+    try:
+        message = self.socket.recv_string()
+    except Exception as e:
+        if type(e).__name__ == "Again":
+            raise TimeoutError(f"{self} timeout after {self.timeout_ms}ms") from e
+        raise
+
+    images = _json_dep.loads(message).get("images", {})
+    img_b64 = images.get(self.camera_name) or (next(iter(images.values())) if images else None)
+    if img_b64 is None:
+        raise RuntimeError(f"{self} no images in message")
+
+    raw = _b64_dep.b64decode(img_b64)
+    frame = _cv2_dep.imdecode(np.frombuffer(raw, np.uint8), _cv2_dep.IMREAD_UNCHANGED)  # uint16 (H,W)
+    if frame is None:
+        raise RuntimeError(f"{self} failed to decode depth image")
     if frame.ndim == 2:
         frame = frame[:, :, None]  # (H,W) -> (H,W,1)
     elif frame.ndim == 3 and frame.shape[2] == 3:
@@ -177,29 +197,6 @@ def _patched_write_image(image, fpath, compress_level=1):
     try:
         if isinstance(image, np.ndarray):
             img = _patched_arr_to_pil(image)
-            if image.dtype == np.uint16:
-                # Depth uint16 e salvo a cada frame no buffer temporario do LeRobot.
-                # compress_level=6 economiza disco, mas consome CPU e causa lag no live view.
-                compress_level = min(compress_level, 1)
-            elif (
-                os.environ.get("G1_RGB_TEMP_FAST", "1") not in ("", "0", "false", "False")
-                and image.dtype == np.uint8
-                and getattr(image, "ndim", 0) == 3
-                and image.shape[2] == 3
-                and "head_camera" in str(fpath)
-            ):
-                # RGB de video e temporario: o LeRobot so precisa desses arquivos
-                # para montar o mp4 no save_episode. Salvar PNG por frame durante
-                # a teleop custa CPU e causa lag no OmniView. BMP nao comprime:
-                # usa mais disco, mas e muito mais leve em CPU. Mantemos o nome
-                # .png porque o encoder procura frame-XXXXXX.png; PIL detecta pelo
-                # magic byte ao abrir.
-                mode = os.environ.get("G1_RGB_TEMP_FAST_FORMAT", "BMP").upper()
-                if mode == "JPEG":
-                    img.save(fpath, format="JPEG", quality=int(os.environ.get("G1_RGB_TEMP_JPEG_QUALITY", "90")))
-                else:
-                    img.save(fpath, format="BMP")
-                return
         elif isinstance(image, _PIL.Image):
             img = image
         else:
@@ -768,34 +765,16 @@ def _write_record_status(episode: int, start_time: float):
         pass
 
 _ep_start_time: float = _time_mod.time()
-_perf_last_log: float = 0.0
-
-def _writer_qsize(dataset) -> int | None:
-    try:
-        writer = getattr(dataset, "image_writer", None)
-        q = getattr(writer, "queue", None)
-        return q.qsize() if q is not None and hasattr(q, "qsize") else None
-    except Exception:
-        return None
 
 def _patched_add_frame_log(self, frame):
-    global _ep_start_time, _perf_last_log
+    global _ep_start_time
     ep_idx = self.meta.total_episodes
     if ep_idx != _dbg_log["episode"] and _dbg_log["file"] is None:
         root = self.root
         _dbg_open(ep_idx, root)
         _ep_start_time = _time_mod.time()
         _write_record_status(ep_idx, _ep_start_time)
-    t0 = _time_mod.perf_counter()
-    try:
-        return _original_add_frame(self, frame)
-    finally:
-        dt_ms = (_time_mod.perf_counter() - t0) * 1000.0
-        now = _time_mod.time()
-        if dt_ms > 25.0 or now - _perf_last_log > 2.0:
-            _perf_last_log = now
-            qsize = _writer_qsize(self)
-            print(f"[PERF] add_frame={dt_ms:.1f}ms image_writer_q={qsize}", flush=True)
+    return _original_add_frame(self, frame)
 
 lerobot.datasets.lerobot_dataset.LeRobotDataset.add_frame = _patched_add_frame_log
 
@@ -889,19 +868,10 @@ except Exception as _e:
 
 if _live_pub is not None:
     _live_orig_obs = UnitreeG1Dex3.get_observation
-    _obs_perf_last_log = 0.0
 
     def _live_wrapped_obs(self, *a, **k):
-        nonlocal_obs_perf = None
-        t0 = _time_mod.perf_counter()
         obs = _live_orig_obs(self, *a, **k)
-        obs_dt_ms = (_time_mod.perf_counter() - t0) * 1000.0
         try:
-            global _obs_perf_last_log
-            now_perf_log = _time_mod.time()
-            if obs_dt_ms > 25.0 or now_perf_log - _obs_perf_last_log > 2.0:
-                _obs_perf_last_log = now_perf_log
-                print(f"[PERF] get_observation={obs_dt_ms:.1f}ms", flush=True)
             ep = max(0, _dbg_log.get("episode", 0))
             # fase do robô: soft-start (rampa) -> bloqueado (X não apertado) -> desbloqueado
             if not _softstart["done"]:
@@ -931,13 +901,12 @@ class IgnoreFPSWarningFilter(logging.Filter):
     def filter(self, record):
         return "Record loop is running slower" not in record.getMessage()
 
-def _free_stale_ports(ports=(5555, 5558, 8012, 5557, 8765)):
+def _free_stale_ports(ports=(5555, 8012, 5557, 8765)):
     """Libera portas presas por processos órfãos de execuções anteriores.
 
     Quando o script é morto com kill -9 (ou crasha), podem ficar órfãos segurando
     a porta e causando 'Address already in use' na próxima execução:
-      5555 = publicador de imagens ZMQ · 5558 = stream RGB-only do VR
-      8012 = servidor Vuer
+      5555 = publicador de imagens ZMQ · 8012 = servidor Vuer
       5557 = telemetria ao vivo (PUB) · 8765 = dashboard web (OmniView LIVE)
     """
     import os
@@ -1067,93 +1036,27 @@ if __name__ == "__main__":
     # sobrecarregando a placa de rede Gigabit do laptop/robô.
     import zmq as _zmq
     import threading as _threading
-    import base64 as _b64_vr
-    import json as _json_vr
-    ROBOT_IP = "127.0.0.1" if force_sim else "192.168.123.164"
+    ROBOT_IP = "192.168.123.164"
     def _zmq_proxy():
         try:
             ctx = _zmq.Context.instance()
             f = ctx.socket(_zmq.SUB)
-            f.setsockopt(_zmq.RCVHWM, 1)
-            f.setsockopt(_zmq.LINGER, 0)
+            f.setsockopt(_zmq.CONFLATE, 1)  # MÁGICA AQUI: Joga fora frames velhos, matando o delay
             f.connect(f"tcp://{ROBOT_IP}:5555")
             f.setsockopt_string(_zmq.SUBSCRIBE, "")
             
             b = ctx.socket(_zmq.PUB)
-            b.setsockopt(_zmq.SNDHWM, 1)
-            b.setsockopt(_zmq.LINGER, 0)
+            b.setsockopt(_zmq.CONFLATE, 1)  # Dropa frames de saída se o cliente estiver lento, matando o TCP buffer delay
             b.bind("tcp://127.0.0.1:5555")
             
-            while True:
-                parts = f.recv_multipart()
-                while True:
-                    try:
-                        parts = f.recv_multipart(flags=_zmq.NOBLOCK)
-                    except _zmq.Again:
-                        break
-                try:
-                    b.send_multipart(parts, flags=_zmq.NOBLOCK)
-                except _zmq.Again:
-                    continue
+            _zmq.device(_zmq.FORWARDER, f, b)
         except Exception as e:
             print(f"[ZMQ Proxy] Erro no proxy local: {e}")
-
-    def _zmq_vr_rgb_proxy():
-        """Publica só head_camera como JPEG bytes para o Quest/Vuer.
-
-        O stream :5555 continua completo (RGB+Depth) para dataset/OmniView. Este
-        canal :5558 evita depth/base64 no caminho crítico do óculos.
-        """
-        try:
-            ctx = _zmq.Context.instance()
-            f = ctx.socket(_zmq.SUB)
-            f.setsockopt(_zmq.RCVHWM, 1)
-            f.setsockopt(_zmq.LINGER, 0)
-            f.connect("tcp://127.0.0.1:5555")
-            f.setsockopt_string(_zmq.SUBSCRIBE, "")
-
-            b = ctx.socket(_zmq.PUB)
-            b.setsockopt(_zmq.SNDHWM, 1)
-            b.setsockopt(_zmq.LINGER, 0)
-            b.bind("tcp://127.0.0.1:5558")
-
-            while True:
-                parts = f.recv_multipart()
-                while True:
-                    try:
-                        parts = f.recv_multipart(flags=_zmq.NOBLOCK)
-                    except _zmq.Again:
-                        break
-                try:
-                    data = _json_vr.loads(parts[0])
-                    head = data.get("images", data).get("head_camera")
-                    if isinstance(head, dict) and data.get("protocol") == "zmq.compressed.v1":
-                        part = head.get("part")
-                        if head.get("encoding") != "jpeg" or part is None or part >= len(parts):
-                            continue
-                        b.send(parts[part], flags=_zmq.NOBLOCK)
-                    elif isinstance(head, str):
-                        b.send(_b64_vr.b64decode(head), flags=_zmq.NOBLOCK)
-                    else:
-                        continue
-                except _zmq.Again:
-                    continue
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[ZMQ VR Proxy] Erro no proxy RGB local: {e}")
-
-    if not force_sim:
-        _t_proxy = _threading.Thread(target=_zmq_proxy, daemon=True)
-        _t_proxy.start()
-    else:
-        print("[ZMQ Proxy] Sim: usando publisher local :5555 direto (sem forwarder principal)")
-    _t_vr_proxy = _threading.Thread(target=_zmq_vr_rgb_proxy, daemon=True)
-    _t_vr_proxy.start()
+    _t_proxy = _threading.Thread(target=_zmq_proxy, daemon=True)
+    _t_proxy.start()
     
     # Agora que o proxy local está rodando em 127.0.0.1:5555, direcionamos todos os clientes pra ele!
     cam_host = "127.0.0.1"
-    os.environ["G1_VR_CAM_PORT"] = "5558"
     
     # Em vez de modificar sys.argv (que quebra o draccus com dicionários aninhados),
     # nós interceptamos a função record() para modificar a config depois do parse.
@@ -1165,22 +1068,6 @@ if __name__ == "__main__":
                 import draccus
                 _lr_mod.register_third_party_plugins()
                 cfg = draccus.parse(_lr_mod.RecordConfig)
-                # Durante a gravação, add_frame salva imagens temporárias por câmera.
-                # Processos exigem pickle/cópia de arrays grandes e podem piorar o
-                # lag; por padrão ficamos em threads e aceleramos o RGB temporário
-                # salvando JPEG rápido no patch de write_image acima.
-                if hasattr(cfg, "dataset"):
-                    if getattr(cfg.dataset, "num_image_writer_processes", 0) == 0:
-                        cfg.dataset.num_image_writer_processes = int(os.environ.get("G1_IMAGE_WRITER_PROCESSES", "0"))
-                    if getattr(cfg.dataset, "num_image_writer_threads_per_camera", 0) == 4:
-                        cfg.dataset.num_image_writer_threads_per_camera = int(os.environ.get("G1_IMAGE_WRITER_THREADS_PER_CAMERA", "8"))
-                    print(
-                        "[IMAGE-WRITER] processos="
-                        f"{cfg.dataset.num_image_writer_processes} "
-                        "threads/cam="
-                        f"{cfg.dataset.num_image_writer_threads_per_camera}",
-                        flush=True,
-                    )
                 if hasattr(cfg, "robot") and hasattr(cfg.robot, "cameras"):
                     for cam_name, cam_cfg in cfg.robot.cameras.items():
                         if getattr(cam_cfg, "type", "") == "zmq" and hasattr(cam_cfg, "video"):
@@ -1203,10 +1090,10 @@ if __name__ == "__main__":
         _quest_adb = f"{quest_adb_ip}:5555" if quest_adb_ip else ""
         _viewer_proc = subprocess.Popen(
             [sys.executable, viewer_script, "--host", cam_host,
-             "--cam-port", "5558", "--tele-port", "5557", "--http-port", "8765",
-             "--quest-adb", _quest_adb, "--img-fps", "30", "--rgb-bytes", "--no-depth"]
+             "--cam-port", "5555", "--tele-port", "5557", "--http-port", "8765",
+             "--quest-adb", _quest_adb]
         )
-        print("[OmniView LIVE] 🖥️  Dashboard web iniciado — RGB-only :5558, 30 FPS, depth OFF — abrindo http://127.0.0.1:8765/live.html")
+        print("[OmniView LIVE] 🖥️  Dashboard web iniciado — abrindo http://127.0.0.1:8765/live.html")
         print("                (use G1_VIEWER=cv2 pra voltar à janela OpenCV antiga)")
     _atexit.register(lambda: _viewer_proc.poll() is None and _viewer_proc.terminate())
 

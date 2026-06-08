@@ -81,15 +81,16 @@ HAND_VEL_LIMIT = float(_os_top.environ.get("G1_HAND_VEL_LIMIT", "10.0"))  # rad/
 HAND_STREAM_HZ = float(_os_top.environ.get("G1_HAND_STREAM_HZ", "100.0"))
 # Liga/desliga a rampa onboard (no robô). DEFAULT=0: a rampa já é feita NO HOST
 # (laptop) pelo arm-streamer 250Hz + hand-streamer 100Hz, que clipam contra o
-# DEFAULT=0: a rampa já é feita NO HOST (laptop) pelo arm-streamer 250Hz +
-# hand-streamer 100Hz, que clipam contra o COMANDO anterior (convergem ao alvo,
-# mantêm a força do aperto). Ligar aqui (=1) com modo "unitree" cria rampa DUPLA:
-# re-clipa contra o MEDIDO → mão lenta E fraca (torque = kp × erro_minúsculo).
+# COMANDO anterior (convergem ao alvo, mantêm a força do aperto). Ligar aqui (=1)
+# cria rampa DUPLA: o modo "unitree" re-clipa contra o MEDIDO, prendendo o erro de
+# posição em <=vmax/ciclo → mão lenta E fraca (torque = kp * erro_minúsculo). Só
+# ligue (=1) se o host NÃO estiver rodando os streamers (G1_HAND_STREAMER=0).
 RAMP_ONBOARD = _os_top.environ.get("G1_RAMP_ONBOARD", "0") not in ("", "0", "false", "False")
-# Modo da rampa (só relevante se RAMP_ONBOARD=1):
+# Modo da rampa:
 #   "interp"  = interpolação temporal q_atual→q_alvo em ~INTERP_S (suaviza o staircase
 #               de 30Hz em qualquer velocidade). Clip de velocidade como backstop.
-#   "unitree" = clip de velocidade puro contra a posição MEDIDA — causa mão lenta/fraca.
+#   "unitree" = FIEL ao G1_29_ArmController: clip de velocidade puro contra a posição
+#               MEDIDA (get_current_dual_arm_q), sem interpolação temporal.
 RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "unitree").strip().lower()
 
 # WATCHDOG DE SEGURANÇA: se o laptop para de mandar comando por > STALE_S (encoding
@@ -98,6 +99,7 @@ RAMP_MODE = _os_top.environ.get("G1_RAMP_MODE", "unitree").strip().lower()
 # o server). kd é mantido → o braço desce amortecido, não em queda livre.
 STALE_S = float(_os_top.environ.get("G1_STALE_S", "2.0"))
 RELEASE_S = float(_os_top.environ.get("G1_RELEASE_S", "1.5"))
+
 
 
 def _scale_clip(cur, tgt, vmax):

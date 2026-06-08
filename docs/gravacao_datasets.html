@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>G1 — Pipeline de Gravação de Datasets (save assíncrono &amp; encoding)</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2530; --border:#30363d;
+    --txt:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --accent2:#79c0ff;
+    --crit:#f85149; --mod:#d29922; --min:#3fb950; --green:#3fb950; --code:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6;font-size:15px}
+  .wrap{max-width:1180px;margin:0 auto;padding:32px 22px 80px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.5px}
+  h2{font-size:22px;margin:46px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+  h3{font-size:17px;margin:22px 0 10px;color:var(--accent2)}
+  code{font-family:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace;background:var(--code);
+    padding:2px 6px;border-radius:5px;font-size:.86em;color:#ffa657;border:1px solid #21262d}
+  .sub{color:var(--muted);font-size:15px;margin:0 0 4px}
+  .hero{background:linear-gradient(135deg,#161b22,#1c2530);border:1px solid var(--border);
+    border-radius:14px;padding:26px 28px;margin-top:18px}
+  .tldr{background:#10231c;border:1px solid #1d4a37;border-left:4px solid var(--green);
+    border-radius:10px;padding:18px 22px;margin:18px 0}
+  .tldr b{color:#7ee787}
+  .verdict{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0}
+  @media(max-width:820px){.verdict{grid-template-columns:1fr}}
+  .vcard{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px}
+  .vcard .q{font-size:13px;color:var(--muted);margin-bottom:8px}
+  .vcard .a{font-size:20px;font-weight:750;margin-bottom:6px}
+  .a.yes{color:#56d364}.a.partial{color:#e3b341}.a.no{color:#ff7b72}
+  .vcard .d{font-size:12.5px;color:#c9d1d9}
+  /* swimlane pipeline */
+  .lane-h{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:6px 0 2px}
+  .lane-title{font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.5px;text-align:center;padding:6px;border-radius:8px}
+  .lt-main{background:#2a1d10;color:#e3b341;border:1px solid #5c3d14}
+  .lt-bg{background:#10231c;color:#7ee787;border:1px solid #1d4a37}
+  .step{display:grid;grid-template-columns:34px 1fr;gap:10px;background:var(--panel);border:1px solid var(--border);
+    border-radius:10px;padding:12px 14px;margin:8px 0}
+  .step .n{width:28px;height:28px;border-radius:50%;background:var(--panel2);border:1px solid var(--border);
+    display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;font-family:monospace}
+  .step.block .n{background:#3d1418;color:#ff7b72;border-color:#6e2329}
+  .step.brief .n{background:#3a2d10;color:#e3b341;border-color:#5c3d14}
+  .step.bg{border-left:3px solid var(--green)}
+  .step .t{font-weight:600;font-size:14px}
+  .step .x{font-size:12.5px;color:var(--muted);margin-top:3px}
+  .step .p{font-family:monospace;font-size:11px;color:#6e7681;margin-top:5px}
+  .tag{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:5px;margin-left:6px;vertical-align:middle}
+  .tag.b{background:#3d1418;color:#ff7b72}
+  .tag.br{background:#3a2d10;color:#e3b341}
+  .tag.ok{background:#10301c;color:#56d364}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{background:var(--panel2);color:var(--accent2);font-weight:650;font-size:12.5px;text-transform:uppercase;letter-spacing:.4px}
+  tr:hover td{background:#11161d}
+  .rec{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin:12px 0}
+  .rec.alta{border-left:4px solid var(--crit)}
+  .rec.media{border-left:4px solid var(--mod)}
+  .rec.baixa{border-left:4px solid var(--min)}
+  .badge{display:inline-block;font-size:11px;font-weight:700;padding:3px 10px;border-radius:6px;text-transform:uppercase;letter-spacing:.4px;margin-right:6px}
+  .pri-alta{background:#3d1418;color:#ff7b72}
+  .pri-media{background:#3a2d10;color:#e3b341}
+  .pri-baixa{background:#10301c;color:#56d364}
+  .eff{background:#16263d;color:#79c0ff}
+  .rec h3{margin:10px 0 8px;color:var(--txt)}
+  .proof{background:var(--code);border:1px solid #21262d;border-radius:8px;padding:10px 13px;margin:9px 0;
+    font-family:monospace;font-size:11.5px;color:#8b949e;overflow-x:auto;white-space:pre-wrap;word-break:break-word}
+  .proof b{color:#ffa657}
+  .note{font-size:12.5px;color:var(--muted);font-style:italic;margin-top:8px}
+  .warnbox{background:#2a1010;border:1px solid #5c1414;border-left:4px solid var(--crit);border-radius:10px;padding:14px 18px;margin:16px 0;font-size:13.5px}
+  .warnbox b{color:#ff7b72}
+  .okbox{background:#10231c;border:1px solid #1d4a37;border-left:4px solid var(--green);border-radius:10px;padding:14px 18px;margin:16px 0;font-size:13.5px}
+  footer{margin-top:50px;padding-top:20px;border-top:1px solid var(--border);color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="sub">Investigação factual · G1 · branch <code>Luiz-pi05d</code> · 2026-06-08</p>
+  <h1>Pipeline de Gravação de Datasets — <code>init_lerobot_record_v2.py</code></h1>
+  <div class="hero">
+    <p style="margin:0 0 6px"><b>Pergunta:</b> a estrutura está boa pra gravar datasets? Dá pra gravar vários rápido e assíncrono — clicar salvar e <b>continuar gravando o próximo</b> enquanto o anterior é encodado? O que dá pra adicionar das fontes oficiais <b>sem refatorar tudo</b>?</p>
+    <p class="note" style="margin-top:10px">Achados de 5 leitores de código (record_v2 + LeRobot oficial) + 2 avaliadores (opções oficiais + crítico adversarial). Toda afirmação tem prova <code>arquivo:linha</code>.</p>
+  </div>
+
+  <div class="verdict">
+    <div class="vcard">
+      <div class="q">A estrutura está boa pra gravar datasets?</div>
+      <div class="a yes">SIM ✓</div>
+      <div class="d">Com 1 ressalva. PNGs já são assíncronos; o save de episódio é assíncrono na unha (INJEÇÃO 7); parquet frame-exato. Precisa de 1 ajuste localizado pra ficar segura em rajada.</div>
+    </div>
+    <div class="vcard">
+      <div class="q">Gravar vários rápido e assíncrono?</div>
+      <div class="a partial">PARCIAL ⚠</div>
+      <div class="d">Vários episódios back-to-back: sim. Mas os saves são <b>serializados</b> — salvar em rajada antes do encode anterior (~13s) <b>trava o controle</b>.</div>
+    </div>
+    <div class="vcard">
+      <div class="q">Continuar gravando enquanto o anterior encoda?</div>
+      <div class="a yes">SIM ✓*</div>
+      <div class="d">Para <b>1 encode em voo</b>: sim, livre. O que <b>não</b> dá é encadear <b>2 encodes</b> — fechar o próximo antes do atual terminar bloqueia.</div>
+    </div>
+  </div>
+
+  <div class="tldr">
+    <p style="margin:0"><b>TL;DR.</b> O save JÁ é assíncrono: ao apertar A, o thread principal só faz o drain de PNGs (~100ms) + snapshot + cria o buffer N+1, e despacha o trabalho pesado (stats + parquet + encode h264 ~13s) numa <b>thread de fundo</b>. Por isso você grava o episódio N+1 enquanto o N encoda. <b>O único bloqueio perigoso</b> é o <code>_join_save_thread()</code> no <i>início</i> de cada save: se você salvar o N+1 <b>antes</b> do encode do N terminar, o loop de controle <b>trava</b> esperando — e se passar de 2s, o <b>watchdog solta o braço</b>. Conserto principal sem refatorar: trocar o join bloqueante por uma <b>fila de saves</b>.</p>
+  </div>
+
+  <h2>1 · O que acontece quando você aperta "Salvar" (A)</h2>
+  <p>Cada etapa marcada por onde roda e se bloqueia o loop de controle do robô:</p>
+  <div class="lane-h">
+    <div class="lane-title lt-main">Thread principal (pode bloquear o controle)</div>
+    <div class="lane-title lt-bg">Thread de fundo "lerobot-save" (livre)</div>
+  </div>
+
+  <div class="step"><div class="n">1</div><div><div class="t">Aperta A no controle direito → evento <code>save</code> <span class="tag ok">não bloqueia</span></div><div class="x">Borda de subida seta <code>events['exit_early']=True</code> (B descarta: <code>rerecord_episode=True</code>).</div><div class="p">xr_g1_arm.py:341-342 → :253-258 · global_events em init_lerobot_record_v2.py:325</div></div></div>
+
+  <div class="step"><div class="n">2</div><div><div class="t">record_loop dá <code>break</code> → record() chama <code>save_episode()</code> <span class="tag ok">não bloqueia</span></div><div class="x"><code>save_episode</code> está monkeypatchado por <code>patched_save_episode</code>.</div><div class="p">lerobot_record.py:321-323, :534-542 · patch em init_lerobot_record_v2.py:623</div></div></div>
+
+  <div class="step"><div class="n">3</div><div><div class="t">GUARD anti-save-vazio <span class="tag ok">não bloqueia</span></div><div class="x">Se buffer <code>size==0</code> (A repetido / antes do 1º frame), pula o save e limpa eventos — protege a sessão de quebrar no validate.</div><div class="p">init_lerobot_record_v2.py:549-561</div></div></div>
+
+  <div class="step block"><div class="n">4</div><div><div class="t">⚠ <code>_join_save_thread()</code> — SERIALIZAÇÃO <span class="tag b">bloqueia LONGO</span></div><div class="x"><b>O único bloqueio perigoso.</b> Espera (<code>.join()</code>) a thread do save <b>anterior</b> terminar. 0s se já acabou; <b>até ~13s</b> se o encode do episódio anterior ainda roda. Passou de <code>STALE_S=2.0s</code> → o watchdog do run_g1_server solta o braço (<code>kp→0</code>). Cenário que trava: episódios curtos salvos em rajada (save-save-save).</div><div class="p">init_lerobot_record_v2.py:563-564 + :512-518 · watchdog run_g1_server.py:99-100, 390-401</div></div></div>
+
+  <div class="step brief"><div class="n">5</div><div><div class="t">Drena o image_writer (<code>wait_until_done</code>) <span class="tag br">bloqueia breve</span></div><div class="x">~100ms estimado, mas é O(queue_size) e a fila é compartilhada. Episódio longo + depth 16-bit (<code>compress_level=6</code>) pode estourar — normalmente &lt;&lt; 2s.</div><div class="p">init_lerobot_record_v2.py:575-576 · image_writer.py:180-181 · compress_level depth=6 em lerobot_dataset.py:1165</div></div></div>
+
+  <div class="step brief"><div class="n">6</div><div><div class="t">Snapshot raso do buffer <span class="tag br">bloqueia breve</span></div><div class="x">Listas viram <code>list(v)</code>, arrays <code>v.copy()</code> — cópia independente que a thread de save usa. É o que desacopla o save da gravação seguinte.</div><div class="p">init_lerobot_record_v2.py:579 + :527-537</div></div></div>
+
+  <div class="step brief"><div class="n">7</div><div><div class="t">Cria o PRÓXIMO buffer (N+1) <span class="tag br">bloqueia breve</span></div><div class="x">Custo desprezível. A partir daqui <code>add_frame</code> do ep N+1 escreve só no buffer novo; a thread de save nunca mais toca <code>self.episode_buffer</code>. <b>É o que torna a gravação do próximo livre.</b></div><div class="p">init_lerobot_record_v2.py:587-589 · add_frame em lerobot_dataset.py:1146-1171</div></div></div>
+
+  <div class="step"><div class="n">8</div><div><div class="t">Dispara a thread daemon e <code>return None</code> <span class="tag ok">não bloqueia</span></div><div class="x">Loop de controle volta livre. <code>_save_worker</code> seta <code>skip_wait=True</code> (drain já foi no principal).</div><div class="p">init_lerobot_record_v2.py:599, 601-619, 621</div></div></div>
+
+  <div class="step bg"><div class="n">9</div><div><div class="t">FUNDO: <code>compute_stats</code> + parquet (síncrono) <span class="tag ok">não bloqueia o controle</span></div><div class="x">Mas é exatamente o que o <code>_join_save_thread()</code> do <b>próximo</b> save (etapa 4) vai esperar. Por isso bloqueia <b>indiretamente</b> o save seguinte.</div><div class="p">init_lerobot_record_v2.py:610 · lerobot_dataset.py:1234,1236</div></div></div>
+
+  <div class="step bg"><div class="n">10</div><div><div class="t">FUNDO: encode h264 (~13s) via pyav in-process <span class="tag ok">não bloqueia o controle</span></div><div class="x"><code>batch_encoding_size=1</code> → encode imediato. 1 câmera de vídeo → ramo sem ProcessPoolExecutor → roda na thread daemon. ffmpeg/libx264 solta o GIL, mas os loops Python por-frame (<code>Image.open→from_image</code>) seguram o GIL e disputam CPU com o controle a 30Hz.</div><div class="p">lerobot_dataset.py:1238,1273-1275 · video_utils.py:379-383 · yaml:25 (~13s)</div></div></div>
+
+  <div class="step bg"><div class="n">11</div><div><div class="t">FUNDO: concatena o .mp4 no chunk + <code>meta.save_episode</code> <span class="tag ok">não bloqueia o controle</span></div><div class="x"><code>meta.save_episode</code> roda DEPOIS do encode (muta estado compartilhado) — é a razão estrutural da serialização.</div><div class="p">video_utils.py:400 (stream-copy) · lerobot_dataset.py:1278</div></div></div>
+
+  <div class="step block"><div class="n">12</div><div><div class="t">Fim da sessão (Y/Ctrl-C): <code>finalize()</code> + atexit join <span class="tag b">bloqueia LONGO</span></div><div class="x">Segundos a dezenas de segundos no encerramento. Acima de 2s o watchdog solta o braço amortecido — comportamento de segurança esperado no shutdown.</div><div class="p">lerobot_record.py:546-547 · init_lerobot_record_v2.py:524 (atexit)</div></div></div>
+
+  <h2>2 · Respostas diretas</h2>
+
+  <div class="okbox">
+    <b>Dá pra gravar o próximo episódio enquanto o anterior encoda?</b> SIM — para <b>1 encode em voo</b>. O buffer já foi trocado por um novo (N+1) <b>antes</b> da thread iniciar (init_lerobot_record_v2.py:589), e a thread usa o snapshot independente via <code>episode_data=</code> (:610), nunca mais tocando <code>self.episode_buffer</code>. <code>add_frame</code> do N+1 escreve só no buffer novo.
+  </div>
+
+  <div class="warnbox">
+    <b>O que NÃO dá:</b> encadear <b>dois encodes em paralelo</b>. Fechar o episódio N+1 <b>antes</b> do encode do N terminar bloqueia no <code>_join_save_thread()</code> (init_lerobot_record_v2.py:564). Em episódios curtos (~1-2s) salvos em rajada, o 2º/3º save fica parado no join; se passar de <code>STALE_S=2.0s</code>, o watchdog do <code>run_g1_server</code> solta o braço (kp→0 em 1.5s). <b>É o único ponto que importa muito no robô real.</b>
+  </div>
+
+  <p><b>Vários datasets distintos numa só sessão?</b> Não — o <code>root</code> é timestamped e fixado na inicialização (<code>init_lerobot_record_v2.py:961-965</code>). Cada dataset novo exige reiniciar o processo. Vários <b>episódios</b> no mesmo dataset: sim, back-to-back (<code>reset_time_s=0</code>, corte manual A/B), teto de 50 eps/sessão.</p>
+
+  <h2>3 · O que adicionar — fontes oficiais, sem refatorar tudo</h2>
+
+  <div class="rec alta">
+    <span class="badge pri-alta">prioridade alta</span><span class="badge eff">esforço: pequeno-localizado</span>
+    <h3>① PRINCIPAL — trocar o <code>_join_save_thread</code> bloqueante por uma FILA de saves</h3>
+    <p>Hoje o save do N+1 bloqueia o thread principal até o encode do N acabar (~13s). Substituir por: uma <b>thread-worker persistente</b> + <code>queue.Queue</code> de snapshots. O <code>patched_save_episode</code> passa a só fazer drain + snapshot + criar buffer N+1 e <b>enfileirar</b> — retornando na hora, <b>sem esperar o encode anterior</b>. A worker consome a fila em <b>série</b> (preservando a ordem que <code>meta.save_episode</code> exige), mas o controle <b>nunca mais trava</b> nos 13s.</p>
+    <div class="proof"><b>embasamento:</b> o próprio core já assume saves em série mutando meta (lerobot_dataset.py:1278 "meta.save_episode need to be executed after encoding the videos"). Alinhado ao <b>streaming_video_encoding</b> oficial ("save_episode near-instant, removes the blocking wait between episodes"): huggingface.co/docs/lerobot/streaming_video_encoding</div>
+    <p class="note">Cuidados: limitar <code>maxsize</code> da fila (backpressure só no caso extremo); tornar <code>_active_save_episode_index</code> uma estrutura por-save (hoje assume 1 save ativo, usado no discard B em :505-506); o atexit deve drenar a fila inteira.</p>
+  </div>
+
+  <div class="rec media">
+    <span class="badge pri-media">prioridade média</span><span class="badge eff">esforço: trivial — 1 knob</span>
+    <h3>② Atacar os ~13s de encode: <code>vcodec</code> por hardware (NVENC / 'auto')</h3>
+    <p>O gargalo real do save <b>não</b> é o image_writer — é o encode CPU-bound (~13s/save com libx264). O <code>vcodec</code> já é knob no yaml (<code>yaml:17</code>). A doc oficial do streaming menciona <code>vcodec='auto'</code> que detecta o melhor HW encoder. Cortaria os 13s pra frações disso, encurtando a janela de serialização e descarregando a CPU que disputa com o IK.</p>
+    <div class="proof"><b>embasamento:</b> vcodec é knob oficial (lerobot_record.py:179, VALID_VIDEO_CODECS em lerobot_dataset.py:81). O core nota que o encode já é multithreaded (lerobot_dataset.py:1588-1589) — o ganho vem de mudar o codec/HW.</div>
+    <p class="note">⚠ Caveat forte: validar que o pyav/ffmpeg do ambiente tem o encoder HW <b>e</b> que o vídeo sai frame-exato/alinhado ao parquet (o treino exige isso).</p>
+  </div>
+
+  <div class="rec media">
+    <span class="badge pri-media">prioridade média</span><span class="badge eff">esforço: trivial — 1 knob</span>
+    <h3>③ Mais threads/processos no image_writer (acelera o drain)</h3>
+    <p>Passar <code>--dataset.num_image_writer_threads_per_camera=6</code> (ou 8), ou <code>--dataset.num_image_writer_processes=1</code> (migra a escrita de PNG pra subprocessos, tirando do GIL do controle). Acelera os ~100ms de drain do thread principal. <b>Não</b> acelera o encode (gargalo real). Ganho marginal e grátis.</p>
+    <div class="proof"><b>embasamento (docstring oficial, verbatim):</b> "We advise to use 4 threads per camera with 0 processes. If the fps is not stable, try to increase or lower the number of threads. If it is still not stable, try to use 1 subprocess, or more." — image_writer.py:139-141</div>
+  </div>
+
+  <div class="rec media">
+    <span class="badge pri-media">prioridade média</span><span class="badge eff">esforço: trivial — 1 knob</span>
+    <h3>④ Baixar o <code>compress_level</code> do depth de 6 → ~1</h3>
+    <p>O drain no thread principal carrega PNGs de profundidade uint16 16-bit salvos com <code>compress_level=6</code> (muito mais caro que o RGB nível 1). Em episódio longo a fila pode ter centenas de frames e o drain O(queue_size) pode passar dos 100ms e se aproximar de <code>STALE_S=2.0s</code>. Baixar o nível acelera escrita e drain.</p>
+    <div class="proof"><b>prova:</b> lerobot_dataset.py:1165 (compress_level = 1 if dtype==video else 6) · parâmetro de save_image em image_writer.py:173</div>
+  </div>
+
+  <div class="rec alta">
+    <span class="badge pri-alta">atenção</span><span class="badge eff">não usar</span>
+    <h3>✗ <code>batch_encoding_size&gt;1</code> — NÃO consertável de forma confiável hoje</h3>
+    <p>O knob existe e em tese adiaria o encode, MAS nesta versão o vídeo em lote sai <b>invertido e truncado</b> (comprovado no run 20260605_173343: batch=50 → file-000.mp4 reverso com 2090/16453 frames). Os patches INJEÇÃO 3.3/3.4 só evitam o <b>crash</b> (KeyError, correlato à issue oficial huggingface/lerobot#2404), <b>não</b> a corrupção. Além disso, mesmo funcionando, o encode em lote rodaria <b>síncrono</b> no episódio-gatilho (N×13s de pico), sem sobrepor com a captura.</p>
+    <div class="proof"><b>prova:</b> knob oficial (lerobot_dataset.py:680-681); bug do crash é issue oficial #2404 (v0.4.0, PR #2462); a corrupção reverso/truncado NÃO tem fix oficial conhecido. Manter <code>video_encoding_batch_size: 1</code> (yaml:26).</div>
+  </div>
+
+  <div class="rec baixa">
+    <span class="badge pri-baixa">prioridade baixa</span><span class="badge eff">esforço: pequeno</span>
+    <h3>⑤ Forçar encode em ProcessPoolExecutor mesmo com 1 câmera</h3>
+    <p>Com 1 câmera de vídeo, o encode cai no ramo sem ProcessPoolExecutor (roda na thread daemon, in-process). Forçar o caminho <code>parallel_encoding</code> tiraria os loops Python por-frame do processo de controle. Ganho pequeno (ffmpeg já não segura o GIL no trabalho pesado) + overhead de spawn por save. A fila de saves (①) e o vcodec HW (②) resolvem melhor.</p>
+    <div class="proof"><b>prova:</b> ProcessPoolExecutor por câmera já existe no ramo parallel_encoding (lerobot_dataset.py:1242-1245). Core: "video encoding with ffmpeg is already using multithreading" (lerobot_dataset.py:1588-1589).</div>
+  </div>
+
+  <h2>4 · Resumo das recomendações</h2>
+  <table>
+    <thead><tr><th>#</th><th>Recomendação</th><th>Prioridade</th><th>Esforço</th><th>Ataca</th></tr></thead>
+    <tbody>
+      <tr><td>①</td><td>Fila de saves (em vez de join bloqueante)</td><td style="color:#ff7b72">alta</td><td>pequeno-localizado</td><td>o único bloqueio perigoso do controle</td></tr>
+      <tr><td>②</td><td>vcodec por hardware (NVENC/'auto')</td><td style="color:#e3b341">média</td><td>1 knob (+ validar)</td><td>os ~13s de encode (gargalo real)</td></tr>
+      <tr><td>③</td><td>+threads/1 processo no image_writer</td><td style="color:#e3b341">média</td><td>1 knob</td><td>os ~100ms de drain</td></tr>
+      <tr><td>④</td><td>compress_level do depth 6→1</td><td style="color:#e3b341">média</td><td>1 knob</td><td>drain em episódio longo</td></tr>
+      <tr><td>✗</td><td>batch_encoding_size&gt;1</td><td style="color:#ff7b72">NÃO usar</td><td>—</td><td>bugado (vídeo corrompido)</td></tr>
+      <tr><td>⑤</td><td>ProcessPool no encode de 1 câmera</td><td style="color:#56d364">baixa</td><td>pequeno</td><td>contenção GIL (marginal)</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    Gerado a partir de investigação multi-agente (5 leitores de código + 2 avaliadores adversariais) sobre <code>init_lerobot_record_v2.py</code> e o LeRobot oficial. Toda afirmação tem citação <code>arquivo:linha</code>. As recomendações priorizam mudanças <b>sem refatoração grande</b> — knobs existentes e ajustes localizados, embasados nas fontes oficiais.<br>
+    G1 · branch <code>Luiz-pi05d</code> · 2026-06-08.
+  </footer>
+
+</div>
+</body>
+</html>

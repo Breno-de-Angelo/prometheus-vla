@@ -1,0 +1,54 @@
+{
+  "dictionary": "DICT_4X4_50",
+  "dpi": 300,
+  "markers": [
+    {
+      "id": 0,
+      "group": "table",
+      "size_mm": 60,
+      "file": "markers/table_id00_60mm.png"
+    },
+    {
+      "id": 1,
+      "group": "table",
+      "size_mm": 60,
+      "file": "markers/table_id01_60mm.png"
+    },
+    {
+      "id": 2,
+      "group": "table",
+      "size_mm": 60,
+      "file": "markers/table_id02_60mm.png"
+    },
+    {
+      "id": 3,
+      "group": "table",
+      "size_mm": 60,
+      "file": "markers/table_id03_60mm.png"
+    },
+    {
+      "id": 4,
+      "group": "cup",
+      "size_mm": 25,
+      "file": "markers/cup_id04_25mm.png"
+    },
+    {
+      "id": 5,
+      "group": "cup",
+      "size_mm": 25,
+      "file": "markers/cup_id05_25mm.png"
+    },
+    {
+      "id": 6,
+      "group": "cup",
+      "size_mm": 25,
+      "file": "markers/cup_id06_25mm.png"
+    },
+    {
+      "id": 7,
+      "group": "cup",
+      "size_mm": 25,
+      "file": "markers/cup_id07_25mm.png"
+    }
+  ]
+}

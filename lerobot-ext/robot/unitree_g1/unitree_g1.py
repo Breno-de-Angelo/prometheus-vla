@@ -496,8 +496,11 @@ class UnitreeG1(Robot):
             # kp/kd por grupo (restauram o amortecimento; ver _arm_gains)
             "arm_kp_shoulder": 80.0, "arm_kp_elbow": 80.0, "arm_kp_wrist": 40.0,
             "arm_kd_shoulder": 3.0,  "arm_kd_elbow": 3.0,  "arm_kd_wrist": 1.5,
-            # limite de velocidade do arm streamer (rad/s), clip a 250Hz (jeito Unitree)
+            # limite de velocidade do arm streamer (rad/s) — backstop de segurança
             "arm_velocity_limit": 20.0,
+            # frequência do IK: define a janela de interpolação (1/arm_interp_hz segundos).
+            # Deve coincidir com o fps do record_loop (30Hz). Ajuste aqui se mudar o fps.
+            "arm_interp_hz": 30.0,
         }
         path = os.environ.get("G1_TUNING", "g1_tuning.json")
         try:
@@ -525,15 +528,23 @@ class UnitreeG1(Robot):
         return self._action_log_f
 
     def _arm_streamer_worker(self):
-        """Publica self.msg a ~250Hz com clip de velocidade contra a posição MEDIDA
-        (réplica do G1_29_ArmController da Unitree). O braço recebe uma rampa contínua
-        em vez de degraus a 30Hz → elimina o stair-stepping/tremor.
+        """Publica self.msg a ~250Hz com INTERPOLAÇÃO TEMPORAL entre alvos de IK de 30Hz.
 
-        clip_arm_q_target (vetorial): se alguma junta excede velocity_limit*dt, escala
-        TODAS proporcionalmente — preserva a direção do movimento no espaço de juntas."""
+        Em vez de clip puro contra prev_cmd (que só saltava ao alvo e ficava parado),
+        faz uma rampa linear start_q → tgt ao longo de interp_s (= 1/arm_interp_hz ≈ 33ms),
+        produzindo ~8 sub-passos reais por ciclo de IK → elimina o staircase.
+
+        Backstop de segurança: clip vetorial de velocidade (arm_velocity_limit) entre
+        prev_cmd e interp_q — protege contra glitch de IK sem afetar movimentos normais.
+        arm_interp_hz e arm_velocity_limit são ajustáveis a quente em g1_tuning.json."""
         dt = float(getattr(self.config, "control_dt", 1.0 / 250.0))
         if dt <= 0:
             dt = 1.0 / 250.0
+        # Estado de interpolação temporal (fora do lock — apenas lido/escrito por esta thread)
+        interp_s: float = 1.0 / 30.0  # janela inicial; atualizada a cada leitura de tuning
+        seg_t0:   float = 0.0          # timestamp (perf_counter) do início do segmento atual
+        start_q:  np.ndarray | None = None   # q no início do segmento
+        _last_tgt: np.ndarray | None = None  # último alvo visto (detecta mudança)
         fails = 0
         while not self._arm_streamer_stop.is_set():
             t0 = time.perf_counter()
@@ -541,26 +552,38 @@ class UnitreeG1(Robot):
                 with self._arm_lock:
                     tun = getattr(self, "_tuning", None) or {}
                     vlim = float(tun.get("arm_velocity_limit", 20.0))
+                    interp_hz = float(tun.get("arm_interp_hz", 30.0))
+                    interp_s = 1.0 / interp_hz if interp_hz > 0 else 1.0 / 30.0
                     ls = self._lowstate
                     items = list(self._arm_target.items())
                     if items and ls is not None:
+                        # Compensa starvation do GIL: usa o tempo real decorrido.
+                        # Se a thread engasgar e pular frames, real_dt compensa 
+                        # avançando a rampa e o limite de velocidade na proporção correta.
+                        now = time.perf_counter()
+                        real_dt = max(now - getattr(self, "_last_stream_t", now - dt), 0.001)
+                        self._last_stream_t = now
+
                         mvs = [mv for mv, _ in items]
                         tgt = np.array([q for _, q in items], dtype=float)
-                        # Clip contra COMANDO ANTERIOR (jeito Unitree oficial: robot_arm.py
-                        # usa self.arm_q_target = ultimo cmd, nao a posicao medida).
-                        # Clip contra medida criava assimetria gravitacional: subir acumula
-                        # delta grande (gravidade atrasa cur), mais clip → mais lento pra cima.
                         prev_cmd = np.array([self.msg.motor_cmd[mv].q for mv in mvs], dtype=float)
-                        delta = tgt - prev_cmd
-                        vmax = vlim * dt
+                        vmax = vlim * real_dt
                         if getattr(self.config, "is_simulation", False):
-                            # SIM: sem clip de velocidade (igual à Unitree no simulation_mode)
+                            # SIM: publica o alvo diretamente (sem rampa), igual à Unitree.
                             newq = tgt
                         elif vmax > 0:
-                            mx = float(np.max(np.abs(delta))) if delta.size else 0.0
-                            # scale >= 1.0: nunca divide por zero, nunca passa mais que vmax.
+
+                            # Filtro EMA (Exponential Moving Average) a 250Hz.
+                            # Muito superior à rampa linear para teleoperação via WiFi:
+                            # adapta-se naturalmente ao jitter dos pacotes do Quest e
+                            # nunca dá "hard stop" (tranco) se um pacote atrasar.
+                            ema_alpha = min(real_dt / (interp_s + real_dt), 1.0)
+                            interp_q  = prev_cmd + ema_alpha * (tgt - prev_cmd)
+                            # Backstop de segurança: clip vetorial entre prev_cmd e interp_q
+                            # (protege contra glitch de IK sem impactar movimentos normais).
+                            mx = float(np.max(np.abs(interp_q - prev_cmd))) if interp_q.size else 0.0
                             scale = max(mx / vmax, 1.0)
-                            newq = prev_cmd + delta / scale
+                            newq = prev_cmd + (interp_q - prev_cmd) / scale
                         else:
                             newq = prev_cmd
                         if not np.any(np.isnan(newq)) and not np.any(np.isinf(newq)):

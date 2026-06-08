@@ -4,7 +4,6 @@ import cv2
 import os
 import threading
 import logging
-import contextlib
 import numpy as np
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +14,7 @@ from lerobot.processor import RobotAction
 
 # Imports do ecossistema Unitree (ajuste os caminhos conforme sua pasta)
 from televuer import TeleVuerWrapper
+from .utils.sensor_utils import SensorClient, ImageUtils
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
 
@@ -106,11 +106,6 @@ class XRG1Arm(Teleoperator):
         # e voltar depois de um gap, re-ancora o clutch para o robô não aplicar
         # de uma vez o movimento que o controle acumulou durante o freeze.
         self._last_clutch_time = None
-        self._video_stop = threading.Event()
-        self._latest_vr_frame = None
-        self._latest_vr_seq = 0
-        self._rendered_vr_seq = 0
-        self._vr_frame_lock = threading.Lock()
 
     def connect(self, calibrate: bool = True) -> None:
         if self._is_connected:
@@ -141,85 +136,74 @@ class XRG1Arm(Teleoperator):
 
         self._is_connected = True
 
-        # Câmera do Quest: usa stream local RGB-only (:5558 por padrão), separado
-        # do stream completo RGB+Depth (:5555) usado pelo dataset/OmniView.
+        # NOVA PARTE: Usando o SensorClient que já funciona!
         if self.config.zmq and self.config.display_mode != "pass-through":
-            self.vr_cam_port = int(os.environ.get("G1_VR_CAM_PORT", "5558"))
-            self.vr_display_fps = float(os.environ.get("G1_VR_DISPLAY_FPS", "60"))
-            logger.info(
-                "Conectando ao feed RGB-only do VR em %s:%d (render %.1f FPS)...",
-                self.config.img_server_ip,
-                self.vr_cam_port,
-                self.vr_display_fps,
-            )
+            logger.info(f"Conectando ao feed de vídeo ZMQ via SensorClient em {self.config.img_server_ip}:5555...")
+            self.sensor_client = SensorClient()
+            self.sensor_client.start_client(server_ip=self.config.img_server_ip, port=5555)
 
+            # Inicia uma thread em background para receber as imagens
             self.video_thread = threading.Thread(target=self._receive_video_feed, daemon=True)
-            self.video_render_thread = threading.Thread(target=self._render_video_feed, daemon=True)
             self.video_thread.start()
-            self.video_render_thread.start()
 
         logger.info("VR Teleoperator Conectado! Visite o link do Vuer no navegador do headset.")
 
     def _receive_video_feed(self):
-        ctx = zmq.Context.instance()
-        while self._is_connected and not self._video_stop.is_set():
-            sock = ctx.socket(zmq.SUB)
-            sock.setsockopt(zmq.CONFLATE, 1)
-            sock.setsockopt(zmq.RCVHWM, 1)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, 1000)
-            sock.setsockopt_string(zmq.SUBSCRIBE, "")
-            sock.connect(f"tcp://{self.config.img_server_ip}:{self.vr_cam_port}")
+        while self._is_connected:
             try:
-                while self._is_connected and not self._video_stop.is_set():
-                    try:
-                        jpg_bytes = sock.recv()
-                    except zmq.Again:
-                        continue
-                    img = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR)
-                    if img is None:
-                        continue
-                    with self._vr_frame_lock:
-                        self._latest_vr_frame = img
-                        self._latest_vr_seq += 1
-            except Exception as e:
-                logger.error(f"Erro no feed de vídeo RGB-only do VR: {e}")
-                time.sleep(0.1)
-            finally:
-                sock.close(0)
+                # Recebe a mensagem estruturada usando o client oficial do seu sim
+                data = self.sensor_client.receive_message()
+                
+                if not data:
+                    time.sleep(0.005)
+                    continue
 
-    def _render_video_feed(self):
-        period = 1.0 / max(1.0, getattr(self, "vr_display_fps", 30.0))
-        while self._is_connected and not self._video_stop.is_set():
-            start = time.perf_counter()
-            frame = None
-            with self._vr_frame_lock:
-                if self._latest_vr_seq != self._rendered_vr_seq and self._latest_vr_frame is not None:
-                    frame = self._latest_vr_frame
-                    self._rendered_vr_seq = self._latest_vr_seq
-            if frame is not None:
-                try:
-                    self.tv_wrapper.render_to_xr(frame)
-                except Exception as e:
-                    logger.error(f"Erro renderizando feed no VR: {e}")
-            time.sleep(max(0.0, period - (time.perf_counter() - start)))
+                # Extrai a imagem do dicionário (lidando com os dois formatos que seu script suporta)
+                img_data = None
+                cam_name = "head_camera"  # Nome padrão, mas vamos buscar dinamicamente se falhar
+                
+                if "images" in data and cam_name in data["images"]:
+                    img_data = data["images"][cam_name]
+                elif cam_name in data:
+                    img_data = data[cam_name]
+                else:
+                    # Pega a primeira câmera que encontrar no dicionário
+                    keys = [k for k in data.keys() if k not in ["timestamps", "images"]]
+                    if keys:
+                        img_data = data[keys[0]]
+
+                # Se achou a imagem, decodifica usando o ImageUtils
+                if img_data is not None:
+                    if isinstance(img_data, str):
+                        img = ImageUtils.decode_image(img_data)
+                    else:
+                        img = img_data  # Assume que já é numpy array
+
+                    if img is not None and isinstance(img, np.ndarray):
+                        # Converte de BGR para RGB
+                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        
+                        # Envia para o VR
+                        self.tv_wrapper.render_to_xr(img_rgb)
+
+            except Exception as e:
+                logger.error(f"Erro no feed de vídeo ZMQ: {e}")
+                time.sleep(0.01) # Pausa curta para não floodar o log em caso de erro contínuo
 
     def disconnect(self) -> None:
         if self._is_connected:
             self._is_connected = False
-            self._video_stop.set()
             
             # Aguarda a thread de vídeo encerrar
             if hasattr(self, 'video_thread') and self.video_thread.is_alive():
                 self.video_thread.join(timeout=1.0)
-            if hasattr(self, 'video_render_thread') and self.video_render_thread.is_alive():
-                self.video_render_thread.join(timeout=1.0)
             
             if self.tv_wrapper:
                 self.tv_wrapper.close()
                 
-            with contextlib.suppress(Exception):
-                self._latest_vr_frame = None
+            # Fecha o client corretamente
+            if hasattr(self, 'sensor_client'):
+                self.sensor_client.stop_client()
 
     @property
     def is_connected(self) -> bool:

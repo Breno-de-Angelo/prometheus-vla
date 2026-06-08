@@ -103,11 +103,11 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
                     server_address=self.robot_ip, port=5555, camera_name="head_camera", width=cam2_width, height=cam2_height
                 ),
                 
-                # AS 3 LENTES TÉCNICAS (Baixa Resolução para o processamento ser imediato)
-                "head_camera_depth": ZMQCameraConfig(
-                    server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height
-                )
-                ,
+                # DEPTH temporariamente desligado para isolar lag durante gravação.
+                # Reative descomentando o bloco abaixo.
+                # "head_camera_depth": ZMQCameraConfig(
+                #     server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height
+                # ),
                 #"d435i_ir_left": ZMQCameraConfig(
                 #    server_address=self.robot_ip, port=5555, camera_name="d435i_ir_left", width=cam_width, height=cam_height
                 #),

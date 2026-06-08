@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from sim.sensor_utils import SensorServer, ImageUtils
+from sim.sensor_utils import SensorServer
 
 
 def start_realsense_zmq():
@@ -43,26 +43,16 @@ def start_realsense_zmq():
             rgb = np.asanyarray(color_frame.get_data())
             depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 (unidades do sensor)
 
-            # depth em mm como uint16 (1 canal), PNG lossless no transporte.
-            # clip em 32767: o ToTensor decodifica PNG I;16 como int16 (com sinal).
+            # Depth em mm como uint16 (1 canal), enviado como PNG no multipart ZMQ.
             depth_mm = np.clip(
                 depth_raw.astype(np.float32) * depth_scale * 1000.0, 0.0, 32767.0
             ).astype(np.uint16)
 
-            encoded_rgb = ImageUtils.encode_image(rgb)
-            encoded_depth = ImageUtils.encode_depth_image(depth_mm)  # PNG uint16 (1 canal)
-
             t = time.time()
-            server.send_message({
-                "images": {
-                    "head_camera": encoded_rgb,
-                    "head_camera_depth": encoded_depth,
-                },
-                "timestamps": {
-                    "head_camera": t,
-                    "head_camera_depth": t,
-                },
-            })
+            server.send_images(
+                {"head_camera": rgb, "head_camera_depth": depth_mm},
+                {"head_camera": t, "head_camera_depth": t},
+            )
 
     except KeyboardInterrupt:
         print("Encerrando...")

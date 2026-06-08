@@ -72,7 +72,9 @@ def start_real_robot_cameras():
 
             # --- TRATAMENTO RGB ---
             img_bgr = np.asanyarray(color_frame.get_data())
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            # Publica BGR diretamente — ImageUtils.encode_image usa cv2.imencode
+            # que já espera BGR. O OmniView e o _patched_zmq_read convertem BGR→RGB
+            # do lado do cliente. Converter aqui para RGB causaria double-swap.
 
             # --- TRATAMENTO DEPTH (CORRIGIDO PARA IA) ---
             depth_raw = np.asanyarray(depth_frame.get_data())
@@ -91,7 +93,7 @@ def start_real_robot_cameras():
             current_time = time.time()
             message = {
                 "images": {
-                    "head_camera": ImageUtils.encode_image(img_rgb),
+                    "head_camera": ImageUtils.encode_image(img_bgr),
                     "head_camera_depth": ImageUtils.encode_image(depth_3c), # Envia a imagem cinza corrigida
                 },
                 "timestamps": {

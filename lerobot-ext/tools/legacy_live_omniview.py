@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Dashboard web AO VIVO estilo OmniView para a teleoperação/gravação do G1.
+
+Espelha a TELA DE DETALHE do OmniView (RGB · head_camera, DEPTH · turbo,
+TRAJETÓRIA 3D · end-effector dir., RAMPAS por junta e TÁTIL · Dex3-1) — só que
+em tempo real, lendo os dados enquanto você teleopera, em vez de um episódio já
+gravado.
+
+Fontes (dois PUBs ZMQ que o pipeline de gravação já expõe):
+  • imagens   : tcp://<cam-host>:5555  (RGB jpg + Depth png uint16) — mesmo do view_cam_live
+  • telemetria: tcp://127.0.0.1:5557    (state/action/tátil) — publicado por live_bridge.py
+
+Arquitetura: duas threads ZMQ (bloqueantes) atualizam o último frame de cada
+fonte; um servidor aiohttp serve o webapp estático e um broadcast websocket
+empurra (a) cada novo frame de imagem e (b) cada nova amostra de telemetria pros
+browsers conectados. O navegador monta as rampas/trajetória/tátil em JS.
+
+Uso:
+    python tools/live_omniview.py --host 127.0.0.1            # sim
+    python tools/live_omniview.py --host 192.168.123.164      # robô real
+    python tools/live_omniview.py --http-port 8013 --no-browser
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import json
+import logging
+import os
+import socket
+import threading
+import time
+import webbrowser
+from pathlib import Path
+
+import cv2
+import numpy as np
+import zmq
+from aiohttp import WSMsgType, web
+
+logging.basicConfig(level=logging.INFO, format="[live_omniview] %(message)s")
+logger = logging.getLogger("live_omniview")
+
+WEBAPP_DIR = Path(__file__).resolve().parent / "live_webapp"
+
+# Último frame de cada fonte + contadores de sequência (pra mandar só o que mudou).
+LATEST = {"img": None, "img_seq": 0, "tele": None, "tele_seq": 0, "quest": None}
+_LOCK = threading.Lock()
+
+
+# ----------------------------------------------------------------------------- imagens
+def _jpg_dataurl(bgr: np.ndarray, quality: int = 80) -> str:
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        return ""
+    return "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+
+
+def _colorize_depth(depth: np.ndarray):
+    """uint16 (sim: metros*38, real: mm) -> (dataurl turbo, meta). Igual ao view_cam_live."""
+    if depth.ndim == 3:
+        depth = depth[:, :, 0]
+    vis_min = float(os.environ.get("DEPTH_VIS_MIN_M", "0.2"))
+    vis_max = float(os.environ.get("DEPTH_VIS_MAX_M", "1.5"))
+    valid = depth > 0
+    if not valid.any():
+        black = np.zeros((*depth.shape, 3), dtype=np.uint8)
+        return _jpg_dataurl(black), {"min": 0, "max": 0, "valid": 0, "visMin": vis_min, "visMax": vis_max}
+    # sim publica metros*38 (valores baixos); robô real publica mm.
+    scale = 38.0 if float(depth[valid].max()) < 150.0 else 1000.0
+    depth_m = depth.astype(np.float32) / scale
+    norm = np.clip((depth_m - vis_min) / (vis_max - vis_min), 0.0, 1.0)
+    # TURBO; perto (norm baixo) -> vermelho => usa (1-norm). Inválidos pretos.
+    d_vis = ((1.0 - norm) * 255).astype(np.uint8)
+    d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO)
+    d_color[~valid] = (0, 0, 0)
+    meta = {
+        "min": round(float(depth_m[valid].min()) * 1000.0),   # mm
+        "max": round(float(depth_m[valid].max()) * 1000.0),
+        "valid": round(100.0 * float(valid.mean())),
+        "visMin": vis_min,
+        "visMax": vis_max,
+    }
+    return _jpg_dataurl(d_color), meta
+
+
+def _image_thread(host: str, port: int, stop: threading.Event):
+    ctx = zmq.Context.instance()
+    while not stop.is_set():
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        sock.setsockopt(zmq.RCVTIMEO, 1000)
+        sock.connect(f"tcp://{host}:{port}")
+        logger.info("imagens: conectado a tcp://%s:%d", host, port)
+        try:
+            while not stop.is_set():
+                try:
+                    msg = sock.recv_string()
+                except zmq.Again:
+                    continue
+                except Exception:
+                    break
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                images = data.get("images", data)
+                rgb_b64 = images.get("head_camera")
+                depth_b64 = images.get("head_camera_depth")
+                out = {}
+                if isinstance(rgb_b64, str):
+                    # RGB ja chega como JPEG/base64 do publisher; o OmniView e apenas
+                    # visualizacao, entao nao decodifica/re-encoda o mesmo frame.
+                    out["rgb"] = "data:image/jpeg;base64," + rgb_b64
+                if isinstance(depth_b64, str):
+                    depth = cv2.imdecode(np.frombuffer(base64.b64decode(depth_b64), np.uint8), cv2.IMREAD_UNCHANGED)
+                    if depth is not None:
+                        url, meta = _colorize_depth(depth)
+                        out["depth"] = url
+                        out["depthMeta"] = meta
+                if out:
+                    with _LOCK:
+                        if not LATEST.get("img"):
+                            LATEST["img"] = {}
+                        LATEST["img"].update(out)
+                        LATEST["img_seq"] += 1
+        finally:
+            sock.close(0)
+        if not stop.is_set():
+            time.sleep(0.5)  # fonte caiu; tenta reconectar
+
+
+def _quest_thread(quest_adb: str, stop: threading.Event):
+    """Sonda o Quest via ADB a cada 2s -> LATEST['quest'] (True/False).
+
+    `quest_adb` = "<ip>:5555" (o headset). Vazio => não sonda (status fica 'n/d').
+    'device' no get-state = headset alcançável na rede (proxy de "Quest conectado").
+    """
+    import subprocess
+    if not quest_adb:
+        return
+    while not stop.is_set():
+        connected = False
+        try:
+            r = subprocess.run(["adb", "-s", quest_adb, "get-state"],
+                               capture_output=True, text=True, timeout=4)
+            connected = (r.returncode == 0 and "device" in r.stdout)
+        except Exception:
+            connected = False
+        with _LOCK:
+            LATEST["quest"] = connected
+        stop.wait(2.0)
+
+
+def _tele_thread(port: int, stop: threading.Event):
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.CONFLATE, 1)
+    sock.setsockopt_string(zmq.SUBSCRIBE, "")
+    sock.setsockopt(zmq.RCVTIMEO, 1000)
+    sock.connect(f"tcp://127.0.0.1:{port}")
+    logger.info("telemetria: conectado a tcp://127.0.0.1:%d", port)
+    try:
+        while not stop.is_set():
+            try:
+                msg = sock.recv_string()
+            except zmq.Again:
+                continue
+            except Exception:
+                break
+            try:
+                pkt = json.loads(msg)
+            except Exception:
+                continue
+            with _LOCK:
+                LATEST["tele"] = pkt
+                LATEST["tele_seq"] += 1
+    finally:
+        sock.close(0)
+
+
+# ----------------------------------------------------------------------------- web / ws
+async def _ws_handler(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse(max_msg_size=0)
+    await ws.prepare(request)
+    request.app["clients"].add(ws)
+    logger.info("ws conectado (%d clientes)", len(request.app["clients"]))
+    try:
+        async for m in ws:  # só mantém viva; o broadcast empurra os frames
+            if m.type == WSMsgType.ERROR:
+                break
+    finally:
+        request.app["clients"].discard(ws)
+        logger.info("ws desconectado (%d clientes)", len(request.app["clients"]))
+    return ws
+
+
+async def _broadcast(app: web.Application):
+    sent_img = sent_tele = 0
+    tick = 0
+    last_img_tick = -10**9
+    while True:
+        await asyncio.sleep(1 / 60)
+        tick += 1
+        clients = app["clients"]
+        if not clients:
+            sent_img, sent_tele = LATEST["img_seq"], LATEST["tele_seq"]
+            continue
+        payloads = []
+        # limita os frames de câmera (só visualização) p/ não estourar a memória do
+        # browser com data/blobs grandes a 30Hz — 848×480 real era pesado demais.
+        img_every = app["img_every"]
+        send_img = (tick - last_img_tick) >= img_every
+        with _LOCK:
+            if send_img and LATEST["img_seq"] != sent_img and LATEST["img"] is not None:
+                sent_img = LATEST["img_seq"]
+                last_img_tick = tick
+                payloads.append({"type": "img", **LATEST["img"]})
+            if LATEST["tele_seq"] != sent_tele and LATEST["tele"] is not None:
+                sent_tele = LATEST["tele_seq"]
+                payloads.append(LATEST["tele"])
+            if tick % 30 == 0:   # ~0.5s: status de conexão do Quest (PC/G1 o browser deduz sozinho)
+                payloads.append({"type": "links", "quest": LATEST["quest"]})
+        for p in payloads:
+            txt = json.dumps(p)
+            for ws in list(clients):
+                try:
+                    await ws.send_str(txt)
+                except Exception:
+                    clients.discard(ws)
+
+
+async def _on_startup(app: web.Application):
+    app["broadcast_task"] = asyncio.create_task(_broadcast(app))
+
+
+async def _on_cleanup(app: web.Application):
+    app["broadcast_task"].cancel()
+    for ws in list(app["clients"]):
+        await ws.close()
+
+
+def build_app() -> web.Application:
+    app = web.Application()
+    app["clients"] = set()
+    app.router.add_get("/ws", _ws_handler)
+    app.router.add_get("/", lambda r: web.HTTPFound("/live.html"))
+    app.router.add_static("/", str(WEBAPP_DIR), show_index=False)
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+    return app
+
+
+def _open_browser_when_ready(host: str, port: int):
+    target = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    for _ in range(60):
+        try:
+            with socket.create_connection((target, port), timeout=0.5):
+                pass
+        except OSError:
+            time.sleep(0.5)
+            continue
+        url = f"http://{target}:{port}/live.html"
+        logger.info("abrindo browser em %s", url)
+        webbrowser.open(url)
+        return
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Dashboard web ao vivo (estilo OmniView) do G1")
+    ap.add_argument("--host", default="127.0.0.1", help="host do PUB de câmeras (sim=127.0.0.1)")
+    ap.add_argument("--cam-port", type=int, default=5555)
+    ap.add_argument("--tele-port", type=int, default=5557)
+    ap.add_argument("--http-host", default="127.0.0.1")
+    ap.add_argument("--http-port", type=int, default=8013)
+    ap.add_argument("--quest-adb", default="", help="<ip>:5555 do Quest p/ status via adb (vazio=n/d)")
+    ap.add_argument("--img-fps", type=float, default=15.0,
+                    help="teto de FPS dos frames de câmera enviados ao browser (só viz; dataset intocado)")
+    ap.add_argument("--no-browser", action="store_true")
+    args = ap.parse_args()
+
+    stop = threading.Event()
+    t_img = threading.Thread(target=_image_thread, args=(args.host, args.cam_port, stop), daemon=True)
+    t_tel = threading.Thread(target=_tele_thread, args=(args.tele_port, stop), daemon=True)
+    t_quest = threading.Thread(target=_quest_thread, args=(args.quest_adb, stop), daemon=True)
+    t_img.start()
+    t_tel.start()
+    t_quest.start()
+
+    if not args.no_browser:
+        threading.Thread(
+            target=_open_browser_when_ready, args=(args.http_host, args.http_port), daemon=True
+        ).start()
+
+    logger.info("dashboard em http://%s:%d/live.html  (Ctrl-C pra sair)", args.http_host, args.http_port)
+    app = build_app()
+    app["img_every"] = max(1, round(60.0 / max(1.0, args.img_fps)))  # ticks de 1/60s entre frames
+    try:
+        web.run_app(app, host=args.http_host, port=args.http_port, print=None, handle_signals=True)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        stop.set()
+
+
+if __name__ == "__main__":
+    main()

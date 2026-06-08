@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from sim.sensor_utils import SensorServer, ImageUtils
+from sim.sensor_utils import SensorServer
 
 
 def start_realsense_zmq():
@@ -40,18 +40,7 @@ def start_realsense_zmq():
 
             img = np.asanyarray(color_frame.get_data())
 
-            encoded_image = ImageUtils.encode_image(img)
-
-            message = {
-                "images": {
-                    "head_camera": encoded_image
-                },
-                "timestamps": {
-                    "head_camera": time.time()
-                }
-            }
-
-            server.send_message(message)
+            server.send_images({"head_camera": img}, {"head_camera": time.time()})
 
     except KeyboardInterrupt:
         print("Encerrando...")
