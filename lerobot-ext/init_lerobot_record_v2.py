@@ -489,6 +489,15 @@ lerobot.datasets.lerobot_dataset.LeRobotDataset._wait_image_writer = _patched_wa
 
 _original_clear_episode_buffer = lerobot.datasets.lerobot_dataset.LeRobotDataset.clear_episode_buffer
 
+def _delete_episode_image_dirs(dataset, episode_index) -> None:
+    import shutil as _shutil, numpy as _np
+    if isinstance(episode_index, _np.ndarray):
+        episode_index = episode_index.item() if episode_index.size == 1 else int(episode_index[0])
+    for cam_key in getattr(dataset.meta, "camera_keys", dataset.meta.image_keys + dataset.meta.video_keys):
+        img_dir = dataset._get_image_file_dir(int(episode_index), cam_key)
+        if img_dir.is_dir():
+            _shutil.rmtree(img_dir)
+
 def _patched_clear_episode_buffer(self, delete_images: bool = True) -> None:
     """Garante que o próximo buffer use o índice correto mesmo durante save assíncrono.
 
@@ -497,18 +506,12 @@ def _patched_clear_episode_buffer(self, delete_images: bool = True) -> None:
     de save para passar no validate). Sem o patch, create_episode_buffer() usaria
     o valor errado e o próximo episódio gravaria no diretório errado.
     """
-    import shutil as _shutil, numpy as _np
     if delete_images:
         if self.image_writer is not None:
             self._wait_image_writer()
         ep_idx = self.episode_buffer.get("episode_index", None)
         if ep_idx is not None:
-            if isinstance(ep_idx, _np.ndarray):
-                ep_idx = ep_idx.item() if ep_idx.size == 1 else int(ep_idx[0])
-            for cam_key in self.meta.image_keys:
-                img_dir = self._get_image_file_dir(ep_idx, cam_key)
-                if img_dir.is_dir():
-                    _shutil.rmtree(img_dir)
+            _delete_episode_image_dirs(self, ep_idx)
     # Se há um save assíncrono ativo, usa o próximo índice explícito para evitar
     # race com meta.total_episodes; caso contrário usa o comportamento padrão.
     if _active_save_episode_index is not None:
@@ -540,6 +543,10 @@ def _save_queue_worker():
             _save_error.append(exc)
             print(f"[ASYNC-SAVE] ❌ Exceção na thread de save (ep {ep_idx}): {exc}", flush=True)
         finally:
+            try:
+                _delete_episode_image_dirs(dataset_ref, ep_idx)
+            except Exception as exc:
+                print(f"[ASYNC-SAVE] ⚠️ Falha limpando imagens temporárias do ep {ep_idx}: {exc}", flush=True)
             _active_save_episode_index = None
             _save_thread_local.skip_wait = False
             _save_queue.task_done()
@@ -557,7 +564,8 @@ def _drain_save_queue():
         return
     _queue_drained = True
     """Drena a fila e espera todos os saves terminarem (chamado pelo atexit)."""
-    print("[ASYNC-SAVE] ⏳ Aguardando saves pendentes antes de encerrar...", flush=True)
+    pending = _save_queue.qsize()
+    print(f"[ASYNC-SAVE] ⏳ Aguardando saves/encodes pendentes antes de encerrar (fila={pending})...", flush=True)
     _save_queue.put(None)   # sentinela: manda o worker parar após processar o que já está na fila
     _save_queue.join()      # bloqueia até task_done() de TODOS os itens (inclusive o None)
     if _save_error:
@@ -597,6 +605,7 @@ def patched_save_episode(self, *args, **kwargs):
     global_events = getattr(lerobot.utils.control_utils, "global_events", None)
     if global_events and global_events.get("stop_recording"):
         print("\n[GUARD] ⚠️ Encerrando o sistema (Y pressionado) — descartando episódio parcial.", flush=True)
+        print("[ASYNC-SAVE] O encerramento vai aguardar todos os saves/encodes já enfileirados.", flush=True)
         try:
             self.clear_episode_buffer()
         except Exception:
@@ -634,6 +643,10 @@ def patched_save_episode(self, *args, **kwargs):
     #    um race: a thread de save pode estar em qualquer ponto da sua execução.
     next_episode_index = episode_data_snapshot["episode_index"] + 1
     try:
+        _delete_episode_image_dirs(self, next_episode_index)
+    except Exception:
+        pass
+    try:
         self.episode_buffer = self.create_episode_buffer(episode_index=next_episode_index)
     except Exception:
         self.episode_buffer = self.create_episode_buffer(episode_index=next_episode_index)
@@ -666,6 +679,10 @@ def patched_save_episode(self, *args, **kwargs):
             _save_error.append(exc)
             print(f"[ASYNC-SAVE] ❌ Erro no save síncrono de fallback: {exc}", flush=True)
         finally:
+            try:
+                _delete_episode_image_dirs(_dataset_ref, ep_idx)
+            except Exception as exc:
+                print(f"[ASYNC-SAVE] ⚠️ Falha limpando imagens temporárias do ep {ep_idx}: {exc}", flush=True)
             _active_save_episode_index = None
             _save_thread_local.skip_wait = False
 
