@@ -190,6 +190,9 @@ def main():
     parser.add_argument("--denoising-steps", type=int, default=0,
                         help="Passos de denoising do flow-matching (latência). 0 = usa o default do "
                              "checkpoint (num_inference_steps=10). Menor = mais rápido, menos preciso.")
+    parser.add_argument("--hand-kp", type=float, default=0.0,
+                        help="Sobrescreve o kp da mão direita (default do robô = 0.8, fraco). "
+                             "Suba (ex: 2, 4) se a mão não fechar o grip. 0 = usa o default.")
     parser.add_argument("--control-mode", default="upper_body")
     parser.add_argument("--no-left-limp", action="store_true",
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
@@ -253,6 +256,9 @@ def main():
     logger.info("política pronta")
 
     robot_cfg = UnitreeG1Dex3Config(robot_ip=args.robot_ip, control_mode=args.control_mode, is_simulation=False)
+    if args.hand_kp > 0:
+        robot_cfg.hand_kp = args.hand_kp  # sobe o torque da mão (default 0.8 é fraco)
+        logger.info("hand_kp sobrescrito = %.2f (default era 0.8)", args.hand_kp)
     robot = UnitreeG1Dex3(robot_cfg)
     robot.connect()
     logger.info(f"robô conectado em {args.robot_ip}")
