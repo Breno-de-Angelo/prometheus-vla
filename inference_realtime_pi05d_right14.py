@@ -192,10 +192,15 @@ def main():
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
+    # force=True: alguns imports do lerobot já configuram o root logger, o que
+    # tornaria este basicConfig um no-op e suprimiria nossos logs INFO (chunks,
+    # ações do dry-run). force=True reconfigura e garante que apareçam.
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
     )
+    logging.getLogger("pi05d_right14").setLevel(getattr(logging, args.log_level.upper()))
 
     # Lado esquerdo mole ANTES do connect() — igual ao --left-arm-limp do record.
     if not args.no_left_limp:
