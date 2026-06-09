@@ -90,48 +90,82 @@ def _image_thread(host: str, port: int, stop: threading.Event, show_depth: bool,
     ctx = zmq.Context.instance()
     while not stop.is_set():
         sock = ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.CONFLATE, 1)
+        # CONFLATE só serve no modo rgb_bytes (mensagem de 1 parte). O stream
+        # completo :5555 é MULTIPART (zmq.compressed.v1) e CONFLATE quebra
+        # multipart no ZMQ — então lá usamos só RCVHWM=1 + drain manual p/ pegar
+        # sempre o frame mais recente sem entupir.
+        if rgb_bytes:
+            sock.setsockopt(zmq.CONFLATE, 1)
         sock.setsockopt(zmq.RCVHWM, 1)
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt_string(zmq.SUBSCRIBE, "")
         sock.setsockopt(zmq.RCVTIMEO, 1000)
         sock.connect(f"tcp://{host}:{port}")
-        logger.info("imagens: conectado a tcp://%s:%d (%s)", host, port, "rgb-bytes" if rgb_bytes else "json")
+        logger.info("imagens: conectado a tcp://%s:%d (%s)", host, port, "rgb-bytes" if rgb_bytes else "multipart/json")
         try:
             while not stop.is_set():
-                try:
-                    if rgb_bytes:
+                # --- modo rgb_bytes: JPEG cru, 1 parte (canal :5558 do VR) ---
+                if rgb_bytes:
+                    try:
                         jpg = sock.recv()
-                        out = {"rgb": "data:image/jpeg;base64," + base64.b64encode(jpg).decode("ascii")}
-                        with _LOCK:
-                            if not LATEST.get("img"):
-                                LATEST["img"] = {}
-                            LATEST["img"].update(out)
-                            LATEST["img_seq"] += 1
+                    except zmq.Again:
                         continue
-                    msg = sock.recv_string()
+                    except Exception:
+                        break
+                    out = {"rgb": "data:image/jpeg;base64," + base64.b64encode(jpg).decode("ascii")}
+                    with _LOCK:
+                        if not LATEST.get("img"):
+                            LATEST["img"] = {}
+                        LATEST["img"].update(out)
+                        LATEST["img_seq"] += 1
+                    continue
+
+                # --- modo completo :5555: recv_multipart + drain p/ frame mais recente ---
+                try:
+                    parts = sock.recv_multipart()
+                    while True:  # descarta frames acumulados, fica só com o último
+                        try:
+                            parts = sock.recv_multipart(flags=zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
                 except zmq.Again:
                     continue
                 except Exception:
                     break
+
                 try:
-                    data = json.loads(msg)
+                    data = json.loads(parts[0])
                 except Exception:
                     continue
                 images = data.get("images", data)
-                rgb_b64 = images.get("head_camera")
-                depth_b64 = images.get("head_camera_depth")
+                protocol = data.get("protocol")
+                rgb_info = images.get("head_camera")
+                depth_info = images.get("head_camera_depth")
                 out = {}
-                if isinstance(rgb_b64, str):
-                    # RGB ja chega como JPEG/base64 do publisher; o OmniView e apenas
-                    # visualizacao, entao nao decodifica/re-encoda o mesmo frame.
-                    out["rgb"] = "data:image/jpeg;base64," + rgb_b64
-                if show_depth and isinstance(depth_b64, str):
-                    depth = cv2.imdecode(np.frombuffer(base64.b64decode(depth_b64), np.uint8), cv2.IMREAD_UNCHANGED)
+
+                # RGB — multipart (dict c/ índice 'part', bytes JPEG crus) ou legado (base64 str)
+                if isinstance(rgb_info, dict) and protocol == "zmq.compressed.v1":
+                    idx = rgb_info.get("part")
+                    if idx is not None and idx < len(parts):
+                        out["rgb"] = "data:image/jpeg;base64," + base64.b64encode(parts[idx]).decode("ascii")
+                elif isinstance(rgb_info, str):
+                    # legado: RGB já chega como JPEG/base64; OmniView é só viz, não re-encoda.
+                    out["rgb"] = "data:image/jpeg;base64," + rgb_info
+
+                # Depth — multipart (PNG uint16 crus) ou legado (base64 str)
+                if show_depth:
+                    depth = None
+                    if isinstance(depth_info, dict) and protocol == "zmq.compressed.v1":
+                        idx = depth_info.get("part")
+                        if idx is not None and idx < len(parts):
+                            depth = cv2.imdecode(np.frombuffer(parts[idx], np.uint8), cv2.IMREAD_UNCHANGED)
+                    elif isinstance(depth_info, str):
+                        depth = cv2.imdecode(np.frombuffer(base64.b64decode(depth_info), np.uint8), cv2.IMREAD_UNCHANGED)
                     if depth is not None:
                         url, meta = _colorize_depth(depth)
                         out["depth"] = url
                         out["depthMeta"] = meta
+
                 if out:
                     with _LOCK:
                         if not LATEST.get("img"):
