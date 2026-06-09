@@ -182,8 +182,14 @@ def main():
     parser.add_argument("--actions-per-chunk", type=int, default=50,
                         help="Quantas ações executar de cada chunk previsto (chunk de treino=50; <=50 seguro).")
     parser.add_argument("--max-delta", type=float, default=0.02,
-                        help="MOVIMENTO LENTO/SEGURO: passo máx (rad) que cada junta pode andar por ciclo. "
+                        help="MOVIMENTO LENTO/SEGURO do BRAÇO: passo máx (rad/ciclo) das 7 juntas do braço. "
                              "Parte da posição medida e rampa devagar até o alvo. 0 = desliga (vai direto).")
+    parser.add_argument("--hand-max-delta", type=float, default=0.10,
+                        help="Passo máx (rad/ciclo) das 7 juntas da MÃO. Maior que o do braço pra fechar o "
+                             "grip a tempo (dedos são seguros). 0 = sem clamp na mão (fecha direto).")
+    parser.add_argument("--denoising-steps", type=int, default=0,
+                        help="Passos de denoising do flow-matching (latência). 0 = usa o default do "
+                             "checkpoint (num_inference_steps=10). Menor = mais rápido, menos preciso.")
     parser.add_argument("--control-mode", default="upper_body")
     parser.add_argument("--no-left-limp", action="store_true",
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
@@ -213,6 +219,16 @@ def main():
     logger.info("carregando política pi05 right14...")
     policy = PI05Policy.from_pretrained(args.checkpoint, strict=False)
     policy.to(device).eval()
+
+    # Latência: desliga gradient checkpointing (otimização de TREINO, inútil em eval)
+    # e, se pedido, reduz os passos de denoising do flow-matching.
+    try:
+        policy.config.gradient_checkpointing = False
+    except Exception:
+        pass
+    if args.denoising_steps > 0:
+        policy.config.num_inference_steps = args.denoising_steps
+        logger.info("denoising steps = %d (default do checkpoint era 10)", args.denoising_steps)
 
     inputs = _policy_inputs(policy)
     wants_depth = "observation.images.head_camera_depth" in inputs
@@ -261,19 +277,22 @@ def main():
     last_cmd = {n: float(obs0.get(n, 0.0)) for n in RIGHT14_FEATURES}
 
     def _clamp_slow(target: dict) -> dict:
-        if args.max_delta <= 0:
-            return dict(target)
+        # Clamp por GRUPO: braço (lento/seguro) vs mão (mais rápido, pra fechar o grip).
         out = {}
         for k, v in target.items():
+            md = args.hand_max_delta if "hand" in k else args.max_delta
             prev = last_cmd.get(k, v)
-            step = max(-args.max_delta, min(args.max_delta, v - prev))
-            out[k] = prev + step
+            if md <= 0:
+                out[k] = v  # sem clamp -> vai direto pro alvo
+            else:
+                step = max(-md, min(md, v - prev))
+                out[k] = prev + step
         return out
 
     if args.dry_run:
         logger.info("=== DRY-RUN: nenhuma ação será enviada ao robô ===")
-    logger.info("movimento: max_delta=%.3f rad/ciclo @ %.0f fps%s",
-                args.max_delta, args.fps, " (clamp DESLIGADO)" if args.max_delta <= 0 else "")
+    logger.info("movimento: braço max_delta=%.3f | mão max_delta=%.3f rad/ciclo @ %.0f fps",
+                args.max_delta, args.hand_max_delta, args.fps)
 
     try:
         while not killer.kill:
@@ -297,11 +316,15 @@ def main():
                 target = action_tensor_to_robot_action(action_out)
                 act_dict = _clamp_slow(target)           # rampa devagar até o alvo
                 last_cmd = dict(act_dict)                 # próximo passo parte daqui
-                if args.dry_run:
-                    if i == 0:
-                        pretty = {k: round(v, 3) for k, v in act_dict.items()}
-                        logger.info("dry-run 1ª ação do chunk (já com clamp, 14 juntas direita):\n  %s", pretty)
-                else:
+                if i == 0:
+                    # loga a 1ª ação de cada chunk — no dry-run E no live (pra você
+                    # ver no terminal o que o robô recebe enquanto se move).
+                    arm = {k: round(v, 3) for k, v in act_dict.items() if "hand" not in k}
+                    hand = {k: round(v, 3) for k, v in act_dict.items() if "hand" in k}
+                    tag = "dry-run" if args.dry_run else "LIVE"
+                    logger.info("%s chunk %d 1ª ação (clamp):\n  braço: %s\n  mão:   %s",
+                                tag, chunk_counter, arm, hand)
+                if not args.dry_run:
                     robot.send_action(act_dict)
                 sleep_for = step_period - (time.perf_counter() - loop_start)
                 if sleep_for > 0:
