@@ -47,7 +47,8 @@ import cv2
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT / "lerobot-ext"))
 
-from train.inference_pi05_d import load_pi05_d  # noqa: E402
+import safetensors.torch as _st  # noqa: E402
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy  # noqa: E402
 from lerobot.cameras.zmq.camera_zmq import ZMQCamera  # noqa: E402
 from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: E402
 from lerobot.policies.factory import make_pre_post_processors  # noqa: E402
@@ -174,10 +175,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="diretório pretrained_model do checkpoint right14")
     parser.add_argument("--robot-ip", default="10.9.8.73")
-    parser.add_argument("--task", default="Pick up the cup")
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--task", default="Pick up the white cup",
+                        help="DEVE bater com o task do treino (dataset right14: 'Pick up the white cup').")
+    parser.add_argument("--fps", type=float, default=30.0,
+                        help="Cadência do envio de ações. Baixe (ex: 10) pra mover mais devagar.")
     parser.add_argument("--actions-per-chunk", type=int, default=50,
                         help="Quantas ações executar de cada chunk previsto (chunk de treino=50; <=50 seguro).")
+    parser.add_argument("--max-delta", type=float, default=0.02,
+                        help="MOVIMENTO LENTO/SEGURO: passo máx (rad) que cada junta pode andar por ciclo. "
+                             "Parte da posição medida e rampa devagar até o alvo. 0 = desliga (vai direto).")
     parser.add_argument("--control-mode", default="upper_body")
     parser.add_argument("--no-left-limp", action="store_true",
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
@@ -200,13 +206,28 @@ def main():
     logger.info(f"device={device}")
 
     logger.info("carregando política pi05 right14...")
-    policy = load_pi05_d(args.checkpoint, device)
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy.config, pretrained_path=args.checkpoint
-    )
+    policy = PI05Policy.from_pretrained(args.checkpoint, strict=False)
+    policy.to(device).eval()
+
     inputs = _policy_inputs(policy)
     wants_depth = "observation.images.head_camera_depth" in inputs
     wants_pressure = any("pressure" in k for k in inputs)
+
+    # Injeção PI05-D (PointNet depth + tátil) SÓ se o checkpoint usa esses tokens.
+    # O modelo RGB puro NÃO tem esses tensores -> injetar ativaria tokens que ele
+    # nunca treinou (o bug do "missing=15" no load_pi05_d, que injeta sempre).
+    if wants_depth or wants_pressure:
+        from train.pi05_d_injector import inject_pi05_d
+        inject_pi05_d(policy, device=device)
+        sd = _st.load_file(str(Path(args.checkpoint) / "model.safetensors"), device=str(device))
+        policy.load_state_dict(sd, strict=False)
+        logger.info("injeção PI05-D aplicada (depth/tátil)")
+    else:
+        logger.info("modelo RGB puro — SEM injeção depth/tátil")
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy.config, pretrained_path=args.checkpoint
+    )
     logger.info("checkpoint espera depth=%s tátil=%s (inputs=%s)", wants_depth, wants_pressure, sorted(inputs))
     logger.info("política pronta")
 
@@ -228,8 +249,26 @@ def main():
     step_period = 1.0 / args.fps
     chunk_counter = 0
 
+    # MOVIMENTO LENTO: seed do clamp com a posição MEDIDA atual da direita, pra
+    # o 1º comando não saltar da pose atual pro alvo do modelo. A cada ciclo, cada
+    # junta anda no máximo args.max_delta rad em direção ao alvo -> rampa devagar.
+    obs0 = robot.get_observation()
+    last_cmd = {n: float(obs0.get(n, 0.0)) for n in RIGHT14_FEATURES}
+
+    def _clamp_slow(target: dict) -> dict:
+        if args.max_delta <= 0:
+            return dict(target)
+        out = {}
+        for k, v in target.items():
+            prev = last_cmd.get(k, v)
+            step = max(-args.max_delta, min(args.max_delta, v - prev))
+            out[k] = prev + step
+        return out
+
     if args.dry_run:
         logger.info("=== DRY-RUN: nenhuma ação será enviada ao robô ===")
+    logger.info("movimento: max_delta=%.3f rad/ciclo @ %.0f fps%s",
+                args.max_delta, args.fps, " (clamp DESLIGADO)" if args.max_delta <= 0 else "")
 
     try:
         while not killer.kill:
@@ -250,11 +289,13 @@ def main():
                 loop_start = time.perf_counter()
                 action_norm = action_chunk[:, i, :]
                 action_out = postprocessor(action_norm).squeeze(0)
-                act_dict = action_tensor_to_robot_action(action_out)
+                target = action_tensor_to_robot_action(action_out)
+                act_dict = _clamp_slow(target)           # rampa devagar até o alvo
+                last_cmd = dict(act_dict)                 # próximo passo parte daqui
                 if args.dry_run:
                     if i == 0:
                         pretty = {k: round(v, 3) for k, v in act_dict.items()}
-                        logger.info("dry-run 1ª ação do chunk (14 juntas direita):\n  %s", pretty)
+                        logger.info("dry-run 1ª ação do chunk (já com clamp, 14 juntas direita):\n  %s", pretty)
                 else:
                     robot.send_action(act_dict)
                 sleep_for = step_period - (time.perf_counter() - loop_start)
