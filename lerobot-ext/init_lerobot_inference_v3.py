@@ -272,6 +272,7 @@ def main():
     show_video = False
     uncertainty_threshold = 0.0
     remote_sim_ip = None
+    fps = 30
 
     for arg in sys.argv[1:]:
         if arg.startswith("--checkpoint="):
@@ -293,6 +294,8 @@ def main():
             print("[INFO]: Visualização de câmera ativada (--v)")
         elif arg.startswith("--remote-sim="):
             remote_sim_ip = arg.split("=", 1)[1]
+        elif arg.startswith("--fps="):
+            fps = int(arg.split("=", 1)[1])
 
     if checkpoint_dir is None:
         print("❌ ERRO: --checkpoint obrigatório.")
@@ -366,6 +369,7 @@ def main():
     print(f"\n🚀 INFERÊNCIA ATIVA [{policy_type.upper()}] — O robô vai se mover!")
     if show_video:
         print("   📺 Janela de câmera ativa.")
+    print(f"   ⏱️  FPS: {fps} ({1000/fps:.1f}ms por ciclo)")
     print("   Ctrl+C para parar.\n")
 
     # ─────────────────────────────────────────────────────────────────
@@ -451,11 +455,11 @@ def main():
             action_dict = {name: float(action_numpy[i]) for i, name in enumerate(joint_names)}
             robot.send_action(action_dict)
 
-            # 11. ~50 Hz
+            # 11. Limita ao fps configurado (padrão: 30Hz)
             elapsed = time.perf_counter() - start_t
-            sleep_time = max(0.0, 0.02 - elapsed)
-            if debug_mode and elapsed > 0.02:
-                print(f"\n⚠️  Loop lento: {elapsed*1000:.1f}ms (limite: 20ms)")
+            sleep_time = max(0.0, (1.0 / fps) - elapsed)
+            if debug_mode and elapsed > (1.0 / fps):
+                print(f"\n⚠️  Loop lento: {elapsed*1000:.1f}ms (limite: {1000/fps:.1f}ms)")
             time.sleep(sleep_time)
 
     except KeyboardInterrupt:

@@ -49,24 +49,37 @@ Opções:
                          PointNet — vista Top-Down (XZ) + lateral (YZ)
                          lado a lado. Requer use_depth_3d=True ou --fake-depth.
                          [Q/ESC] na janela para fechar.
+  --fps=<INT>            Hz do loop de controle (padrão: 30).
+                         Igual ao parâmetro fps do LeRobot: define environment_dt = 1/fps
+                         e insere um time.sleep() no final de cada ciclo para manter
+                         a cadência exata. Use o valor medido no log "Loop dt médio".
   --debug                Loga ações e tempos no terminal em tempo real
+  --log                  Ativa gravação do log em arquivo .txt.
+                         Sem esta flag nenhum arquivo é criado.
+  --log-path=<DIR>       Pasta onde o log será salvo (criada automaticamente se não existir).
+                         Padrão quando omitido: ./logs/
+                         O arquivo gerado será: <DIR>/log_<YYYYMMDD_HHMMSS>.txt
+                         O log contém duas seções por separador "---":
+                           EXECUTED  step | timestamp | <joint_values...>  (ação real executada)
+                           NETWORK   chunk_id | step_in_chunk | obs_step | <joint_values...>  (bruto da rede)
+                         Use plot_log.py para gerar gráficos e playback_log.py para reprodução.
   -h, --help             Mostra esta mensagem
 
 Exemplos:
   # PI05-Depth (inferência ~1600ms, loop ~33ms → chunk=60, lead=50):
   python init_lerobot_inference_async.py \
       --checkpoint=train_output/pi05/best_val_checkpoint/pretrained_model \
-      --chunk=60 --lead=50 --debug
+      --chunk=60 --lead=50 --fps=30 --debug
 
   # ACT-Depth mais rápido (inferência ~200ms, loop ~33ms → chunk=10, lead=8):
   python init_lerobot_inference_async.py \
       --checkpoint=train_output/pick_up_the_cup_nodepth/best_val_checkpoint/pretrained_model \
-      --chunk=10 --lead=8
+      --chunk=10 --lead=8 --fps=30
 
   # Com câmera ZMQ e visualização:
   python init_lerobot_inference_async.py \
       --checkpoint=train_output/pi05/best_val_checkpoint/pretrained_model \
-      --cam-robot=192.168.123.164 --v --chunk=60 --lead=50
+      --cam-robot=192.168.123.164 --v --chunk=60 --lead=50 --fps=30
 
   # ACT-D com vídeo fake RGB + depth sincronizado do dataset:
   python init_lerobot_inference_async.py \
@@ -82,6 +95,7 @@ import time
 import threading
 import multiprocessing as mp
 from queue import Queue, Empty, Full
+from datetime import datetime
 
 import torch
 import cv2
@@ -1307,6 +1321,7 @@ def inference_worker(
     actions_per_chunk: int,
     debug: bool,
     attn_window=None,        # AttnMapWindow ou None
+    network_log_queue=None,  # Queue para enviar chunks brutos ao log (None = sem log)
 ):
     """
     Roda em thread separada.
@@ -1319,7 +1334,12 @@ def inference_worker(
 
     while not stop_event.is_set():
         try:
-            obs = obs_queue.get(timeout=0.5)
+            # Recebe a observação E o passo em que foi capturada
+            queue_item = obs_queue.get(timeout=0.5)
+            if isinstance(queue_item, tuple):
+                obs, obs_step = queue_item
+            else:
+                obs, obs_step = queue_item, 0
         except Empty:
             continue
 
@@ -1388,6 +1408,13 @@ def inference_worker(
             if attn_window is not None:
                 policy._last_action_chunk_np = chunk_np   # sem torch, só numpy
 
+            # 3b2. Envia chunk bruto da rede para o log writer
+            if network_log_queue is not None:
+                try:
+                    network_log_queue.put_nowait((chunk_np, obs_step))
+                except Full:
+                    pass  # descarta se o writer estiver lento
+
             # 3c. Atualiza o attention map (não bloqueia — tem lock interno)
             if attn_window is not None and _last_rgb is not None:
                 attn_window.update(policy, _last_rgb)
@@ -1398,25 +1425,16 @@ def inference_worker(
                 has_attn = getattr(policy, "last_attn_weights", None) is not None
                 print(f"\n🧠 [inference] {t_inf_ms:.1f}ms | chunk={len(chunk_np)} ações | attn={'✓' if has_attn else '✗'}")
 
-                # debug temporário — imprime primeiro frame do chunk
-            if debug:
-                arr = np.array(chunk_np)   # converte lista para array aqui
-                print(f"\n[DEBUG] chunk shape={arr.shape} "
-                    f"min={arr.min():.4f} max={arr.max():.4f} "
-                    f"mean={arr.mean():.4f}")
-                print(f"[DEBUG] frame 0 bracos: {arr[0, :14].round(3).tolist()}")
-                print(f"[DEBUG] frame 0 maos:   {arr[0, 14:].round(3).tolist()}")
-
             # 4. Envia chunk para o loop de controle
             #    Se a fila estiver cheia, descarta o chunk antigo e insere o novo
             try:
-                action_queue.put_nowait(chunk_np)
+                action_queue.put_nowait((chunk_np, obs_step))
             except Full:
                 try:
                     action_queue.get_nowait()
                 except Empty:
                     pass
-                action_queue.put_nowait(chunk_np)
+                action_queue.put_nowait((chunk_np, obs_step))
 
         except Exception as e:
             import traceback
@@ -1449,6 +1467,11 @@ def main():
     remote_sim_ip = None
     actions_per_chunk = 60
     lead_actions = 50
+    slow_video_factor = 1.0
+    log_enabled = False
+    log_path = None
+    #Limite de diferença permitida (Você pode precisar ajustar isso testando)
+    limite_de_mudanca = 0.8
 
     for arg in sys.argv[1:]:
         if arg.startswith("--checkpoint="):
@@ -1471,6 +1494,11 @@ def main():
             lead_actions = int(arg.split("=", 1)[1])
         elif arg == "--debug":
             debug_mode = True
+        elif arg == "--log":
+            log_enabled = True
+        elif arg.startswith("--log-path="):
+            log_path = arg.split("=", 1)[1]
+            log_enabled = True  # --log-path implica --log
         elif arg == "--v":
             show_video = True
         elif arg == "--v-control":
@@ -1483,6 +1511,15 @@ def main():
             show_depth = True
         elif arg.startswith("--remote-sim="):
             remote_sim_ip = arg.split("=", 1)[1]
+        elif arg.startswith("--inconsistency="):
+            limite_de_mudanca = float(arg.split("=", 1)[1])
+        elif arg.startswith("--slow-video="):
+            # Velocidade do vídeo fake: 1.0=normal, 0.5=metade, 0.25=1/4
+            # Útil para debug: o modelo prediz chunks condicionados no
+            # vídeo atual — com slow motion o braço tem mais tempo para
+            # chegar na xícara antes de um novo chunk ser solicitado.
+            slow_video_factor = float(arg.split("=", 1)[1])
+            slow_video_factor = max(0.05, min(1.0, slow_video_factor))
 
     lead_actions = min(lead_actions, actions_per_chunk)
 
@@ -1590,6 +1627,45 @@ def main():
         dw = PointCloudWindow(intrinsics=pc_intrinsics)
         dw.create()
 
+    # ── Configuração do log em TXT ─────────────────────────────────────
+    # Só cria arquivos se --log ou --log-path foi passado.
+    # Formato TXT tem dois blocos no mesmo arquivo:
+    #   EXECUTED  step | timestamp | joint0 | ...   (ação final executada)
+    #   NETWORK   chunk_id | step_in_chunk | obs_step | joint0 | ...  (bruto da rede)
+    arquivo_log = None
+    network_log_queue = None
+    nome_arquivo_log = None
+
+    if log_enabled:
+        pasta_log = log_path if log_path else "logs"
+        os.makedirs(pasta_log, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        nome_arquivo_log = os.path.join(pasta_log, f"log_{ts}.txt")
+
+        arquivo_log = open(nome_arquivo_log, mode='w', encoding='utf-8')
+
+        # ── Cabeçalho do arquivo ──────────────────────────────────────
+        arquivo_log.write("# LeRobot Inference Log\n")
+        arquivo_log.write(f"# Data: {datetime.now().isoformat()}\n")
+        arquivo_log.write(f"# Política: {policy_type}\n")
+        arquivo_log.write(f"# chunk={actions_per_chunk} | lead={lead_actions}\n")
+        arquivo_log.write(f"# Juntas: {' | '.join(joint_names)}\n")
+        arquivo_log.write("#\n")
+        arquivo_log.write("# SEÇÃO EXECUTED — ação ponderada final enviada ao robô\n")
+        arquivo_log.write("# Colunas: EXECUTED | step | timestamp | " + " | ".join(joint_names) + "\n")
+        arquivo_log.write("# SEÇÃO NETWORK  — chunks brutos gerados pela rede (antes do ensembling)\n")
+        arquivo_log.write("# Colunas: NETWORK  | chunk_id | step_in_chunk | obs_step | " + " | ".join(joint_names) + "\n")
+        arquivo_log.write("#\n")
+        arquivo_log.write("---BEGIN---\n")
+        arquivo_log.flush()
+
+        # Fila para receber chunks crus da thread de inferência
+        network_log_queue = Queue(maxsize=64)
+
+        print(f"📝 Log ativo → {nome_arquivo_log}")
+    else:
+        print("📝 Log desativado (passe --log ou --log-path=<DIR> para ativar)")
+
     # ── Filas entre threads ───────────────────────────────────────────
     obs_queue    = Queue(maxsize=1)   # sempre a obs mais recente
     action_queue = Queue(maxsize=2)   # no máximo 2 chunks em fila
@@ -1614,6 +1690,7 @@ def main():
             actions_per_chunk=actions_per_chunk,
             debug=debug_mode,
             attn_window=aw,          # None se --v-attn não foi passado
+            network_log_queue=network_log_queue,  # None se --log não foi passado
         ),
         daemon=True,
         name="inference_worker",
@@ -1646,8 +1723,27 @@ def main():
     current_chunk: list = []
     vc_last_rgb = None   # último frame RGB válido para o modo pause
 
+    # NOVAS VARIÁVEIS PARA COMPENSAÇÃO DE TEMPO E ENSEMBLING
+    active_chunks = []
+    current_step = 0
+    waiting_for_inference = False
+    _chunk_id_counter = 0  # ID único de cada chunk gerado pela rede
+
     _diag_loops = 0
     _diag_elapsed_sum = 0.0
+
+    # ── Slow-motion: acumulador fracionário de frames ─────────────────
+    # A cada ciclo acumula slow_video_factor. Quando >= 1.0, lê frame
+    # real e reseta. Caso contrário, repete o último frame lido.
+    # Efeito: o modelo vê o mesmo frame por múltiplos ciclos, dando
+    # tempo ao braço de executar os frames do chunk antes de receber
+    # um chunk novo condicionado numa cena diferente.
+    _sv_counter      = 0.0
+    _sv_freeze_rgb   = None
+    _sv_freeze_depth = None
+    if slow_video_factor < 1.0 and (fake_cap is not None):
+        print(f"   🐌 Slow-motion ativo: {slow_video_factor}x "
+              f"(repete frame a cada {round(1/slow_video_factor)} ciclos)")
 
     # ─────────────────────────────────────────────────────────────────
     # LOOP PRINCIPAL
@@ -1700,11 +1796,30 @@ def main():
 
             # 2. Câmeras externas
             if obs_valid and obs is not None:
-                obs, fake_img_rgb = get_camera_frames(
-                    obs, stream_client, fake_cap, fake_img_rgb,
-                    fake_depth_cap=fake_depth_cap,
-                    fake_depth_img=fake_depth_img,
-                )
+                if slow_video_factor < 1.0 and fake_cap is not None:
+                    # Slow-motion: só avança o vídeo quando acumulador >= 1.0
+                    _sv_counter += slow_video_factor
+                    if _sv_counter >= 1.0:
+                        _sv_counter -= 1.0
+                        obs, fake_img_rgb = get_camera_frames(
+                            obs, stream_client, fake_cap, fake_img_rgb,
+                            fake_depth_cap=fake_depth_cap,
+                            fake_depth_img=fake_depth_img,
+                        )
+                        _sv_freeze_rgb   = obs.get("head_camera")
+                        _sv_freeze_depth = obs.get("head_camera_depth")
+                    else:
+                        # Repete o último frame sem avançar o vídeo
+                        if _sv_freeze_rgb is not None:
+                            obs["head_camera"] = _sv_freeze_rgb
+                        if _sv_freeze_depth is not None:
+                            obs["head_camera_depth"] = _sv_freeze_depth
+                else:
+                    obs, fake_img_rgb = get_camera_frames(
+                        obs, stream_client, fake_cap, fake_img_rgb,
+                        fake_depth_cap=fake_depth_cap,
+                        fake_depth_img=fake_depth_img,
+                    )
 
             # 3. Visualização + aplicação de contraste/brilho à observação
             if obs_valid and obs is not None and show_video:
@@ -1744,39 +1859,95 @@ def main():
                 if not alive:
                     raise KeyboardInterrupt
 
-            # 4. Alimenta a fila de inferência quando o buffer estiver baixo
-            if obs_valid and len(current_chunk) <= lead_actions:
-                try:
-                    obs_queue.put_nowait(obs)
-                except Full:
-                    try:
-                        obs_queue.get_nowait()
-                    except Empty:
-                        pass
-                    obs_queue.put_nowait(obs)
+            # Calcula quantas ações restam no chunk MAIS RECENTE
+            actions_left = 0
+            if active_chunks:
+                newest_chunk = active_chunks[-1]
+                actions_left = (newest_chunk["start_step"] + len(newest_chunk["chunk"])) - current_step
 
-            # 5. Pega chunk novo — SUBSTITUI o buffer atual
-            #    (não concatena: ações velhas na frente causam movimentos de recuo)
+            # 4. Alimenta a fila de inferência
+            if obs_valid and (actions_left <= lead_actions) and not waiting_for_inference:
+                try:
+                    obs_queue.put_nowait((obs, current_step))
+                    waiting_for_inference = True
+                except Full:
+                    try: obs_queue.get_nowait()
+                    except Empty: pass
+                    obs_queue.put_nowait((obs, current_step))
+                    waiting_for_inference = True
+
+            # 5. Recebe novo chunk PURO e adiciona à lista
             if not action_queue.empty():
                 try:
-                    new_chunk = action_queue.get_nowait()
-                    current_chunk = new_chunk  # substitui, não concatena
+                    new_chunk, obs_step = action_queue.get_nowait()
+                    waiting_for_inference = False
+                    # Guarda o chunk original intacto
+                    active_chunks.append({
+                        "start_step": obs_step,
+                        "chunk": new_chunk
+                    })
                 except Empty:
                     pass
+                except ValueError:
+                    pass
 
-            # 6. Executa próxima ação
-            if current_chunk:
-                action_numpy = current_chunk.pop(0)
+            # Limpa da memória os chunks que já ficaram totalmente no passado
+            active_chunks = [c for c in active_chunks if (c["start_step"] + len(c["chunk"])) > current_step]
 
-                if debug_mode:
-                    arm = " | ".join([f"{v:.3f}" for v in action_numpy[:7]])
-                    print(f"\r🤖 [{policy_type}] E: [{arm}] buf={len(current_chunk)}", end="", flush=True)
+            # 6. ENSEMBLING OFICIAL DO ACT (ALOHA)
+            if active_chunks:
+                actions_for_now = []
+                
+                # Pergunta a CADA chunk empilhado: "O que você previu para o exato momento atual?"
+                for c in active_chunks:
+                    idx = current_step - c["start_step"]
+                    if 0 <= idx < len(c["chunk"]):
+                        actions_for_now.append(c["chunk"][idx])
+                        
+                if actions_for_now:
+                    # Aplica a matemática oficial de Stanford (k=0.01)
+                    # O chunk MAIS VELHO recebe o MAIOR peso. O mais NOVO recebe o MENOR peso.
+                    # Isso cria a inércia que impede o robô de dar trancos para trás.
+                    k = 0.01
+                    exp_weights = np.exp(-k * np.arange(len(actions_for_now)))
+                    exp_weights = exp_weights / exp_weights.sum()
+                    
+                    actions_np = np.array(actions_for_now)
+                    # Calcula a ação média diluída entre todas as previsões da história recente
+                    action_numpy = np.sum(actions_np * exp_weights[:, None], axis=0)
+                    
+                    current_step += 1
 
-                action_dict = {name: float(action_numpy[i]) for i, name in enumerate(joint_names)}
-                robot.send_action(action_dict)
+                    # Grava a ação EXECUTADA no log TXT
+                    if arquivo_log is not None:
+                        vals = "\t".join(f"{v:.6f}" for v in action_numpy.tolist())
+                        arquivo_log.write(
+                            f"EXECUTED\t{current_step}\t{time.time():.6f}\t{vals}\n"
+                        )
+                        # Drena chunks brutos da rede e grava como NETWORK
+                        if network_log_queue is not None:
+                            while True:
+                                try:
+                                    raw_chunk, obs_step_net = network_log_queue.get_nowait()
+                                    _chunk_id_counter += 1
+                                    for si, action_row in enumerate(raw_chunk):
+                                        rvals = "\t".join(f"{v:.6f}" for v in action_row.tolist())
+                                        arquivo_log.write(
+                                            f"NETWORK\t{_chunk_id_counter}\t{si}\t{obs_step_net}\t{rvals}\n"
+                                        )
+                                except Empty:
+                                    break
+
+                    if debug_mode:
+                        arm = " | ".join([f"{v:.3f}" for v in action_numpy[:7]])
+                        # Agora ele mostra quantos planos estão empilhados ajudando na média
+                        print(f"\r🤖 [{policy_type}] E: [{arm}] planos_ativos={len(active_chunks)}", end="", flush=True)
+
+                    action_dict = {name: float(action_numpy[i]) for i, name in enumerate(joint_names)}
+                    robot.send_action(action_dict)
             else:
                 if debug_mode:
-                    print("\r⏳ Aguardando 1º chunk de inferência...", end="", flush=True)
+                    print("\r⏳ Aguardando inferência...", end="", flush=True)
 
             # 7. Diagnóstico periódico do dt do loop
             elapsed = time.perf_counter() - start_t
@@ -1786,7 +1957,7 @@ def main():
                 avg_dt_ms = (_diag_elapsed_sum / _diag_loops) * 1000
                 if debug_mode:
                     print(f"\n📊 Loop dt médio (100 ciclos): {avg_dt_ms:.1f}ms  ({1000/avg_dt_ms:.1f} Hz)")
-                    print(f"   Sugestão: --chunk >= {int(1600/avg_dt_ms)+5}  --lead >= {int(1600/avg_dt_ms)}")
+                    print(f"   Sugestão: --chunk >= {int(avg_dt_ms * 3 + 5):.0f}  --lead >= {int(avg_dt_ms * 3):.0f}")
                 _diag_loops = 0
                 _diag_elapsed_sum = 0.0
 
@@ -1803,6 +1974,25 @@ def main():
     finally:
         stop_event.set()
         inf_thread.join(timeout=3.0)
+
+        # Salva e fecha o arquivo de log TXT com segurança
+        if arquivo_log is not None and not arquivo_log.closed:
+            # Drena qualquer chunk que ainda não foi gravado
+            if network_log_queue is not None:
+                while True:
+                    try:
+                        raw_chunk, obs_step_net = network_log_queue.get_nowait()
+                        _chunk_id_counter += 1
+                        for si, action_row in enumerate(raw_chunk):
+                            rvals = "\t".join(f"{v:.6f}" for v in action_row.tolist())
+                            arquivo_log.write(
+                                f"NETWORK\t{_chunk_id_counter}\t{si}\t{obs_step_net}\t{rvals}\n"
+                            )
+                    except Empty:
+                        break
+            arquivo_log.write("---END---\n")
+            arquivo_log.close()
+            print(f"\n💾 Log salvo em: {nome_arquivo_log}")
 
         if fake_cap is not None:
             fake_cap.release()

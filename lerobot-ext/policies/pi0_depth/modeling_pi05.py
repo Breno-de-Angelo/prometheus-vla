@@ -856,6 +856,26 @@ class PI05DEPTHPolicy(PreTrainedPolicy):
                     img = img.to(device)
                 if img.dtype != torch.float32:
                     img = img.to(torch.float32)
+
+                # ── Reverte normalização ImageNet do factory.py ──────────────
+                # O factory.py (linha 128) sobrescreve as stats de TODAS as
+                # camera_keys com ImageNet quando use_imagenet_stats=True.
+                # O NormalizerProcessorStep usa essas stats e normaliza o depth,
+                # produzindo valores negativos que destroem a projeção 3D.
+                # Detecção automática: min() < -0.1 → foi normalizado → revertemos.
+                # Treino: chega normalizado (negativo) → revertemos para [0,1].
+                # Inferência: chega cru de [0,1] → bloco não executa.
+                if img.min() < -0.1:
+                    _mean = torch.tensor(
+                        [0.485, 0.456, 0.406],
+                        device=img.device, dtype=img.dtype
+                    ).view(1, 3, 1, 1)
+                    _std = torch.tensor(
+                        [0.229, 0.224, 0.225],
+                        device=img.device, dtype=img.dtype
+                    ).view(1, 3, 1, 1)
+                    img = (img * _std + _mean).clamp(0.0, 1.0)
+
                 depth_images.append(img)
                 continue  # Não passa pelo SigLIP
 
