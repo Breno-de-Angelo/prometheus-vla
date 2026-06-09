@@ -1,0 +1,138 @@
+# ==========================================================
+# PI05 BASE — Treino braço+mão DIREITA (14 dims)
+# Dataset: G1_Dex3_right14_dataset  (pré-processado por
+#          lerobot-ext/tools/slice_right_arm_only.py)
+#
+# Para usar com novos episódios gravados, rode primeiro:
+#   python lerobot-ext/tools/slice_right_arm_only.py \
+#       datasets/G1_Dex3_depth_tactil_dataset/<timestamp>
+# Isso cria datasets/G1_Dex3_right14_dataset/<timestamp>.
+# Atualize dataset.root e os campos `episodes` abaixo.
+# ==========================================================
+
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
+# ==========================================================
+dataset:
+  repo_id: lewislf/G1_Dex3_right14_dataset
+  root: lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432
+
+  image_transforms:
+    enable: true
+    max_num_transforms: 2   # aplica até 2 de 3 transforms por step (sorteado)
+    random_order: false
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+      RandomResizedCrop:
+        type: RandomResizedCrop
+        weight: 1.0
+        kwargs:
+          size: [480, 848]      # mantém resolução original; pi05 redimensiona para 224x224
+          scale: [0.75, 1.0]   # corta entre 75% e 100% da área
+          ratio: [0.9, 1.1]    # aspect ratio próximo do original
+          antialias: true
+      RandomErasing:
+        type: RandomErasing
+        weight: 0.5             # metade do peso dos outros — augmentação mais agressiva
+        kwargs:
+          p: 1.0                # sempre aplica quando sorteado (controle de frequência pelo weight)
+          scale: [0.02, 0.10]  # apaga 2–10% da área da imagem
+          ratio: [0.3, 3.3]
+          value: 0              # preenche com preto
+
+  # Com 15 episódios: 12 treino / 3 validação.
+  # Quando tiver 300+ eps, ajuste esta lista mantendo ~10-15% held-out.
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO
+# ==========================================================
+val_dataset:
+  repo_id: lewislf/G1_Dex3_right14_dataset
+  root: lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432
+  episodes: [12, 13, 14]
+
+
+# ==========================================================
+# 3. POLICY — PI05 BASE
+# ==========================================================
+policy:
+  type: pi05
+  repo_id: lewislf/G1_Dex3_right14_pi05_lf
+  push_to_hub: false
+
+  pretrained_path: lerobot/pi05_base   # hf download lerobot/pi05_base --local-dir ~/pi05_base_weights; ajuste para o path local na Atena
+
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  image_resolution: [224, 224]
+
+  # pi05 padeia internamente para max_*_dim=32 — manter 32 mesmo com 14 dims
+  max_state_dim: 32
+  max_action_dim: 32
+
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+  train_expert_only: true
+  freeze_vision_encoder: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+
+  optimizer_lr: 1.0e-4
+  scheduler_warmup_steps: 500
+  scheduler_decay_steps: 4500
+  scheduler_decay_lr: 1.0e-5
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+    observation.state:
+      type: STATE
+      shape: [14]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [14]
+
+
+# ==========================================================
+# 4. TREINAMENTO
+# ==========================================================
+output_dir: train_output/cup_pi05_right14_lf
+job_name: cup_pi05_right14_lf
+
+# 5k steps: sanity check com 15 eps.
+# Para 300+ eps, usar 30k–50k steps (ajustar scheduler acima também).
+steps: 5000
+batch_size: 32
+num_workers: 4
+log_freq: 100
+save_freq: 500
+save_checkpoint: true
+
+eval_freq: 500
+
+depth_fusion: false
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  entity: prometheus-lcad
