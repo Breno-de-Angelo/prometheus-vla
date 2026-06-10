@@ -97,7 +97,7 @@ def build_observation_batch(
     wants_depth: bool,
     wants_pressure: bool,
     depth_camera: ZMQCamera | None = None,
-) -> dict:
+) -> tuple[dict, dict]:
     """Monta o batch que a política espera, com STATE de 14 dims (só direita).
 
     - observation.state: as 14 juntas de RIGHT14_FEATURES, nessa ordem.
@@ -150,7 +150,7 @@ def build_observation_batch(
         batch["observation.right_hand_pressure"] = torch.from_numpy(
             np.asarray(right_p, dtype=np.float32)).to(device).unsqueeze(0)
 
-    return batch
+    return batch, obs
 
 
 def action_tensor_to_robot_action(action_vec: torch.Tensor) -> dict:
@@ -209,6 +209,9 @@ def main():
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Loga as 14 ações previstas (com nome da junta) mas NÃO envia pro robô.")
+    parser.add_argument("--live", action="store_true",
+                        help="publica telemetria (:5557) + mapa de ATENÇÃO da VLA pro dashboard "
+                             "OmniView (rode tools/live_omniview.py na MESMA máquina e abra :8013)")
     parser.add_argument("--open-hand-s", type=float, default=2.0,
                         help="soft start: rampa a mão direita até a pose ABERTA em N segundos antes do "
                              "loop (episódios de treino começam de mão aberta; partir de mão fechada "
@@ -308,6 +311,34 @@ def main():
     step_period = 1.0 / args.fps
     chunk_counter = 0
 
+    # --- OmniView live: telemetria + mapa de atenção da VLA (--live) ---
+    live_pub, attn_rec = None, None
+    if args.live:
+        import base64
+
+        from tools.live_bridge import TelemetryPublisher
+        from train.attn_recorder import AttnRecorder, overlay_heatmap
+
+        live_pub = TelemetryPublisher()
+        attn_rec = AttnRecorder().install()
+        logger.info("OmniView live: telemetria em :5557 + atenção da VLA "
+                    "(rode tools/live_omniview.py e abra :8013)")
+
+        def _publish_attn(rgb_np):
+            heat = attn_rec.heatmap()
+            if heat is None or rgb_np is None:
+                return
+            try:
+                import cv2 as _cv2
+                ov = overlay_heatmap(rgb_np, heat)
+                ok, buf = _cv2.imencode(".jpg", ov, [int(_cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    live_pub.publish_extra({
+                        "attn_jpg": "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+                    })
+            except Exception as e:
+                logger.debug("attn overlay falhou: %s", e)
+
     # MOVIMENTO LENTO: seed do clamp com a posição MEDIDA atual da direita, pra
     # o 1º comando não saltar da pose atual pro alvo do modelo. A cada ciclo, cada
     # junta anda no máximo args.max_delta rad em direção ao alvo -> rampa devagar.
@@ -353,11 +384,28 @@ def main():
     try:
         while not killer.kill:
             t_obs_start = time.perf_counter()
-            batch = build_observation_batch(
+            batch, raw_obs = build_observation_batch(
                 robot, args.task, device, wants_depth, wants_pressure, depth_camera)
+
+            # frame RGB cru (pré-processor) p/ desenhar o overlay de atenção
+            rgb_np = None
+            if attn_rec is not None:
+                try:
+                    t_img = batch["observation.images.head_camera"]
+                    t_img = t_img[0] if t_img.dim() == 4 else t_img
+                    rgb_np = (t_img.permute(1, 2, 0).float().cpu().numpy() * 255.0
+                              ).clip(0, 255).astype(np.uint8)
+                except Exception:
+                    pass
+
             batch = preprocessor(batch)
             with torch.no_grad():
-                action_chunk = policy.predict_action_chunk(batch)  # (1, chunk, action_dim)
+                if attn_rec is not None:
+                    with attn_rec:
+                        action_chunk = policy.predict_action_chunk(batch)  # (1, chunk, action_dim)
+                    _publish_attn(rgb_np)
+                else:
+                    action_chunk = policy.predict_action_chunk(batch)  # (1, chunk, action_dim)
             t_inf = time.perf_counter() - t_obs_start
             logger.info("chunk %d: previsto em %.0fms (shape %s)",
                         chunk_counter, t_inf * 1000, tuple(action_chunk.shape))
@@ -382,12 +430,27 @@ def main():
                                 tag, chunk_counter, arm, hand)
                 if not args.dry_run:
                     robot.send_action(act_dict)
+                if live_pub is not None:
+                    # rampas/trajetória/tátil do dashboard (custo ~nulo: slot único)
+                    _ls = getattr(robot, "_left_hand_state", None)
+                    _rs = getattr(robot, "_right_hand_state", None)
+                    live_pub.publish(
+                        raw_obs, act_dict,
+                        getattr(_ls, "pressure", None), getattr(_rs, "pressure", None),
+                        frame=chunk_counter * args.actions_per_chunk + i,
+                        t=time.time(), robot_phase="unlocked",
+                    )
                 sleep_for = step_period - (time.perf_counter() - loop_start)
                 if sleep_for > 0:
                     time.sleep(sleep_for)
             chunk_counter += 1
     finally:
         logger.info("desconectando")
+        if live_pub is not None:
+            try:
+                live_pub.close()
+            except Exception:
+                pass
         if depth_camera is not None:
             try:
                 depth_camera.disconnect()

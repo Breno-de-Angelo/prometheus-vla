@@ -86,6 +86,7 @@ class TelemetryPublisher:
         self._ok = bool(RIGHT_ARM_KEYS)
         self.socket = None
         self._slot = None
+        self._slot_extra = None   # pacotes avulsos (ex.: attn_jpg da inferência)
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -109,15 +110,17 @@ class TelemetryPublisher:
             if not self._event.wait(timeout=0.5):
                 continue
             self._event.clear()
-            pkt = self._slot           # snapshot (atribuição é atômica via GIL)
-            if pkt is None:
-                continue
-            try:
-                self.socket.send_string(json.dumps(pkt), flags=zmq.NOBLOCK)
-            except zmq.Again:
-                pass
-            except Exception as e:
-                logger.debug("[live_bridge] send falhou: %s", e)
+            for attr in ("_slot", "_slot_extra"):
+                pkt = getattr(self, attr)     # snapshot (atribuição é atômica via GIL)
+                if pkt is None:
+                    continue
+                setattr(self, attr, None)
+                try:
+                    self.socket.send_string(json.dumps(pkt), flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+                except Exception as e:
+                    logger.debug("[live_bridge] send falhou: %s", e)
 
     def publish(self, obs, action, pressure_left, pressure_right, episode=0, frame=0, t=0.0,
                 robot_phase="unlocked"):
@@ -148,10 +151,29 @@ class TelemetryPublisher:
                     "rightHand": _group(action, RIGHT_HAND_KEYS),
                 },
                 "pressure": {"left": _press_list(pressure_left), "right": _press_list(pressure_right)},
+                # sinais de grasp do controle (0=solto, 1=fechado). squeeze=fecha a mão
+                # toda (grasp); trigger=pinça fina do dedo.
+                "grasp": {
+                    "left": _get(action, "left_grasp_squeeze.q"),
+                    "right": _get(action, "right_grasp_squeeze.q"),
+                    "leftTrigger": _get(action, "left_grasp_trigger.q"),
+                    "rightTrigger": _get(action, "right_grasp_trigger.q"),
+                },
             }
             self._event.set()
         except Exception as e:  # nunca derruba a gravação
             logger.debug("[live_bridge] publish falhou: %s", e)
+
+    def publish_extra(self, pkt: dict):
+        """Pacote JSON avulso no mesmo PUB (ex.: {'attn_jpg': dataURL} da inferência).
+        Mesmo contrato do publish: slot único, nunca bloqueia nem levanta."""
+        if self.socket is None:
+            return
+        try:
+            self._slot_extra = dict(pkt)
+            self._event.set()
+        except Exception as e:
+            logger.debug("[live_bridge] publish_extra falhou: %s", e)
 
     def close(self):
         self._stop.set()

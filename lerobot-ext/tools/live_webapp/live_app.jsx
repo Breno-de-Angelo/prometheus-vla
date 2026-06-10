@@ -80,6 +80,8 @@
   // ----------------------------------------------------------------- websocket
   function useLiveData() {
     const histRef = useRef([]);          // amostras {s28, a28, pl, pr}
+    const graspRef = useRef({ left: 0, right: 0 });   // gatilho de grasp atual (0-1)
+    const graspHistRef = useRef([]);     // histórico do gatilho direito p/ sparkline
     const imgRef = useRef({});           // {rgb, depth, depthMeta, rgbSize}
     const metaRef = useRef({ episode: 0, frame: 0 });
     const pmaxRef = useRef(120);         // auto-ganho da pressão
@@ -107,12 +109,13 @@
             // acumula data-URLs decodificados (848×480 a 30Hz estourava a memória/aba).
             const prev = imgRef.current;
             const next = {
-              rgb: prev.rgb, depth: prev.depth,
+              rgb: prev.rgb, depth: prev.depth, attn: prev.attn,
               rgbSize: m.rgbSize || prev.rgbSize,
               depthMeta: m.depthMeta || prev.depthMeta,
             };
             if (m.rgb)   { next.rgb   = dataUrlToBlobUrl(m.rgb);   if (prev.rgb)   URL.revokeObjectURL(prev.rgb); }
             if (m.depth) { next.depth = dataUrlToBlobUrl(m.depth); if (prev.depth) URL.revokeObjectURL(prev.depth); }
+            if (m.attn)  { next.attn  = dataUrlToBlobUrl(m.attn);  if (prev.attn)  URL.revokeObjectURL(prev.attn); }
             imgRef.current = next;
             dirty.current = true;
           } else if (m.type === 'tele') {
@@ -126,6 +129,12 @@
             const h = histRef.current;
             h.push({ s28, a28, pr, pl });
             if (h.length > MAXLEN) h.shift();
+            if (m.grasp) {
+              graspRef.current = m.grasp;
+              const gh = graspHistRef.current;
+              gh.push(+m.grasp.right || 0);
+              if (gh.length > MAXLEN) gh.shift();
+            }
             metaRef.current = { episode: m.episode || 0, frame: m.frame || 0 };
             dirty.current = true;
           }
@@ -142,7 +151,56 @@
       return () => { alive = false; clearTimeout(retry); cancelAnimationFrame(raf); try { ws.close(); } catch (e) {} };
     }, []);
 
-    return { histRef, imgRef, metaRef, pmaxRef, lastTeleRef, questRef, phaseRef, conn };
+    return { histRef, graspRef, graspHistRef, imgRef, metaRef, pmaxRef, lastTeleRef, questRef, phaseRef, conn };
+  }
+
+  // --------------------------------------------------------------- gatilho de grasp
+  // Mostra o quanto o gatilho do controle está apertado (0=solto, 1=no talo),
+  // pra ter referência de "apertar muito" vs "deixar solto". Foco no direito (ativo).
+  function GraspBar({ label, value, accent }) {
+    const v = Math.max(0, Math.min(1, +value || 0));
+    const pct = (v * 100).toFixed(0);
+    return (
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, opacity: 0.8, fontFamily: 'monospace' }}>
+          <span>{label}</span><span>{pct}%</span>
+        </div>
+        <div style={{ height: 12, background: 'rgba(255,255,255,0.08)', borderRadius: 3, overflow: 'hidden' }}>
+          <div style={{ width: pct + '%', height: '100%', background: accent, transition: 'width 60ms linear' }} />
+        </div>
+      </div>
+    );
+  }
+
+  function GraspSparkline({ hist, accent }) {
+    const W = 220, H = 32;
+    const n = hist.length;
+    if (n < 2) return <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" />;
+    const step = W / (n - 1);
+    const pts = hist.map((v, i) => `${(i * step).toFixed(1)},${(H - Math.max(0, Math.min(1, v)) * H).toFixed(1)}`).join(' ');
+    return (
+      <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ display: 'block' }}>
+        <polyline points={pts} fill="none" stroke={accent} strokeWidth="1.5" />
+      </svg>
+    );
+  }
+
+  function GraspPanel({ grasp, hist }) {
+    return (
+      <div className="panel">
+        <div className="panel-head">
+          <span className="ph-label">GRASP · CONTROLE</span>
+          <span className="ph-meta mono">0 = solto · 1 = fechado</span>
+        </div>
+        <div style={{ padding: '8px 10px' }}>
+          <GraspBar label="dir · squeeze (fecha a mão)" value={grasp.right} accent="#34d399" />
+          <GraspBar label="dir · trigger (pinça)" value={grasp.rightTrigger} accent="#22d3ee" />
+          <GraspBar label="esq · squeeze" value={grasp.left} accent="#64748b" />
+          <div style={{ marginTop: 6, fontSize: 9, opacity: 0.6, fontFamily: 'monospace' }}>dir squeeze · últimos {Math.round(MAXLEN / FPS)}s</div>
+          <GraspSparkline hist={hist} accent="#34d399" />
+        </div>
+      </div>
+    );
   }
 
   // --------------------------------------------------------------- bloco de conexões
@@ -218,18 +276,33 @@
   }
 
   // --------------------------------------------------------------- RGB ao vivo
-  function LiveRGB({ url, size }) {
+  // Com a inferência publicando o mapa de atenção da VLA (attn_jpg), o painel
+  // ganha 2 abas: RGB cru e ATENÇÃO (heatmap JET sobre o frame que a política viu).
+  function LiveRGB({ url, attnUrl, size }) {
+    const [showAttn, setShowAttn] = useState(false);
+    const attnOn = showAttn && attnUrl;
+    const tab = (on) => ({
+      cursor: 'pointer', padding: '0 6px', borderRadius: 3,
+      opacity: on ? 1 : 0.45, background: on ? 'rgba(255,255,255,0.12)' : 'none',
+    });
     return (
       <div className="media-panel">
         <div className="media-head">
-          <span className="mh-label">RGB · head_camera</span>
+          {attnUrl ? (
+            <span className="mh-label">
+              <span style={tab(!attnOn)} onClick={() => setShowAttn(false)}>RGB</span>{' '}
+              <span style={tab(!!attnOn)} onClick={() => setShowAttn(true)}>ATENÇÃO·VLA</span>
+            </span>
+          ) : (
+            <span className="mh-label">RGB · head_camera</span>
+          )}
           <span className="mh-meta">{size ? `${size[0]}×${size[1]}` : '—'} · live</span>
         </div>
         <div className="media-body">
-          {url
-            ? <img src={url} className="rgb-canvas" draggable="false" />
+          {(attnOn ? attnUrl : url)
+            ? <img src={attnOn ? attnUrl : url} className="rgb-canvas" draggable="false" />
             : <div className="wait mono">aguardando câmera…</div>}
-          <span className="real-badge">LIVE</span>
+          <span className="real-badge">{attnOn ? 'ATN' : 'LIVE'}</span>
           <div className="scanline" />
         </div>
       </div>
@@ -280,7 +353,7 @@
 
   // ----------------------------------------------------------------------- App
   function App() {
-    const { histRef, imgRef, metaRef, pmaxRef, lastTeleRef, questRef, phaseRef, conn } = useLiveData();
+    const { histRef, graspRef, graspHistRef, imgRef, metaRef, pmaxRef, lastTeleRef, questRef, phaseRef, conn } = useLiveData();
     const [group, setGroup] = useState('rightArm');
     const [sig, setSig] = useState({ cmd: false, filt: true, exec: true });
     const hzRef = useRef({ last: performance.now(), n: 0, hz: 0 });
@@ -333,7 +406,7 @@
         </header>
 
         <div className="detail-grid">
-          <div className="cell cell-rgb"><LiveRGB url={img.rgb} size={img.rgbSize} /></div>
+          <div className="cell cell-rgb"><LiveRGB url={img.rgb} attnUrl={img.attn} size={img.rgbSize} /></div>
           <div className="cell cell-depth"><LiveDepth url={img.depth} meta={img.depthMeta} /></div>
           <div className="cell cell-tactile">
             {ready
@@ -366,6 +439,7 @@
           </div>
           <div className="cell cell-conn">
             <EstadoPanel phase={phaseRef.current} />
+            <GraspPanel grasp={graspRef.current} hist={graspHistRef.current} />
             <ConnPanel pc={pcLink} quest={questLink} g1={g1Link} />
           </div>
         </div>

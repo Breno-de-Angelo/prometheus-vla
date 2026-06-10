@@ -203,11 +203,33 @@ def _quest_thread(quest_adb: str, stop: threading.Event):
 def _tele_thread(port: int, stop: threading.Event):
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.SUB)
-    sock.setsockopt(zmq.CONFLATE, 1)
+    # SEM CONFLATE: o canal carrega DOIS tipos de pacote (telemetria e attn_jpg da
+    # inferência) e CONFLATE guardaria só o último, fazendo um apagar o outro.
+    # Em vez disso, drena a fila e guarda o mais recente de CADA tipo.
+    sock.setsockopt(zmq.RCVHWM, 8)
     sock.setsockopt_string(zmq.SUBSCRIBE, "")
     sock.setsockopt(zmq.RCVTIMEO, 1000)
     sock.connect(f"tcp://127.0.0.1:{port}")
     logger.info("telemetria: conectado a tcp://127.0.0.1:%d", port)
+
+    def _handle(msg: str):
+        try:
+            pkt = json.loads(msg)
+        except Exception:
+            return
+        with _LOCK:
+            # mapa de atenção da VLA (inferência): vai pro canal de IMAGEM.
+            attn = pkt.pop("attn_jpg", None)
+            if attn:
+                if not LATEST.get("img"):
+                    LATEST["img"] = {}
+                LATEST["img"]["attn"] = attn
+                LATEST["img_seq"] += 1
+                if not pkt or set(pkt) <= {"type"}:
+                    return
+            LATEST["tele"] = pkt
+            LATEST["tele_seq"] += 1
+
     try:
         while not stop.is_set():
             try:
@@ -216,13 +238,15 @@ def _tele_thread(port: int, stop: threading.Event):
                 continue
             except Exception:
                 break
-            try:
-                pkt = json.loads(msg)
-            except Exception:
-                continue
-            with _LOCK:
-                LATEST["tele"] = pkt
-                LATEST["tele_seq"] += 1
+            _handle(msg)
+            # drena o backlog sem bloquear (fica só com o mais recente de cada tipo)
+            while True:
+                try:
+                    _handle(sock.recv_string(flags=zmq.NOBLOCK))
+                except zmq.Again:
+                    break
+                except Exception:
+                    break
     finally:
         sock.close(0)
 
