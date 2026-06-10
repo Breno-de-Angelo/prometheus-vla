@@ -370,7 +370,27 @@ def main():
                                for k, tgt in OPEN_HAND_POSE.items()})
             time.sleep(1.0 / args.fps)
         last_cmd.update(OPEN_HAND_POSE)
-        logger.info("soft start: mão aberta (dedos em 0 rad).")
+
+        # Espera a mão CONVERGIR de verdade (o streamer de 100Hz faz clip de
+        # velocidade e pode ainda estar a caminho quando a rampa de comando acaba;
+        # sem isso a política assume com a mão meio aberta e fecha de novo).
+        SETTLE_TOL = 0.15   # rad
+        deadline = time.time() + 2.0
+        residual = {}
+        while time.time() < deadline:
+            obs_h = robot.get_observation()
+            residual = {k: float(obs_h.get(k, 0.0)) for k in OPEN_HAND_POSE}
+            if all(abs(v) < SETTLE_TOL for v in residual.values()):
+                break
+            time.sleep(0.1)
+        laggards = {k.split("right_hand_")[-1]: round(v, 3)
+                    for k, v in residual.items() if abs(v) >= SETTLE_TOL}
+        if laggards:
+            logger.warning("soft start: mão NÃO convergiu pra 0 em %s — juntas fora "
+                           "(medido, rad): %s — checar kp/atrito/obstrução", "2.0s extra", laggards)
+        else:
+            logger.info("soft start: mão aberta e CONFIRMADA pela medição (|q| < %.2f rad).",
+                        SETTLE_TOL)
 
     def _clamp_slow(target: dict) -> dict:
         # Clamp por GRUPO: braço (lento/seguro) vs mão (mais rápido, pra fechar o grip).
