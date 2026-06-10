@@ -81,6 +81,48 @@ RIGHT14_FEATURES: list[str] = [
 OPEN_HAND_POSE: dict[str, float] = {n: 0.0 for n in RIGHT14_FEATURES if "hand" in n}
 
 
+def _soft_start_open_hand(robot, args) -> None:
+    """PRIMEIRA ação da run (antes do load do modelo, que leva ~1 min): rampa a mão
+    direita da pose MEDIDA até a pose ABERTA (0 rad) e confirma pela medição.
+    Episódios de treino sempre começam de mão aberta; partir fechada joga a
+    política no regime 'já agarrando'. O braço não é tocado."""
+    if args.open_hand_s <= 0 or args.dry_run:
+        return
+    short = lambda d: {k.split("right_hand_")[-1]: round(v, 3) for k, v in d.items()}  # noqa: E731
+
+    obs = robot.get_observation()
+    start = {k: float(obs.get(k, 0.0)) for k in OPEN_HAND_POSE}
+    logger.info("soft start: mão direita MEDIDA inicial (rad): %s", short(start))
+
+    n_steps = max(1, int(args.open_hand_s * args.fps))
+    logger.info("soft start: abrindo em %.1fs (%d passos) até 0 rad...", args.open_hand_s, n_steps)
+    for i in range(1, n_steps + 1):
+        a = i / n_steps
+        robot.send_action({k: (1.0 - a) * start[k] + a * tgt
+                           for k, tgt in OPEN_HAND_POSE.items()})
+        time.sleep(1.0 / args.fps)
+
+    # Espera CONVERGIR (o streamer de 100Hz faz clip de velocidade e pode ainda
+    # estar a caminho quando a rampa de comando acaba).
+    settle_tol = 0.15  # rad
+    deadline = time.time() + 2.0
+    final = dict(start)
+    while time.time() < deadline:
+        o = robot.get_observation()
+        final = {k: float(o.get(k, 0.0)) for k in OPEN_HAND_POSE}
+        if all(abs(v) < settle_tol for v in final.values()):
+            break
+        time.sleep(0.1)
+
+    logger.info("soft start: mão direita MEDIDA final (rad):   %s", short(final))
+    laggards = {k: v for k, v in short(final).items() if abs(v) >= settle_tol}
+    if laggards:
+        logger.warning("soft start: NÃO convergiu pra 0 (tol %.2f) — juntas fora: %s "
+                       "— checar kp/atrito/obstrução", settle_tol, laggards)
+    else:
+        logger.info("soft start: mão aberta CONFIRMADA (todas |q| < %.2f rad).", settle_tol)
+
+
 def _policy_inputs(policy) -> set[str]:
     """Nomes das features de entrada que o checkpoint espera (p/ auto-detectar depth/tátil)."""
     feats = getattr(policy.config, "input_features", None) or {}
@@ -256,6 +298,17 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"device={device}")
 
+    # ── ROBÔ PRIMEIRO: conecta e abre a mão ANTES do load do modelo (~1 min) ──
+    robot_cfg = UnitreeG1Dex3Config(robot_ip=args.robot_ip, control_mode=args.control_mode,
+                                    is_simulation=False)
+    if args.hand_kp > 0:
+        robot_cfg.hand_kp = args.hand_kp  # sobe o torque da mão (default 0.8 é fraco)
+        logger.info("hand_kp sobrescrito = %.2f (default era 0.8)", args.hand_kp)
+    robot = UnitreeG1Dex3(robot_cfg)
+    robot.connect()
+    logger.info(f"robô conectado em {args.robot_ip}")
+    _soft_start_open_hand(robot, args)
+
     logger.info("carregando política pi05 right14...")
     policy = PI05Policy.from_pretrained(args.checkpoint, strict=False)
     policy.to(device).eval()
@@ -298,14 +351,6 @@ def main():
     )
     logger.info("checkpoint espera depth=%s tátil=%s (inputs=%s)", wants_depth, wants_pressure, sorted(inputs))
     logger.info("política pronta")
-
-    robot_cfg = UnitreeG1Dex3Config(robot_ip=args.robot_ip, control_mode=args.control_mode, is_simulation=False)
-    if args.hand_kp > 0:
-        robot_cfg.hand_kp = args.hand_kp  # sobe o torque da mão (default 0.8 é fraco)
-        logger.info("hand_kp sobrescrito = %.2f (default era 0.8)", args.hand_kp)
-    robot = UnitreeG1Dex3(robot_cfg)
-    robot.connect()
-    logger.info(f"robô conectado em {args.robot_ip}")
 
     depth_camera = None
     if wants_depth:
@@ -351,46 +396,10 @@ def main():
     # MOVIMENTO LENTO: seed do clamp com a posição MEDIDA atual da direita, pra
     # o 1º comando não saltar da pose atual pro alvo do modelo. A cada ciclo, cada
     # junta anda no máximo args.max_delta rad em direção ao alvo -> rampa devagar.
+    # (O soft start de abertura da mão já rodou ANTES do load do modelo —
+    #  _soft_start_open_hand, primeira ação da run.)
     obs0 = robot.get_observation()
     last_cmd = {n: float(obs0.get(n, 0.0)) for n in RIGHT14_FEATURES}
-
-    # SOFT START DA MÃO: rampa as 7 juntas da mão direita da pose medida até a
-    # pose ABERTA antes do loop da política. Motivo: os episódios de treino
-    # SEMPRE começam de mão aberta; se a run parte com a mão fechada (resto de
-    # run anterior), o modelo vê um state que só existe na fase de grasp e fica
-    # preso de mão fechada. O braço NÃO é tocado (parte da pose em que estiver).
-    if args.open_hand_s > 0 and not args.dry_run:
-        hand_start = {k: last_cmd[k] for k in OPEN_HAND_POSE}
-        n_steps = max(1, int(args.open_hand_s * args.fps))
-        logger.info("soft start: abrindo a mão direita em %.1fs (%d passos)...",
-                    args.open_hand_s, n_steps)
-        for i in range(1, n_steps + 1):
-            a = i / n_steps
-            robot.send_action({k: (1.0 - a) * hand_start[k] + a * tgt
-                               for k, tgt in OPEN_HAND_POSE.items()})
-            time.sleep(1.0 / args.fps)
-        last_cmd.update(OPEN_HAND_POSE)
-
-        # Espera a mão CONVERGIR de verdade (o streamer de 100Hz faz clip de
-        # velocidade e pode ainda estar a caminho quando a rampa de comando acaba;
-        # sem isso a política assume com a mão meio aberta e fecha de novo).
-        SETTLE_TOL = 0.15   # rad
-        deadline = time.time() + 2.0
-        residual = {}
-        while time.time() < deadline:
-            obs_h = robot.get_observation()
-            residual = {k: float(obs_h.get(k, 0.0)) for k in OPEN_HAND_POSE}
-            if all(abs(v) < SETTLE_TOL for v in residual.values()):
-                break
-            time.sleep(0.1)
-        laggards = {k.split("right_hand_")[-1]: round(v, 3)
-                    for k, v in residual.items() if abs(v) >= SETTLE_TOL}
-        if laggards:
-            logger.warning("soft start: mão NÃO convergiu pra 0 em %s — juntas fora "
-                           "(medido, rad): %s — checar kp/atrito/obstrução", "2.0s extra", laggards)
-        else:
-            logger.info("soft start: mão aberta e CONFIRMADA pela medição (|q| < %.2f rad).",
-                        SETTLE_TOL)
 
     def _clamp_slow(target: dict) -> dict:
         # Clamp por GRUPO: braço (lento/seguro) vs mão (mais rápido, pra fechar o grip).
