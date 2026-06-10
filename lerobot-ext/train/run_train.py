@@ -101,11 +101,6 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     # cropados; None = sem crop. Sem ele, fundo até ~32 m entra na nuvem e domina
     # o sampling. Valores ficam no YAML, não hardcoded.
     depth_workspace: dict[str, list[float]] | None = None
-    # Pesos por dimensão para o critério de BEST checkpoint (lista do tamanho do
-    # action space). Se definido, best = média ponderada do val_action_mse por dim
-    # (ex.: pesar a mão 2x pra escolher o checkpoint que melhor fecha o grasp).
-    # None = comportamento padrão (val_action_mse global, fallback val_loss).
-    best_metric_dim_weights: list[float] | None = None
     # true = grava SÓ 2 checkpoints em disco: `best` (cópia real, atualizada quando
     # o val melhora) e `last` (rolling, sobrescrito a cada save_freq) — sem
     # acumular checkpoints numerados (9.1G cada). Pico de disco: ~3x um checkpoint
@@ -564,7 +559,8 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    best_val_metric = float("inf")
+    best_val_loss = float("inf")
+    best_val_mse = None
     best_checkpoint_step = None
 
     for _ in range(step, cfg.steps):
@@ -725,27 +721,26 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 if wandb_logger:
                     wandb_logger.log_dict(val_log_dict, step, mode="eval")
 
-                # Critério do BEST: média PONDERADA por dim do val_action_mse se
-                # best_metric_dim_weights estiver na config (ex.: mão 2x p/ escolher
-                # o checkpoint que melhor fecha o grasp); senão val_action_mse
-                # global; fallback val_loss quando action_mse falha.
-                weights = getattr(cfg, "best_metric_dim_weights", None)
-                if weights and mse_dim_avg is not None:
-                    w = torch.tensor(weights, dtype=torch.float32)
-                    d = min(w.numel(), mse_dim_avg.numel())
-                    current_metric = float((mse_dim_avg[:d] * w[:d]).sum() / w[:d].sum())
-                    val_log_dict["val_best_metric_weighted"] = current_metric
-                    if wandb_logger:
-                        wandb_logger.log_dict({"val_best_metric_weighted": current_metric}, step, mode="eval")
-                elif val_action_mse_meter.count > 0:
-                    current_metric = val_action_mse_meter.avg
+                # Critério do BEST (definido com o usuário, 2026-06-10): o candidato
+                # só vira best se for melhor que o best atual NAS DUAS métricas —
+                # val_loss (flow matching) E val_action_mse (erro do chunk gerado).
+                # Uma métrica sozinha pode enganar; exigir dominância é conservador.
+                # Fallback: sem action_mse disponível, compara só val_loss.
+                cur_loss = val_loss_meter.avg
+                cur_mse = val_action_mse_meter.avg if val_action_mse_meter.count > 0 else None
+                if best_checkpoint_step is None:
+                    is_new_best = True
+                elif cur_mse is not None and best_val_mse is not None:
+                    is_new_best = cur_loss <= best_val_loss and cur_mse <= best_val_mse
                 else:
-                    current_metric = val_loss_meter.avg
-                if current_metric < best_val_metric:
-                    best_val_metric = current_metric
+                    is_new_best = cur_loss <= best_val_loss
+                if is_new_best:
+                    best_val_loss = cur_loss
+                    best_val_mse = cur_mse
                     best_checkpoint_step = step
                     logging.info(
-                        f"  ↑ NEW BEST val_metric={current_metric:.4f} at step {step}"
+                        f"  ↑ NEW BEST (domina nas 2 métricas) val_loss={cur_loss:.4f} "
+                        f"val_action_mse={cur_mse if cur_mse is None else round(cur_mse, 4)} at step {step}"
                     )
                     # Salva CÓPIA REAL do best no momento da melhora (granularidade
                     # do eval_freq) — antes o best era só symlink e o mínimo de val

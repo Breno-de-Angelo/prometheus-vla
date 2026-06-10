@@ -164,5 +164,6 @@ wandb:
 # (rolling a cada save_freq). Sem numerados de 9.1G.
 keep_only_best_and_last: true
 
-# Critério do best: val_action_mse global (default). A definição de um critério
-# composto está em discussão com o usuário — não inventar pesos aqui.
+# Critério do best (definido 2026-06-10): o checkpoint só vira best se for
+# melhor que o best atual NAS DUAS métricas de val — val_loss E val_action_mse
+# (dominância; uma métrica sozinha pode enganar). Implementado no run_train.py.
