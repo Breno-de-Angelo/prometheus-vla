@@ -80,6 +80,18 @@ RIGHT14_FEATURES: list[str] = [
 # em 0 rad; fechar = index/middle positivos, thumb_1/2 negativos).
 OPEN_HAND_POSE: dict[str, float] = {n: 0.0 for n in RIGHT14_FEATURES if "hand" in n}
 
+# Pose de mão FECHADA do teleop (xr_g1_arm.py): no modo RIGHT8 a política devolve
+# 1 escalar squeeze (0=aberta, 1=fechada) e os 7 dedos são reconstruídos como
+# squeeze × RIGHT_TARGET — a MESMA fórmula com que o dataset foi comprimido
+# (tools/slice_right_arm_1squeeze.py / compress_hand_to_grasp.py).
+# Ordem = a dos dedos em RIGHT14_FEATURES (thumb_0..2, index_0..1, middle_0..1).
+RIGHT_TARGET: list[float] = [0.0, -0.920, -1.74, 1.57, 1.74, 1.57, 1.74]
+
+# Setado no main() após o load, lendo output_features do checkpoint:
+#   "right14" -> ação 14 dims (7 braço + 7 dedos diretos)
+#   "right8"  -> ação 8 dims  (7 braço + 1 squeeze; dedos via RIGHT_TARGET)
+ACTION_MODE: str = "right14"
+
 
 def _soft_start_open_hand(robot, args) -> None:
     """PRIMEIRA ação da run (antes do load do modelo, que leva ~1 min): rampa a mão
@@ -196,13 +208,24 @@ def build_observation_batch(
 
 
 def action_tensor_to_robot_action(action_vec: torch.Tensor) -> dict:
-    """Roteia as 14 saídas (1as 14 dims) para os 14 motores da direita, por nome.
+    """Roteia a saída da política para os 14 motores da direita, por nome.
 
     NÃO inclui nenhuma junta da esquerda no dicionário → o robô não recebe comando
-    pra elas (elas ficam moles via G1_LEFT_ARM_LIMP). A política pode devolver 14 ou
-    32 dims (padding interno); pegamos só as 14 primeiras, que são as reais.
+    pra elas (elas ficam moles via G1_LEFT_ARM_LIMP). A política pode devolver mais
+    dims que o real (padding interno até 32); pegamos só as reais.
+
+    ACTION_MODE (auto-detectado no load):
+      right14 -> as 14 primeiras dims vão direto pros 14 motores.
+      right8  -> dims 0-6 = braço; dim 7 = squeeze (clip [0,1]) e os 7 dedos
+                 são reconstruídos como squeeze × RIGHT_TARGET (fórmula do teleop).
     """
     action = action_vec.detach().cpu().numpy().astype(float).reshape(-1).tolist()
+    if ACTION_MODE == "right8":
+        out = {name: action[i] for i, name in enumerate(RIGHT14_FEATURES[:7])}
+        squeeze = min(max(action[7], 0.0), 1.0)
+        for name, tgt in zip(RIGHT14_FEATURES[7:], RIGHT_TARGET):
+            out[name] = squeeze * tgt
+        return out
     return {name: action[i] for i, name in enumerate(RIGHT14_FEATURES) if i < len(action)}
 
 
@@ -309,9 +332,34 @@ def main():
     logger.info(f"robô conectado em {args.robot_ip}")
     _soft_start_open_hand(robot, args)
 
-    logger.info("carregando política pi05 right14...")
+    logger.info("carregando política pi05 right14/right8...")
     policy = PI05Policy.from_pretrained(args.checkpoint, strict=False)
     policy.to(device).eval()
+
+    # Auto-detect do espaço de ação do checkpoint (right14 vs right8/squeeze).
+    global ACTION_MODE
+    try:
+        action_dim = int(policy.config.output_features["action"].shape[0])
+    except (KeyError, AttributeError, TypeError, IndexError):
+        action_dim = 14
+        logger.warning("output_features['action'] ausente no config do checkpoint — "
+                       "assumindo 14 dims (right14)")
+    if action_dim == 8:
+        ACTION_MODE = "right8"
+        logger.info("=" * 70)
+        logger.info("AÇÃO DO CHECKPOINT: 8 dims → modo RIGHT8 (squeeze comprimido)")
+        logger.info("  dims 0-6 = braço direito | dim 7 = squeeze (0=aberta, 1=fechada)")
+        logger.info("  dedos reconstruídos: hand_q = squeeze × RIGHT_TARGET %s", RIGHT_TARGET)
+        logger.info("=" * 70)
+    elif action_dim == 14:
+        ACTION_MODE = "right14"
+        logger.info("=" * 70)
+        logger.info("AÇÃO DO CHECKPOINT: 14 dims → modo RIGHT14 (dedos comandados direto)")
+        logger.info("=" * 70)
+    else:
+        raise ValueError(
+            f"action_dim={action_dim} não suportado por este script (esperado 8 ou 14). "
+            f"Checkpoint: {args.checkpoint}")
 
     # Latência: desliga gradient checkpointing (otimização de TREINO, inútil em eval)
     # e, se pedido, reduz os passos de denoising do flow-matching.
