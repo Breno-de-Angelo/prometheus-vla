@@ -16,7 +16,12 @@ from pathlib import Path
 import safetensors.torch as st
 import torch
 
-from train.depth_encoder import PointNetEncoder, depth_to_pointcloud
+from train.depth_encoder import (
+    PointNetEncoder,
+    depth_cloud_sanity_check,
+    depth_to_pointcloud,
+    validate_intrinsics,
+)
 
 
 # Default for the cup3 setup (G1 head camera). Override via inject_pi05_depth(..., depth_key=...)
@@ -47,36 +52,42 @@ def _load_injected_weights(policy, checkpoint_dir):
 def inject_pi05_depth(
     policy,
     device,
-    camera_intrinsics=None,
+    camera_intrinsics: dict,
     load_injected_from=None,
     depth_key: str = DEFAULT_DEPTH_KEY,
-    depth_scale: float = 2.0,
+    depth_scale: float = None,
+    workspace: dict = None,
 ):
     """Acopla PointNet ao PI05 e injeta um único token extra (depth) no prefixo.
 
     Args:
+        camera_intrinsics: OBRIGATÓRIO — {fx, fy, cx, cy} do stream de depth na
+            resolução gravada. Sem default: o antigo (600/600/320/240, nominal de
+            640x480) distorcia a nuvem do stream real 848x480 silenciosamente.
         depth_key: feature name in the LeRobot batch dict carrying the depth map
             (H, W) or (B, H, W). Default `DEFAULT_DEPTH_KEY` matches our cup3
             setup; pass another string for CALVIN / LIBERO+depth / etc.
-        depth_scale: multiplier applied to depth values to obtain meters. Default
-            2.0 matches the cup3 ZMQ hack ([0,1] tensor mapped to [0,2m]). For
-            datasets that already store depth in meters (CALVIN, LIBERO+depth via
-            binhng), pass 1.0.
+        depth_scale: OBRIGATÓRIO — multiplicador que leva os valores do tensor a
+            METROS (PNG16 em mm → 0.001; CALVIN/LIBERO já em metros → 1.0). Sem
+            default: o antigo (2.0, hack do cup3) treinaria com escala 2000x
+            errada em silêncio se esquecido.
     """
+    validate_intrinsics(camera_intrinsics)
+    if depth_scale is None:
+        raise ValueError(
+            "depth_scale não informado. Configure `depth_scale` no YAML de treino "
+            "(PNG16 em milímetros → 0.001) ou --depth-scale na inferência."
+        )
     print(
         f"\n[INJECAO PI05-DEPTH]: Ativando fusao 3D (PointNet) sem tato "
-        f"(depth_key={depth_key!r}, depth_scale={depth_scale})..."
+        f"(depth_key={depth_key!r}, depth_scale={depth_scale}, "
+        f"intrinsics={camera_intrinsics})..."
     )
 
     hidden_size = _vlm_hidden_size(policy)
 
     policy.pointnet = PointNetEncoder(output_dim=hidden_size).to(device)
-    policy.camera_intrinsics = camera_intrinsics or {
-        "fx": 600.0,
-        "fy": 600.0,
-        "cx": 320.0,
-        "cy": 240.0,
-    }
+    policy.camera_intrinsics = camera_intrinsics
 
     model = policy.model
     model._extra_prefix_embs = None
@@ -116,8 +127,12 @@ def inject_pi05_depth(
 
         tokens = []
         if depth is not None:
+            if not getattr(self, "_depth_sanity_done", False):
+                depth_cloud_sanity_check(depth, depth_scale, tag=":pi05-depth")
+                self._depth_sanity_done = True
             pc = depth_to_pointcloud(
-                depth.float(), self.camera_intrinsics, depth_scale=depth_scale
+                depth.float(), self.camera_intrinsics, depth_scale=depth_scale,
+                workspace=workspace,
             )
             depth_tok = self.pointnet(pc).unsqueeze(1)
             tokens.append(depth_tok)

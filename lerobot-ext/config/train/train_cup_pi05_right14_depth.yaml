@@ -1,0 +1,160 @@
+# ==========================================================
+# PI05 BASE — Treino braço+mão DIREITA (14 dims) — RGB + DEPTH
+# Dataset: G1_Dex3_right14_dataset
+# Fusão: depth_only = RGB + PointNet token de depth (sem tátil)
+# GPU alvo: CUDA_VISIBLE_DEVICES=0
+#
+# Depth armazenado como PNG16 uint16 em milímetros (D435).
+# depth_scale=0.001 converte mm → metros antes do PointNet.
+# O RGB entra normalmente pelo encoder PaliGemma/SigLIP.
+# ==========================================================
+
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
+# ==========================================================
+dataset:
+  repo_id: lewislf/G1_Dex3_right14_dataset
+  root: lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432
+  revision: main
+  video_backend: pyav
+
+  image_transforms:
+    enable: true
+    max_num_transforms: 2
+    random_order: false
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+      RandomResizedCrop:
+        type: RandomResizedCrop
+        weight: 1.0
+        kwargs:
+          size: [480, 848]
+          scale: [0.75, 1.0]
+          ratio: [0.9, 1.1]
+          antialias: true
+      RandomErasing:
+        type: RandomErasing
+        weight: 0.5
+        kwargs:
+          p: 1.0
+          scale: [0.02, 0.10]
+          ratio: [0.3, 3.3]
+          value: 0
+
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO
+# ==========================================================
+val_dataset:
+  repo_id: lewislf/G1_Dex3_right14_dataset
+  root: lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432
+  revision: main
+  video_backend: pyav
+  episodes: [12, 13, 14]
+
+
+# ==========================================================
+# 3. POLICY — PI05 BASE + DEPTH FUSION
+# ==========================================================
+policy:
+  type: pi05
+  repo_id: lewislf/G1_Dex3_right14_pi05_depth_lf
+  push_to_hub: false
+
+  pretrained_path: lerobot/pi05_base
+
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  image_resolution: [224, 224]
+
+  max_state_dim: 32
+  max_action_dim: 32
+
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+  train_expert_only: true
+  freeze_vision_encoder: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+
+  optimizer_lr: 1.0e-4
+  scheduler_warmup_steps: 500
+  scheduler_decay_steps: 4500
+  scheduler_decay_lr: 1.0e-5
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [1, 480, 848]
+    observation.state:
+      type: STATE
+      shape: [14]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [14]
+
+
+# ==========================================================
+# 4. TREINAMENTO
+# ==========================================================
+output_dir: train_output/cup_pi05_right14_depth_lf
+job_name: cup_pi05_right14_depth_lf
+
+steps: 5000
+batch_size: 32
+num_workers: 8
+log_freq: 100
+save_freq: 500
+save_checkpoint: true
+
+eval_freq: 500
+
+# --- Depth fusion ---
+depth_fusion: true
+fusion_mode: depth_only
+depth_key: observation.images.head_camera_depth
+depth_scale: 0.001   # PNG16 está em milímetros → converte para metros (OBRIGATÓRIO)
+
+# PROVISÓRIO: intrínsecos NOMINAIS do D435 a 848x480 (fx≈fy≈425, cx≈424, cy≈240).
+# SUBSTITUIR pelos valores REAIS lidos do sensor na próxima coleta:
+#   (no robô) python lerobot-ext/tools/dump_realsense_intrinsics.py --width 848 --height 480
+depth_intrinsics:
+  fx: 425.0
+  fy: 425.0
+  cx: 424.0
+  cy: 240.0
+
+# Crop de workspace no frame da câmera (metros): mesa + copo dominam a nuvem,
+# fundo distante fica fora. Validar visualmente com:
+#   python lerobot-ext/tools/inspect_depth_cloud.py --config <este yaml> --root <dataset>
+depth_workspace:
+  z: [0.2, 1.5]
+  x: [-0.8, 0.8]
+  y: [-0.8, 0.8]
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  entity: prometheus-lcad

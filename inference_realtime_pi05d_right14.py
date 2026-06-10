@@ -193,6 +193,13 @@ def main():
     parser.add_argument("--hand-kp", type=float, default=0.0,
                         help="Sobrescreve o kp da mão direita (default do robô = 0.8, fraco). "
                              "Suba (ex: 2, 4) se a mão não fechar o grip. 0 = usa o default.")
+    parser.add_argument("--depth-fx", type=float, default=None,
+                        help="intrínseco fx do stream de DEPTH (obrigatório se o checkpoint usa depth)")
+    parser.add_argument("--depth-fy", type=float, default=None)
+    parser.add_argument("--depth-cx", type=float, default=None)
+    parser.add_argument("--depth-cy", type=float, default=None)
+    parser.add_argument("--depth-scale", type=float, default=None,
+                        help="multiplicador depth→metros (PNG16 em mm → 0.001); obrigatório se usa depth")
     parser.add_argument("--control-mode", default="upper_body")
     parser.add_argument("--no-left-limp", action="store_true",
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
@@ -242,7 +249,14 @@ def main():
     # nunca treinou (o bug do "missing=15" no load_pi05_d, que injeta sempre).
     if wants_depth or wants_pressure:
         from train.pi05_d_injector import inject_pi05_d
-        inject_pi05_d(policy, device=device)
+        # Auditoria FASE 3: intrínsecos e depth_scale agora são obrigatórios
+        # (sem default silencioso). Os mesmos valores usados no TREINO do checkpoint.
+        intr = None
+        if None not in (args.depth_fx, args.depth_fy, args.depth_cx, args.depth_cy):
+            intr = {"fx": args.depth_fx, "fy": args.depth_fy,
+                    "cx": args.depth_cx, "cy": args.depth_cy}
+        inject_pi05_d(policy, device=device, camera_intrinsics=intr,
+                      depth_scale=args.depth_scale)
         sd = _st.load_file(str(Path(args.checkpoint) / "model.safetensors"), device=str(device))
         policy.load_state_dict(sd, strict=False)
         logger.info("injeção PI05-D aplicada (depth/tátil)")

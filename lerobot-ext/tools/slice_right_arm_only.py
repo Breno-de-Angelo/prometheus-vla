@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Cria variante 14-dim (braço+mão direita) de um dataset LeRobot G1_Dex3 28-dim.
 
+Aceita também action de 32 dims (gravações novas com as 4 dims de grasp do
+controle nos índices 28-31): o layout das primeiras 28 dims é idêntico e as
+grasp dims são DESCARTADAS — no espaço right14 os 7 dedos direitos são
+comandados diretamente, então squeeze/trigger são redundantes.
+
 CONTEXTO
 --------
 O dataset gravado pelo pipeline de teleop do G1 tem 28 dimensões de action/state:
@@ -96,7 +101,7 @@ def process_meta_info(src: Path, dst: Path, right_names: list) -> None:
             feat = info["features"][feat_key]
             if isinstance(feat.get("shape"), list):
                 feat["shape"] = [N_RIGHT]
-            if isinstance(feat.get("names"), list) and len(feat["names"]) == 28:
+            if isinstance(feat.get("names"), list) and len(feat["names"]) in (28, 32):
                 feat["names"] = right_names
 
     (dst / "meta").mkdir(parents=True, exist_ok=True)
@@ -111,11 +116,34 @@ def process_meta_stats(src: Path, dst: Path) -> None:
         if feat_key not in stats:
             continue
         for stat_key, val in stats[feat_key].items():
-            if isinstance(val, list) and len(val) == 28:
+            if isinstance(val, list) and len(val) in (28, 32):
                 stats[feat_key][stat_key] = _slice_stat_list(val)
+        _guard_zero_range_quantiles(stats[feat_key], feat_key)
 
     (dst / "meta/stats.json").write_text(json.dumps(stats, indent=2))
     print(f"  meta/stats.json: action/state stats → 14 dims")
+
+
+QUANTILE_MIN_RANGE = 1e-3  # rad; abaixo disso a dim é considerada congelada
+
+
+def _guard_zero_range_quantiles(feat_stats: dict, feat_key: str) -> None:
+    """Dims congeladas (ex.: right_hand_thumb_0) fazem a quantile norm do LeRobot
+    dividir por um denominador minúsculo, amplificando ruído de sensor para a
+    escala dos sinais reais (medido no right14: state dim 7 tem range 7.2e-6 rad
+    de LSB do encoder → normalizava para ±3; o `== 0` não pega porque o range não
+    é exatamente zero). Critério: range < QUANTILE_MIN_RANGE → força
+    q99 = q01 + 1.0, a dim normaliza para ~-1 constante e o unnormalize devolve
+    ~q01 exato.
+    TODO: na fase de escala do dataset, avaliar right13 (remover a dim congelada)."""
+    q01, q99 = feat_stats.get("q01"), feat_stats.get("q99")
+    if not (isinstance(q01, list) and isinstance(q99, list)):
+        return
+    for d, (lo, hi) in enumerate(zip(q01, q99)):
+        if hi - lo < QUANTILE_MIN_RANGE:
+            print(f"  [AVISO] {feat_key} dim {d}: range ~zero (q99-q01={hi - lo:.3e}, "
+                  f"q01={lo:.4f}) — forçando q99 = q01 + 1.0 pra evitar divisão por ~eps")
+            feat_stats["q99"][d] = lo + 1.0
 
 
 def process_meta_episodes(src: Path, dst: Path) -> None:
@@ -136,7 +164,7 @@ def process_meta_episodes(src: Path, dst: Path) -> None:
         for col in stat_cols:
             df[col] = df[col].apply(
                 lambda v: np.array(v, dtype=np.float32)[RIGHT_INDICES]
-                if isinstance(v, (list, np.ndarray)) and len(v) == 28
+                if isinstance(v, (list, np.ndarray)) and len(v) in (28, 32)
                 else v
             )
         df.to_parquet(out, index=False)
@@ -181,7 +209,7 @@ def main():
     # Nomes das juntas direitas (extrai do info.json de origem)
     info_src = json.loads((src / "meta/info.json").read_text())
     all_names = info_src["features"]["action"].get("names", [])
-    right_names = [all_names[i] for i in RIGHT_INDICES] if len(all_names) == 28 else []
+    right_names = [all_names[i] for i in RIGHT_INDICES] if len(all_names) in (28, 32) else []
 
     print("\n[1/5] Parquets de dados...")
     process_data_parquets(src / "data", dst / "data")

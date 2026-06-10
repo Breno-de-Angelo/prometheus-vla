@@ -86,10 +86,51 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     #   CALVIN          -> "observation.depths.static"
     #   LIBERO+depth    -> "observation.images.image_depth"
     depth_key: str = "observation.images.head_camera_depth"
-    # Multiplier applied to depth values to obtain meters. Default 2.0 matches
-    # the cup3 ZMQ pipeline ([0,1] mapped to [0,2m]). For datasets that already
-    # store depth in meters (CALVIN, LIBERO+depth via binhng), set 1.0.
-    depth_scale: float = 2.0
+    # Multiplier applied to depth values to obtain meters — OBRIGATÓRIO quando
+    # depth_fusion=true (auditoria FASE 3: o default antigo de 2.0, hack do cup3,
+    # treinaria com escala 2000x errada em silêncio se esquecido no YAML).
+    # PNG16 em milímetros → 0.001; CALVIN/LIBERO+depth já em metros → 1.0.
+    depth_scale: float | None = None
+    # Intrínsecos {fx, fy, cx, cy} do stream de DEPTH na resolução gravada —
+    # OBRIGATÓRIO quando depth_fusion=true. Ler do sensor com
+    # lerobot-ext/tools/dump_realsense_intrinsics.py (o default antigo era
+    # nominal de 640x480 e distorcia a nuvem do stream 848x480 em silêncio).
+    depth_intrinsics: dict[str, float] | None = None
+    # Crop de workspace no frame da câmera, em metros (auditoria FASE 4) —
+    # {"z": [min,max], "x": [min,max], "y": [min,max]}; eixos faltantes não são
+    # cropados; None = sem crop. Sem ele, fundo até ~32 m entra na nuvem e domina
+    # o sampling. Valores ficam no YAML, não hardcoded.
+    depth_workspace: dict[str, list[float]] | None = None
+
+QUANTILE_MIN_RANGE = 1e-3  # rad; abaixo disso a dim é considerada congelada
+
+
+def _guard_zero_range_quantile_stats(dataset) -> None:
+    """Safety net (auditoria FASE 2): dims congeladas fazem a quantile norm dividir
+    por um denominador minúsculo e amplificar ruído de sensor para a escala dos
+    sinais reais (medido no right14: state dim 7 tem range 7.2e-6 rad de LSB do
+    encoder → normalizava para ±3; `== 0` não pega porque o range não é exatamente
+    zero). Critério: range < QUANTILE_MIN_RANGE → q99 = q01 + 1.0, em memória,
+    antes do normalizer ser construído. O mesmo guard existe no
+    slice_right_arm_only.py para datasets novos."""
+    import numpy as _np
+
+    for feat_key in ("action", "observation.state"):
+        st = dataset.meta.stats.get(feat_key) if dataset.meta.stats else None
+        if not st or "q01" not in st or "q99" not in st:
+            continue
+        q01 = _np.asarray(st["q01"], dtype=_np.float64)
+        q99 = _np.asarray(st["q99"], dtype=_np.float64)
+        frozen = _np.nonzero(q99 - q01 < QUANTILE_MIN_RANGE)[0]
+        if len(frozen):
+            logging.warning(
+                f"[stats-guard] {feat_key}: dims {frozen.tolist()} com range ~zero "
+                f"(q99-q01 < {QUANTILE_MIN_RANGE}) — forçando q99 = q01 + 1.0 pra "
+                f"evitar divisão por ~eps na quantile norm"
+            )
+            q99[frozen] = q01[frozen] + 1.0
+            st["q99"] = q99.astype(_np.asarray(st["q99"]).dtype, copy=False)
+
 
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
@@ -240,6 +281,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        _guard_zero_range_quantile_stats(dataset)
         if hasattr(cfg, 'val_dataset') and cfg.val_dataset:
             logging.info("Creating validation dataset")
             # Temporarily swap dataset config to create val dataset
@@ -254,6 +296,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
 
     if not is_main_process:
         dataset = make_dataset(cfg)
+        _guard_zero_range_quantile_stats(dataset)
         if hasattr(cfg, 'val_dataset') and cfg.val_dataset:
             train_ds_cfg = cfg.dataset
             cfg.dataset = cfg.val_dataset
@@ -293,20 +336,35 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             if candidate.exists() and (candidate / "model.safetensors").exists():
                 injected_ckpt = candidate
 
+        if cfg.depth_scale is None:
+            raise ValueError(
+                "depth_fusion=true exige `depth_scale` explícito no YAML "
+                "(PNG16 em milímetros → 0.001). Sem default — ver auditoria FASE 3."
+            )
+
         if cfg.fusion_mode == "depth_only":
             from pi05_depth_injector import inject_pi05_depth
 
             inject_pi05_depth(
                 policy,
                 device=_device,
+                camera_intrinsics=cfg.depth_intrinsics,
                 load_injected_from=injected_ckpt,
                 depth_key=cfg.depth_key,
                 depth_scale=cfg.depth_scale,
+                workspace=cfg.depth_workspace,
             )
         elif cfg.fusion_mode == "full":
             from pi05_d_injector import inject_pi05_d
 
-            inject_pi05_d(policy, device=_device, load_injected_from=injected_ckpt)
+            inject_pi05_d(
+                policy,
+                device=_device,
+                camera_intrinsics=cfg.depth_intrinsics,
+                load_injected_from=injected_ckpt,
+                depth_scale=cfg.depth_scale,
+                workspace=cfg.depth_workspace,
+            )
         else:
             raise ValueError(
                 f"Unknown fusion_mode={cfg.fusion_mode!r}; expected 'full' or 'depth_only'."

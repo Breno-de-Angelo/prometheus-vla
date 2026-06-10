@@ -13,7 +13,12 @@ import safetensors.torch as st
 import torch
 import torch.nn as nn
 
-from train.depth_encoder import PointNetEncoder, depth_to_pointcloud
+from train.depth_encoder import (
+    PointNetEncoder,
+    depth_cloud_sanity_check,
+    depth_to_pointcloud,
+    validate_intrinsics,
+)
 
 
 DEPTH_KEY = "observation.images.head_camera_depth"
@@ -41,7 +46,9 @@ def _load_injected_weights(policy, checkpoint_dir):
     return len(injected)
 
 
-def inject_pi05_d(policy, device, camera_intrinsics=None, pressure_dim=66, load_injected_from=None):
+def inject_pi05_d(policy, device, camera_intrinsics: dict = None, pressure_dim=66,
+                  load_injected_from=None, depth_scale: float = None,
+                  workspace: dict = None):
     """Acopla PointNet + encoder de pressão ao PI05 e injeta tokens extras no prefixo.
 
     - Dois tokens são acrescentados ao final da sequência de prefixo:
@@ -53,7 +60,14 @@ def inject_pi05_d(policy, device, camera_intrinsics=None, pressure_dim=66, load_
     - Se o batch não trouxer depth/pressão, o injector degrada para uma passada pi05
       nativa (nenhum token extra é adicionado naquele step).
     """
-    print("\n[INJECAO PI05-D]: Ativando fusao 3D (PointNet) + tato (Dex3) para PI05...")
+    validate_intrinsics(camera_intrinsics)
+    if depth_scale is None:
+        raise ValueError(
+            "depth_scale não informado. Configure `depth_scale` no YAML de treino "
+            "(PNG16 em milímetros → 0.001) ou --depth-scale na inferência."
+        )
+    print(f"\n[INJECAO PI05-D]: Ativando fusao 3D (PointNet) + tato (Dex3) para PI05 "
+          f"(depth_scale={depth_scale}, intrinsics={camera_intrinsics})...")
 
     hidden_size = _vlm_hidden_size(policy)
 
@@ -63,12 +77,7 @@ def inject_pi05_d(policy, device, camera_intrinsics=None, pressure_dim=66, load_
         nn.ReLU(),
         nn.Linear(256, hidden_size),
     ).to(device)
-    policy.camera_intrinsics = camera_intrinsics or {
-        "fx": 600.0,
-        "fy": 600.0,
-        "cx": 320.0,
-        "cy": 240.0,
-    }
+    policy.camera_intrinsics = camera_intrinsics
 
     model = policy.model
     model._extra_prefix_embs = None
@@ -106,8 +115,11 @@ def inject_pi05_d(policy, device, camera_intrinsics=None, pressure_dim=66, load_
 
         tokens = []
         if depth is not None:
-            # depth chega em mm; converte pra metros na back-projection
-            pc = depth_to_pointcloud(depth.float(), self.camera_intrinsics, depth_scale=0.001)
+            if not getattr(self, "_depth_sanity_done", False):
+                depth_cloud_sanity_check(depth, depth_scale, tag=":pi05-D")
+                self._depth_sanity_done = True
+            pc = depth_to_pointcloud(depth.float(), self.camera_intrinsics,
+                                     depth_scale=depth_scale, workspace=workspace)
             depth_tok = self.pointnet(pc).unsqueeze(1)
             tokens.append(depth_tok)
         if left is not None and right is not None:
