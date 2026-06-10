@@ -101,6 +101,16 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     # cropados; None = sem crop. Sem ele, fundo até ~32 m entra na nuvem e domina
     # o sampling. Valores ficam no YAML, não hardcoded.
     depth_workspace: dict[str, list[float]] | None = None
+    # Pesos por dimensão para o critério de BEST checkpoint (lista do tamanho do
+    # action space). Se definido, best = média ponderada do val_action_mse por dim
+    # (ex.: pesar a mão 2x pra escolher o checkpoint que melhor fecha o grasp).
+    # None = comportamento padrão (val_action_mse global, fallback val_loss).
+    best_metric_dim_weights: list[float] | None = None
+    # true = grava SÓ 2 checkpoints em disco: `best` (cópia real, atualizada quando
+    # o val melhora) e `last` (rolling, sobrescrito a cada save_freq) — sem
+    # acumular checkpoints numerados (9.1G cada). Pico de disco: ~3x um checkpoint
+    # (best + last + tmp do swap atômico).
+    keep_only_best_and_last: bool = False
 
 QUANTILE_MIN_RANGE = 1e-3  # rad; abaixo disso a dim é considerada congelada
 
@@ -620,6 +630,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             val_loss_meter = VarianceMeter("val_loss", ":.3f")
             val_action_mse_meter = VarianceMeter("val_action_mse", ":.4f")
             val_metrics = {}
+            # acumuladores per-dim (action MSE e flow loss) — viram val_*_dim_XX
+            val_mse_dim_sum, val_mse_dim_n = None, 0
+            val_lpd_sum, val_lpd_n = None, 0
 
             # action_mse é caro (num_inference_steps forwards por batch), limite em
             # até N batches por eval pra não dominar o wall-clock.
@@ -641,8 +654,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                             # gt pode vir com shape [B, chunk, dim] ou [B, dim]
                             if gt_actions.dim() == pred_actions.dim():
                                 dim = min(pred_actions.shape[-1], gt_actions.shape[-1])
-                                mse = ((pred_actions[..., :dim] - gt_actions[..., :dim]) ** 2).mean()
-                                val_action_mse_meter.update(mse.item())
+                                sq = (pred_actions[..., :dim] - gt_actions[..., :dim]) ** 2
+                                val_action_mse_meter.update(sq.mean().item())
+                                mse_dim = sq.mean(dim=tuple(range(sq.dim() - 1))).float().cpu()
+                                val_mse_dim_sum = mse_dim if val_mse_dim_sum is None else val_mse_dim_sum + mse_dim
+                                val_mse_dim_n += 1
                             action_mse_batches_done += 1
                         except Exception as e:
                             logging.warning("action_mse eval falhou: %s", e)
@@ -651,6 +667,13 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     val_loss_gathered = accelerator.gather(val_loss)
 
                     if val_output_dict:
+                        # loss_per_dim é LISTA (filtrada do loop de meters abaixo);
+                        # acumula aqui pra virar val_loss_dim_XX.
+                        _lpd = val_output_dict.get("loss_per_dim")
+                        if isinstance(_lpd, (list, tuple)):
+                            _lpd_t = torch.tensor(_lpd, dtype=torch.float32)
+                            val_lpd_sum = _lpd_t if val_lpd_sum is None else val_lpd_sum + _lpd_t
+                            val_lpd_n += 1
                         for k, v in val_output_dict.items():
                             if isinstance(v, (int, float, torch.Tensor)):
                                 if k not in val_metrics:
@@ -686,6 +709,15 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     logging.info(f"  {val_action_mse_meter}")
                     val_log_dict["val_action_mse"] = val_action_mse_meter.avg
                     val_log_dict["val_action_mse_std"] = val_action_mse_meter.std
+                # per-dim no wandb: val_action_mse_dim_XX e val_loss_dim_XX
+                mse_dim_avg = None
+                if val_mse_dim_n:
+                    mse_dim_avg = val_mse_dim_sum / val_mse_dim_n
+                    for i, v in enumerate(mse_dim_avg.tolist()):
+                        val_log_dict[f"val_action_mse_dim_{i:02d}"] = v
+                if val_lpd_n:
+                    for i, v in enumerate((val_lpd_sum / val_lpd_n).tolist()):
+                        val_log_dict[f"val_loss_dim_{i:02d}"] = v
                 for k, meter in val_metrics.items():
                     val_log_dict[f"val_{k}"] = meter.avg
                     logging.info(f"  {k}: {meter.avg:.3f}")
@@ -693,9 +725,22 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 if wandb_logger:
                     wandb_logger.log_dict(val_log_dict, step, mode="eval")
 
-                # Tracker do melhor checkpoint pelo val_action_mse (métrica objetiva).
-                # Cai no val_loss quando action_mse falha.
-                current_metric = val_action_mse_meter.avg if val_action_mse_meter.count > 0 else val_loss_meter.avg
+                # Critério do BEST: média PONDERADA por dim do val_action_mse se
+                # best_metric_dim_weights estiver na config (ex.: mão 2x p/ escolher
+                # o checkpoint que melhor fecha o grasp); senão val_action_mse
+                # global; fallback val_loss quando action_mse falha.
+                weights = getattr(cfg, "best_metric_dim_weights", None)
+                if weights and mse_dim_avg is not None:
+                    w = torch.tensor(weights, dtype=torch.float32)
+                    d = min(w.numel(), mse_dim_avg.numel())
+                    current_metric = float((mse_dim_avg[:d] * w[:d]).sum() / w[:d].sum())
+                    val_log_dict["val_best_metric_weighted"] = current_metric
+                    if wandb_logger:
+                        wandb_logger.log_dict({"val_best_metric_weighted": current_metric}, step, mode="eval")
+                elif val_action_mse_meter.count > 0:
+                    current_metric = val_action_mse_meter.avg
+                else:
+                    current_metric = val_loss_meter.avg
                 if current_metric < best_val_metric:
                     best_val_metric = current_metric
                     best_checkpoint_step = step
@@ -735,18 +780,45 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(policy),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                )
-                update_last_checkpoint(checkpoint_dir)
+                if getattr(cfg, "keep_only_best_and_last", False):
+                    # rolling `last`: sobrescreve via tmp + rename atômico, sem
+                    # acumular numerados (só best+last reais em disco).
+                    import shutil as _sh
+
+                    last_dir = Path(cfg.output_dir) / "checkpoints" / "last"
+                    tmp_dir = last_dir.parent / ".last_tmp"
+                    if tmp_dir.exists():
+                        _sh.rmtree(tmp_dir)
+                    save_checkpoint(
+                        checkpoint_dir=tmp_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
+                    if last_dir.is_symlink() or last_dir.is_file():
+                        last_dir.unlink()
+                    elif last_dir.is_dir():
+                        _sh.rmtree(last_dir)
+                    tmp_dir.rename(last_dir)
+                    logging.info(f"  last (rolling) salvo em {last_dir} [step {step}]")
+                    checkpoint_dir = last_dir
+                else:
+                    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
+                    update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
