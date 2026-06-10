@@ -49,7 +49,7 @@ class AttnRecorder:
                     and w.shape[2] <= rec.max_q_len
                     and w.shape[3] >= rec.n_img
                 ):
-                    img_w = w[..., : rec.n_img].float().mean(dim=(0, 1, 2))  # [n_img]
+                    img_w = w[..., : rec.n_img].detach().float().mean(dim=(0, 1, 2))  # [n_img]
                     rec._sum = img_w if rec._sum is None else rec._sum + img_w
                     rec._n += 1
             except Exception:
@@ -72,7 +72,7 @@ class AttnRecorder:
         if not self._n or self._sum is None:
             return None
         g = int(round(self.n_img ** 0.5))
-        h = (self._sum / self._n).reshape(g, g).cpu().numpy()
+        h = (self._sum / self._n).detach().reshape(g, g).cpu().numpy()
         h = h - h.min()
         mx = h.max()
         return h / mx if mx > 0 else h

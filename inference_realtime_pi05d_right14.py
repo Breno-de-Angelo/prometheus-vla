@@ -209,6 +209,15 @@ def main():
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Loga as 14 ações previstas (com nome da junta) mas NÃO envia pro robô.")
+    parser.add_argument("--rtc", action="store_true",
+                        help="Real-Time Chunking (PI/lerobot): prediz o próximo chunk numa thread "
+                             "ENQUANTO executa o atual, com inpainting na emenda — elimina os "
+                             "degraus do loop síncrono. (ignorado no --dry-run)")
+    parser.add_argument("--rtc-execution-horizon", type=int, default=20,
+                        help="passos do chunk anterior tratados como prefixo fixo no inpainting")
+    parser.add_argument("--rtc-max-guidance", type=float, default=1.0)
+    parser.add_argument("--rtc-refill", type=int, default=30,
+                        help="pede chunk novo quando a fila tem <= N ações (> horizon + delay)")
     parser.add_argument("--live", action="store_true",
                         help="publica telemetria (:5557) + mapa de ATENÇÃO da VLA pro dashboard "
                              "OmniView (rode tools/live_omniview.py na MESMA máquina e abra :8013)")
@@ -376,12 +385,123 @@ def main():
                 out[k] = prev + step
         return out
 
+    # ─────────────────── RTC: predição assíncrona + inpainting ───────────────────
+    def _run_rtc_loop():
+        """Real-Time Chunking (Black et al. 2025; impl. lerobot/policies/rtc).
+
+        Thread de INFERÊNCIA: quando a fila cai abaixo de --rtc-refill, prevê um
+        chunk novo condicionado ao resto do anterior (prev_chunk_left_over +
+        inference_delay) e faz merge na ActionQueue. Thread ATUADORA (esta):
+        consome a fila a --fps sem nunca parar → sem platôs nem saltos de replan.
+        """
+        import math
+        from threading import Lock, Thread
+
+        from lerobot.configs.types import RTCAttentionSchedule
+        from lerobot.policies.rtc.action_queue import ActionQueue
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+        from lerobot.policies.rtc.latency_tracker import LatencyTracker
+
+        rtc_cfg = RTCConfig(
+            enabled=True,
+            execution_horizon=args.rtc_execution_horizon,
+            max_guidance_weight=args.rtc_max_guidance,
+            prefix_attention_schedule=RTCAttentionSchedule.EXP,
+        )
+        policy.config.rtc_config = rtc_cfg
+        policy.init_rtc_processor()
+        queue = ActionQueue(rtc_cfg)
+        lat = LatencyTracker()
+        robot_lock = Lock()
+        time_per_step = 1.0 / args.fps
+        refill = max(args.rtc_refill, args.rtc_execution_horizon + 2)
+        latest_obs: dict = {}
+        logger.info("RTC ON: execution_horizon=%d guidance=%.1f refill<=%d fps=%.0f",
+                    args.rtc_execution_horizon, args.rtc_max_guidance, refill, args.fps)
+
+        def _infer_loop():
+            n = 0
+            while not killer.kill:
+                if queue.qsize() > refill:
+                    time.sleep(0.02)
+                    continue
+                try:
+                    t0 = time.perf_counter()
+                    idx_before = queue.get_action_index()
+                    left_over = queue.get_left_over()
+                    delay = math.ceil((lat.max() or 0.0) / time_per_step)
+                    with robot_lock:
+                        batch, raw_obs = build_observation_batch(
+                            robot, args.task, device, wants_depth, wants_pressure, depth_camera)
+                    latest_obs.update(raw_obs)
+                    rgb_np = None
+                    if attn_rec is not None:
+                        try:
+                            t_img = batch["observation.images.head_camera"]
+                            t_img = t_img[0] if t_img.dim() == 4 else t_img
+                            rgb_np = (t_img.permute(1, 2, 0).float().cpu().numpy() * 255.0
+                                      ).clip(0, 255).astype(np.uint8)
+                        except Exception:
+                            pass
+                    b = preprocessor(batch)
+                    with torch.no_grad():
+                        if attn_rec is not None:
+                            with attn_rec:
+                                chunk = policy.predict_action_chunk(
+                                    b, inference_delay=delay, prev_chunk_left_over=left_over)
+                            _publish_attn(rgb_np)
+                        else:
+                            chunk = policy.predict_action_chunk(
+                                b, inference_delay=delay, prev_chunk_left_over=left_over)
+                    original = chunk.squeeze(0).clone()          # normalizado: p/ leftover do RTC
+                    processed = postprocessor(chunk).squeeze(0)  # físico: p/ executar
+                    dt = time.perf_counter() - t0
+                    lat.add(dt)
+                    queue.merge(original, processed, math.ceil(dt / time_per_step), idx_before)
+                    logger.info("RTC chunk %d: %.0fms delay=%d fila=%d", n, dt * 1000, delay, queue.qsize())
+                    n += 1
+                except Exception as e:
+                    logger.error("RTC infer falhou: %s", e)
+                    time.sleep(0.2)
+
+        th = Thread(target=_infer_loop, daemon=True)
+        th.start()
+
+        frame = 0
+        while not killer.kill:
+            t0 = time.perf_counter()
+            a = queue.get()
+            if a is not None:
+                target = action_tensor_to_robot_action(a.cpu())
+                act_dict = _clamp_slow(target)
+                last_cmd.update(act_dict)
+                with robot_lock:
+                    robot.send_action(act_dict)
+                if live_pub is not None:
+                    _ls = getattr(robot, "_left_hand_state", None)
+                    _rs = getattr(robot, "_right_hand_state", None)
+                    live_pub.publish(latest_obs, act_dict,
+                                     getattr(_ls, "pressure", None), getattr(_rs, "pressure", None),
+                                     frame=frame, t=time.time(), robot_phase="unlocked")
+                if frame % 150 == 0:
+                    arm = {k: round(v, 3) for k, v in act_dict.items() if "hand" not in k}
+                    hand = {k: round(v, 3) for k, v in act_dict.items() if "hand" in k}
+                    logger.info("RTC frame %d:\n  braço: %s\n  mão:   %s", frame, arm, hand)
+                frame += 1
+            sleep_for = time_per_step - (time.perf_counter() - t0)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+        th.join(timeout=2.0)
+
     if args.dry_run:
         logger.info("=== DRY-RUN: nenhuma ação será enviada ao robô ===")
     logger.info("movimento: braço max_delta=%.3f | mão max_delta=%.3f rad/ciclo @ %.0f fps",
                 args.max_delta, args.hand_max_delta, args.fps)
 
     try:
+        if args.rtc and not args.dry_run:
+            _run_rtc_loop()
+            killer.kill = True  # encerrado: não cai no loop síncrono abaixo
         while not killer.kill:
             t_obs_start = time.perf_counter()
             batch, raw_obs = build_observation_batch(
