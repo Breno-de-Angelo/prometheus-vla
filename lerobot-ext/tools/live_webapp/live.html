@@ -199,18 +199,19 @@ button{font-family:inherit;cursor:pointer}
 .rec-dot.off{background:var(--bad);box-shadow:none;animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .media-body .rgb-canvas,.depth-body .depth-img{object-fit:contain}
-/* layout LIVE: sem trajetória 3D. Em cima RGB · Depth · Tátil (3 painéis iguais);
-   embaixo as rampas (2 colunas) + o bloco de conexões. */
+/* layout LIVE: 4 blocos 2×2 (RGB·Depth em cima, Atenção·Comandos embaixo, todos
+   do mesmo tamanho) + coluna lateral com Tátil e Conexões. */
 .live-grid .detail-grid{
   grid-template-columns:1fr 1fr 1fr;
-  grid-template-rows:minmax(0,1fr) minmax(0,0.82fr);
-  grid-template-areas:"rgb depth tactile" "ramps ramps conn";
+  grid-template-rows:minmax(0,1fr) minmax(0,1fr);
+  grid-template-areas:"rgb depth tactile" "attn ramps conn";
 }
+.cell-attn{grid-area:attn}
 .cell-conn{grid-area:conn;flex-direction:column;gap:12px}
 .cell-conn>.estado-panel{flex:none}
 @media (max-width:820px){
-  .live-grid .detail-grid{grid-template-columns:1fr 1fr;grid-template-rows:280px 280px 320px 160px;
-    grid-template-areas:"rgb depth" "tactile tactile" "ramps ramps" "conn conn"!important}
+  .live-grid .detail-grid{grid-template-columns:1fr 1fr;grid-template-rows:280px 280px 320px 280px 160px;
+    grid-template-areas:"rgb depth" "attn attn" "tactile tactile" "ramps ramps" "conn conn"!important}
 }
 /* bloco de conexões (grande) */
 .conn-panel .conn-body{flex:1;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:30px;padding:18px 30px}

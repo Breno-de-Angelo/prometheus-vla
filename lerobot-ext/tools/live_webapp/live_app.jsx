@@ -277,44 +277,48 @@
   }
 
   // --------------------------------------------------------------- RGB ao vivo
-  // Com a inferência publicando o mapa de atenção da VLA, o painel ganha 2 abas:
-  // RGB cru e ATENÇÃO. Preferimos attn_hm (só o heatmap JET pequeno) composto AQUI
-  // por cima do RGB ao vivo — fundo a 30fps, heatmap trocando a cada chunk. O
-  // attn_jpg legado (overlay pronto, frame congelado) segue como fallback.
-  function LiveRGB({ url, attnUrl, attnHmUrl, size }) {
-    const [showAttn, setShowAttn] = useState(false);
-    const hasAttn = attnHmUrl || attnUrl;
-    const attnOn = showAttn && hasAttn;
-    const tab = (on) => ({
-      cursor: 'pointer', padding: '0 6px', borderRadius: 3,
-      opacity: on ? 1 : 0.45, background: on ? 'rgba(255,255,255,0.12)' : 'none',
-    });
-    const liveCompose = attnOn && attnHmUrl && url;
+  function LiveRGB({ url, size }) {
     return (
       <div className="media-panel">
         <div className="media-head">
-          {hasAttn ? (
-            <span className="mh-label">
-              <span style={tab(!attnOn)} onClick={() => setShowAttn(false)}>RGB</span>{' '}
-              <span style={tab(!!attnOn)} onClick={() => setShowAttn(true)}>ATENÇÃO·VLA</span>
-            </span>
-          ) : (
-            <span className="mh-label">RGB · head_camera</span>
-          )}
+          <span className="mh-label">RGB · head_camera</span>
           <span className="mh-meta">{size ? `${size[0]}×${size[1]}` : '—'} · live</span>
         </div>
         <div className="media-body">
-          {liveCompose ? (
+          {url
+            ? <img src={url} className="rgb-canvas" draggable="false" />
+            : <div className="wait mono">aguardando câmera…</div>}
+          <span className="real-badge">LIVE</span>
+          <div className="scanline" />
+        </div>
+      </div>
+    );
+  }
+
+  // --------------------------------------------------------- ATENÇÃO da VLA
+  // Bloco exclusivo: RGB AO VIVO de fundo (30fps) + heatmap JET (attn_hm, ~2Hz
+  // — 1 por chunk da inferência) composto por cima. attn_jpg legado (overlay
+  // pronto, frame congelado) fica de fallback p/ runs com código antigo.
+  function LiveAttention({ url, hmUrl, legacyUrl }) {
+    const live = hmUrl && url;
+    return (
+      <div className="media-panel">
+        <div className="media-head">
+          <span className="mh-label">ATENÇÃO · VLA</span>
+          <span className="mh-meta">{live ? 'heatmap · live' : legacyUrl ? 'overlay' : '—'}</span>
+        </div>
+        <div className="media-body">
+          {live ? (
             <div style={{ position: 'relative' }}>
               <img src={url} className="rgb-canvas" draggable="false" />
-              <img src={attnHmUrl} draggable="false"
+              <img src={hmUrl} draggable="false"
                    style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
                             opacity: 0.5, pointerEvents: 'none' }} />
             </div>
-          ) : (attnOn ? attnUrl : url)
-            ? <img src={attnOn ? attnUrl : url} className="rgb-canvas" draggable="false" />
-            : <div className="wait mono">aguardando câmera…</div>}
-          <span className="real-badge">{attnOn ? 'ATN' : 'LIVE'}</span>
+          ) : legacyUrl
+            ? <img src={legacyUrl} className="rgb-canvas" draggable="false" />
+            : <div className="wait mono">aguardando inferência…</div>}
+          <span className="real-badge">ATN</span>
           <div className="scanline" />
         </div>
       </div>
@@ -418,8 +422,9 @@
         </header>
 
         <div className="detail-grid">
-          <div className="cell cell-rgb"><LiveRGB url={img.rgb} attnUrl={img.attn} attnHmUrl={img.attnHm} size={img.rgbSize} /></div>
+          <div className="cell cell-rgb"><LiveRGB url={img.rgb} size={img.rgbSize} /></div>
           <div className="cell cell-depth"><LiveDepth url={img.depth} meta={img.depthMeta} /></div>
+          <div className="cell cell-attn"><LiveAttention url={img.rgb} hmUrl={img.attnHm} legacyUrl={img.attn} /></div>
           <div className="cell cell-tactile">
             {ready
               ? <TactilePanel hands={tele.hands} frame={0} group={group} palette="heat" />
