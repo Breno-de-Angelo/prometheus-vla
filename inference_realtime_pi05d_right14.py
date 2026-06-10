@@ -262,6 +262,10 @@ def main():
     parser.add_argument("--hand-kp", type=float, default=0.0,
                         help="Sobrescreve o kp da mão direita (default do robô = 0.8, fraco). "
                              "Suba (ex: 2, 4) se a mão não fechar o grip. 0 = usa o default.")
+    parser.add_argument("--hand-stall-clamp", type=float, default=0.4,
+                        help="ANTI-STALL dos dedos: o alvo de cada dedo fica preso a MEDIDO±Δ rad. "
+                             "Dedo bloqueado (copo/mesa) deixa de ser empurrado além de Δ — protege "
+                             "a Dex3 de sobrecorrente/dano. 0 = desliga.")
     parser.add_argument("--depth-fx", type=float, default=None,
                         help="intrínseco fx do stream de DEPTH (obrigatório se o checkpoint usa depth)")
     parser.add_argument("--depth-fy", type=float, default=None)
@@ -466,6 +470,41 @@ def main():
                 out[k] = prev + step
         return out
 
+    # ANTI-STALL dos dedos (deploy-only, proteção de hardware): o alvo de cada
+    # dedo fica preso à janela MEDIDO±Δ. Dedo bloqueado (copo/mesa) → erro de
+    # posição máximo = Δ → torque de stall limitado (não desliga a Dex3 por
+    # sobrecorrente nem força o dedo); liberou → a janela acompanha o medido e
+    # o alvo da política volta a valer. Dataset/teleop intocados.
+    _stall_log_t = [0.0]
+
+    def _hand_stall_clamp(target: dict) -> dict:
+        d = args.hand_stall_clamp
+        if d <= 0:
+            return target
+        try:
+            st = robot._right_hand_state
+            if st is None:
+                return target
+            meas = {f"{n}.q": float(s.q)
+                    for n, s in zip(robot.right_hand_joint_names, st.motor_state)}
+        except Exception:
+            return target  # proteção nunca derruba o loop
+        out = dict(target)
+        hits = []
+        for k, q in meas.items():
+            if k in out:
+                v = out[k]
+                nv = max(q - d, min(q + d, v))
+                if abs(nv - v) > 1e-6:
+                    hits.append((k, v, nv, q))
+                out[k] = nv
+        if hits and time.time() - _stall_log_t[0] > 2.0:
+            _stall_log_t[0] = time.time()
+            k, v, nv, q = hits[0]
+            logger.info("anti-stall: %d dedo(s) limitado(s) — ex.: %s alvo %.2f→%.2f (medido %.2f)",
+                        len(hits), k.replace("right_hand_", "").replace("_joint.q", ""), v, nv, q)
+        return out
+
     # ─────────────────── RTC: predição assíncrona + inpainting ───────────────────
     def _run_rtc_loop():
         """Real-Time Chunking (Black et al. 2025; impl. lerobot/policies/rtc).
@@ -551,7 +590,7 @@ def main():
                 act_dict = _clamp_slow(target)
                 last_cmd.update(act_dict)
                 with robot_lock:
-                    robot.send_action(act_dict)
+                    robot.send_action(_hand_stall_clamp(act_dict))
                 if live_pub is not None:
                     _ls = getattr(robot, "_left_hand_state", None)
                     _rs = getattr(robot, "_right_hand_state", None)
@@ -572,6 +611,9 @@ def main():
         logger.info("=== DRY-RUN: nenhuma ação será enviada ao robô ===")
     logger.info("movimento: braço max_delta=%.3f | mão max_delta=%.3f rad/ciclo @ %.0f fps",
                 args.max_delta, args.hand_max_delta, args.fps)
+    if args.hand_stall_clamp > 0:
+        logger.info("anti-stall dedos ATIVO: alvo preso a MEDIDO±%.2f rad (protege a Dex3 de stall)",
+                    args.hand_stall_clamp)
 
     try:
         if args.rtc and not args.dry_run:
@@ -613,7 +655,7 @@ def main():
                     logger.info("%s chunk %d 1ª ação (clamp):\n  braço: %s\n  mão:   %s",
                                 tag, chunk_counter, arm, hand)
                 if not args.dry_run:
-                    robot.send_action(act_dict)
+                    robot.send_action(_hand_stall_clamp(act_dict))
                 if live_pub is not None:
                     # rampas/trajetória/tátil do dashboard (custo ~nulo: slot único)
                     _ls = getattr(robot, "_left_hand_state", None)
