@@ -586,6 +586,12 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
+                # loss_per_dim vem do forward como LISTA — o wrapper do wandb só
+                # loga escalares (ignorava com warning). Expande em loss_dim_XX.
+                per_dim = wandb_log_dict.pop("loss_per_dim", None)
+                if isinstance(per_dim, (list, tuple)):
+                    for i, v in enumerate(per_dim):
+                        wandb_log_dict[f"loss_dim_{i:02d}"] = float(v)
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
                     wandb_log_dict.update(
