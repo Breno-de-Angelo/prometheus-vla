@@ -395,12 +395,12 @@ def main():
         consome a fila a --fps sem nunca parar → sem platôs nem saltos de replan.
         """
         import math
+        from collections import deque
         from threading import Lock, Thread
 
         from lerobot.configs.types import RTCAttentionSchedule
         from lerobot.policies.rtc.action_queue import ActionQueue
         from lerobot.policies.rtc.configuration_rtc import RTCConfig
-        from lerobot.policies.rtc.latency_tracker import LatencyTracker
 
         rtc_cfg = RTCConfig(
             enabled=True,
@@ -411,7 +411,9 @@ def main():
         policy.config.rtc_config = rtc_cfg
         policy.init_rtc_processor()
         queue = ActionQueue(rtc_cfg)
-        lat = LatencyTracker()
+        # janela móvel (não máximo histórico): o chunk 0 leva ~900ms de warmup do
+        # CUDA e congelaria a estimativa de delay lá em cima pra sempre.
+        lat_win = deque(maxlen=5)
         robot_lock = Lock()
         time_per_step = 1.0 / args.fps
         refill = max(args.rtc_refill, args.rtc_execution_horizon + 2)
@@ -429,7 +431,7 @@ def main():
                     t0 = time.perf_counter()
                     idx_before = queue.get_action_index()
                     left_over = queue.get_left_over()
-                    delay = math.ceil((lat.max() or 0.0) / time_per_step)
+                    delay = math.ceil(max(lat_win, default=0.0) / time_per_step)
                     with robot_lock:
                         batch, raw_obs = build_observation_batch(
                             robot, args.task, device, wants_depth, wants_pressure, depth_camera)
@@ -456,7 +458,7 @@ def main():
                     original = chunk.squeeze(0).clone()          # normalizado: p/ leftover do RTC
                     processed = postprocessor(chunk).squeeze(0)  # físico: p/ executar
                     dt = time.perf_counter() - t0
-                    lat.add(dt)
+                    lat_win.append(dt)
                     queue.merge(original, processed, math.ceil(dt / time_per_step), idx_before)
                     logger.info("RTC chunk %d: %.0fms delay=%d fila=%d", n, dt * 1000, delay, queue.qsize())
                     n += 1
