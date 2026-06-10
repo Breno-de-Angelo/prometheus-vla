@@ -160,10 +160,9 @@ wandb:
   entity: prometheus-lcad
 
 # --- Best/last (pedido do usuário 2026-06-10) ---
-# Só 2 checkpoints em disco: best (cópia real quando o val melhora, critério
-# ponderado abaixo) e last (rolling a cada save_freq). Sem numerados de 9.1G.
+# Só 2 checkpoints em disco: best (cópia real quando o val melhora) e last
+# (rolling a cada save_freq). Sem numerados de 9.1G.
 keep_only_best_and_last: true
 
-# Critério do best: média ponderada por dim do val_action_mse.
-# Dims 0-6 = braço (peso 1.0), dims 7-13 = mão (peso 2.0 — o grasp é onde falha).
-best_metric_dim_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+# Critério do best: val_action_mse global (default). A definição de um critério
+# composto está em discussão com o usuário — não inventar pesos aqui.
