@@ -126,7 +126,7 @@ steps: 20000
 batch_size: 32
 num_workers: 8
 log_freq: 100
-save_freq: 5000   # checkpoint ~9G cada; 4 checkpoints em 20k steps
+save_freq: 500   # last rolling a cada 500 (sobrescreve o anterior; pedido do usuário)
 save_checkpoint: true
 
 eval_freq: 500   # granularidade do best (cópia real salva quando o val melhora)
