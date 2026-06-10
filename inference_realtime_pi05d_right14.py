@@ -76,6 +76,10 @@ RIGHT14_FEATURES: list[str] = [
     "right_hand_middle_1_joint.q",
 ]
 
+# Pose de mão ABERTA (= pose de início dos episódios do dataset: todos os dedos
+# em 0 rad; fechar = index/middle positivos, thumb_1/2 negativos).
+OPEN_HAND_POSE: dict[str, float] = {n: 0.0 for n in RIGHT14_FEATURES if "hand" in n}
+
 
 def _policy_inputs(policy) -> set[str]:
     """Nomes das features de entrada que o checkpoint espera (p/ auto-detectar depth/tátil)."""
@@ -205,6 +209,10 @@ def main():
                         help="NÃO força a esquerda mole (kp=0). Por padrão a esquerda fica mole.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Loga as 14 ações previstas (com nome da junta) mas NÃO envia pro robô.")
+    parser.add_argument("--open-hand-s", type=float, default=2.0,
+                        help="soft start: rampa a mão direita até a pose ABERTA em N segundos antes do "
+                             "loop (episódios de treino começam de mão aberta; partir de mão fechada "
+                             "joga o modelo no regime 'já agarrando'). 0 = desliga.")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -217,6 +225,16 @@ def main():
         force=True,
     )
     logging.getLogger("pi05d_right14").setLevel(getattr(logging, args.log_level.upper()))
+
+    # Log em ARQUIVO além do terminal (pedido 2026-06-10): cada run de inferência
+    # ganha um arquivo próprio com timestamp, com tudo que aparece no terminal.
+    log_dir = REPO_ROOT / "train" / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"infer_right14_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    logger.info("log desta run também em: %s", log_path)
 
     # Lado esquerdo mole ANTES do connect() — igual ao --left-arm-limp do record.
     if not args.no_left_limp:
@@ -295,6 +313,24 @@ def main():
     # junta anda no máximo args.max_delta rad em direção ao alvo -> rampa devagar.
     obs0 = robot.get_observation()
     last_cmd = {n: float(obs0.get(n, 0.0)) for n in RIGHT14_FEATURES}
+
+    # SOFT START DA MÃO: rampa as 7 juntas da mão direita da pose medida até a
+    # pose ABERTA antes do loop da política. Motivo: os episódios de treino
+    # SEMPRE começam de mão aberta; se a run parte com a mão fechada (resto de
+    # run anterior), o modelo vê um state que só existe na fase de grasp e fica
+    # preso de mão fechada. O braço NÃO é tocado (parte da pose em que estiver).
+    if args.open_hand_s > 0 and not args.dry_run:
+        hand_start = {k: last_cmd[k] for k in OPEN_HAND_POSE}
+        n_steps = max(1, int(args.open_hand_s * args.fps))
+        logger.info("soft start: abrindo a mão direita em %.1fs (%d passos)...",
+                    args.open_hand_s, n_steps)
+        for i in range(1, n_steps + 1):
+            a = i / n_steps
+            robot.send_action({k: (1.0 - a) * hand_start[k] + a * tgt
+                               for k, tgt in OPEN_HAND_POSE.items()})
+            time.sleep(1.0 / args.fps)
+        last_cmd.update(OPEN_HAND_POSE)
+        logger.info("soft start: mão aberta (dedos em 0 rad).")
 
     def _clamp_slow(target: dict) -> dict:
         # Clamp por GRUPO: braço (lento/seguro) vs mão (mais rápido, pra fechar o grip).
