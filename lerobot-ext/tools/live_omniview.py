@@ -88,6 +88,7 @@ def _colorize_depth(depth: np.ndarray):
 
 def _image_thread(host: str, port: int, stop: threading.Event, show_depth: bool, rgb_bytes: bool):
     ctx = zmq.Context.instance()
+    _last_frame_warn = [0.0]   # rate-limit do log de frame ruim (1 a cada 5s)
     while not stop.is_set():
         sock = ctx.socket(zmq.SUB)
         # CONFLATE só serve no modo rgb_bytes (mensagem de 1 parte). O stream
@@ -130,41 +131,47 @@ def _image_thread(host: str, port: int, stop: threading.Event, show_depth: bool,
                             break
                 except zmq.Again:
                     continue
-                except Exception:
+                except Exception as e:
+                    logger.warning("imagens: recv falhou (%s: %s); reconectando", type(e).__name__, e)
                     break
 
                 try:
                     data = json.loads(parts[0])
-                except Exception:
-                    continue
-                images = data.get("images", data)
-                protocol = data.get("protocol")
-                rgb_info = images.get("head_camera")
-                depth_info = images.get("head_camera_depth")
-                out = {}
+                    images = data.get("images", data)
+                    protocol = data.get("protocol")
+                    rgb_info = images.get("head_camera")
+                    depth_info = images.get("head_camera_depth")
+                    out = {}
 
-                # RGB — multipart (dict c/ índice 'part', bytes JPEG crus) ou legado (base64 str)
-                if isinstance(rgb_info, dict) and protocol == "zmq.compressed.v1":
-                    idx = rgb_info.get("part")
-                    if idx is not None and idx < len(parts):
-                        out["rgb"] = "data:image/jpeg;base64," + base64.b64encode(parts[idx]).decode("ascii")
-                elif isinstance(rgb_info, str):
-                    # legado: RGB já chega como JPEG/base64; OmniView é só viz, não re-encoda.
-                    out["rgb"] = "data:image/jpeg;base64," + rgb_info
-
-                # Depth — multipart (PNG uint16 crus) ou legado (base64 str)
-                if show_depth:
-                    depth = None
-                    if isinstance(depth_info, dict) and protocol == "zmq.compressed.v1":
-                        idx = depth_info.get("part")
+                    # RGB — multipart (dict c/ índice 'part', bytes JPEG crus) ou legado (base64 str)
+                    if isinstance(rgb_info, dict) and protocol == "zmq.compressed.v1":
+                        idx = rgb_info.get("part")
                         if idx is not None and idx < len(parts):
-                            depth = cv2.imdecode(np.frombuffer(parts[idx], np.uint8), cv2.IMREAD_UNCHANGED)
-                    elif isinstance(depth_info, str):
-                        depth = cv2.imdecode(np.frombuffer(base64.b64decode(depth_info), np.uint8), cv2.IMREAD_UNCHANGED)
-                    if depth is not None:
-                        url, meta = _colorize_depth(depth)
-                        out["depth"] = url
-                        out["depthMeta"] = meta
+                            out["rgb"] = "data:image/jpeg;base64," + base64.b64encode(parts[idx]).decode("ascii")
+                    elif isinstance(rgb_info, str):
+                        # legado: RGB já chega como JPEG/base64; OmniView é só viz, não re-encoda.
+                        out["rgb"] = "data:image/jpeg;base64," + rgb_info
+
+                    # Depth — multipart (PNG uint16 crus) ou legado (base64 str)
+                    if show_depth:
+                        depth = None
+                        if isinstance(depth_info, dict) and protocol == "zmq.compressed.v1":
+                            idx = depth_info.get("part")
+                            if idx is not None and idx < len(parts):
+                                depth = cv2.imdecode(np.frombuffer(parts[idx], np.uint8), cv2.IMREAD_UNCHANGED)
+                        elif isinstance(depth_info, str):
+                            depth = cv2.imdecode(np.frombuffer(base64.b64decode(depth_info), np.uint8), cv2.IMREAD_UNCHANGED)
+                        if depth is not None:
+                            url, meta = _colorize_depth(depth)
+                            out["depth"] = url
+                            out["depthMeta"] = meta
+                except Exception as e:
+                    # frame ruim não pode matar a thread: descarta, loga (com folga) e segue
+                    now = time.time()
+                    if now - _last_frame_warn[0] > 5.0:
+                        _last_frame_warn[0] = now
+                        logger.warning("imagens: frame descartado (%s: %s)", type(e).__name__, e)
+                    continue
 
                 if out:
                     with _LOCK:
@@ -172,6 +179,8 @@ def _image_thread(host: str, port: int, stop: threading.Event, show_depth: bool,
                             LATEST["img"] = {}
                         LATEST["img"].update(out)
                         LATEST["img_seq"] += 1
+        except Exception as e:
+            logger.warning("imagens: thread caiu (%s: %s); reconectando em 0.5s", type(e).__name__, e)
         finally:
             sock.close(0)
         if not stop.is_set():
@@ -202,15 +211,6 @@ def _quest_thread(quest_adb: str, stop: threading.Event):
 
 def _tele_thread(port: int, stop: threading.Event):
     ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.SUB)
-    # SEM CONFLATE: o canal carrega DOIS tipos de pacote (telemetria e attn_jpg da
-    # inferência) e CONFLATE guardaria só o último, fazendo um apagar o outro.
-    # Em vez disso, drena a fila e guarda o mais recente de CADA tipo.
-    sock.setsockopt(zmq.RCVHWM, 8)
-    sock.setsockopt_string(zmq.SUBSCRIBE, "")
-    sock.setsockopt(zmq.RCVTIMEO, 1000)
-    sock.connect(f"tcp://127.0.0.1:{port}")
-    logger.info("telemetria: conectado a tcp://127.0.0.1:%d", port)
 
     def _handle(msg: str):
         try:
@@ -224,31 +224,47 @@ def _tele_thread(port: int, stop: threading.Event):
                 if not LATEST.get("img"):
                     LATEST["img"] = {}
                 LATEST["img"]["attn"] = attn
+                LATEST["attn_ts"] = time.time()
                 LATEST["img_seq"] += 1
                 if not pkt or set(pkt) <= {"type"}:
                     return
             LATEST["tele"] = pkt
             LATEST["tele_seq"] += 1
 
-    try:
-        while not stop.is_set():
-            try:
-                msg = sock.recv_string()
-            except zmq.Again:
-                continue
-            except Exception:
-                break
-            _handle(msg)
-            # drena o backlog sem bloquear (fica só com o mais recente de cada tipo)
-            while True:
+    while not stop.is_set():
+        sock = ctx.socket(zmq.SUB)
+        # SEM CONFLATE: o canal carrega DOIS tipos de pacote (telemetria e attn_jpg da
+        # inferência) e CONFLATE guardaria só o último, fazendo um apagar o outro.
+        # Em vez disso, drena a fila e guarda o mais recente de CADA tipo.
+        sock.setsockopt(zmq.RCVHWM, 8)
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        sock.setsockopt(zmq.RCVTIMEO, 1000)
+        sock.connect(f"tcp://127.0.0.1:{port}")
+        logger.info("telemetria: conectado a tcp://127.0.0.1:%d", port)
+        try:
+            while not stop.is_set():
                 try:
-                    _handle(sock.recv_string(flags=zmq.NOBLOCK))
+                    msg = sock.recv_string()
                 except zmq.Again:
+                    continue
+                except Exception as e:
+                    logger.warning("telemetria: recv falhou (%s: %s); reconectando", type(e).__name__, e)
                     break
-                except Exception:
-                    break
-    finally:
-        sock.close(0)
+                _handle(msg)
+                # drena o backlog sem bloquear (fica só com o mais recente de cada tipo)
+                while True:
+                    try:
+                        _handle(sock.recv_string(flags=zmq.NOBLOCK))
+                    except zmq.Again:
+                        break
+                    except Exception:
+                        break
+        except Exception as e:
+            logger.warning("telemetria: thread caiu (%s: %s); reconectando em 0.5s", type(e).__name__, e)
+        finally:
+            sock.close(0)
+        if not stop.is_set():
+            time.sleep(0.5)
 
 
 # ----------------------------------------------------------------------------- web / ws
@@ -284,6 +300,11 @@ async def _broadcast(app: web.Application):
         img_every = app["img_every"]
         send_img = (tick - last_img_tick) >= img_every
         with _LOCK:
+            # atenção parada (inferência off há >5s): tira do pacote pra não reenviar
+            # ~40KB de heatmap fóssil 30x/s pela rede.
+            img = LATEST["img"]
+            if img and "attn" in img and time.time() - LATEST.get("attn_ts", 0.0) > 5.0:
+                img.pop("attn", None)
             if send_img and LATEST["img_seq"] != sent_img and LATEST["img"] is not None:
                 sent_img = LATEST["img_seq"]
                 last_img_tick = tick
