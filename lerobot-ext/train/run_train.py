@@ -702,6 +702,35 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     logging.info(
                         f"  ↑ NEW BEST val_metric={current_metric:.4f} at step {step}"
                     )
+                    # Salva CÓPIA REAL do best no momento da melhora (granularidade
+                    # do eval_freq) — antes o best era só symlink e o mínimo de val
+                    # entre saves periódicos nunca era materializado em disco
+                    # (ex.: rgb238 teve mínimo no step ~2000 com save_freq 5000).
+                    # Escrita em dir temporário + rename atômico: um crash no meio
+                    # não corrompe o best anterior.
+                    if cfg.save_checkpoint:
+                        import shutil as _sh
+
+                        best_dir = Path(cfg.output_dir) / "checkpoints" / "best"
+                        tmp_dir = best_dir.parent / ".best_tmp"
+                        if tmp_dir.exists():
+                            _sh.rmtree(tmp_dir)
+                        save_checkpoint(
+                            checkpoint_dir=tmp_dir,
+                            step=step,
+                            cfg=cfg,
+                            policy=accelerator.unwrap_model(policy),
+                            optimizer=optimizer,
+                            scheduler=lr_scheduler,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                        )
+                        if best_dir.is_symlink() or best_dir.is_file():
+                            best_dir.unlink()
+                        elif best_dir.is_dir():
+                            _sh.rmtree(best_dir)
+                        tmp_dir.rename(best_dir)
+                        logging.info(f"  best salvo (cópia real) em {best_dir} [step {step}]")
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
@@ -718,12 +747,6 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
-                if best_checkpoint_step == step:
-                    best_link = checkpoint_dir.parent / "best"
-                    if best_link.exists() or best_link.is_symlink():
-                        best_link.unlink()
-                    best_link.symlink_to(checkpoint_dir.name)
-                    logging.info(f"  symlinked best -> {checkpoint_dir.name}")
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
