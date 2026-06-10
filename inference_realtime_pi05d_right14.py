@@ -371,27 +371,31 @@ def main():
         import base64
 
         from tools.live_bridge import TelemetryPublisher
-        from train.attn_recorder import AttnRecorder, overlay_heatmap
+        from train.attn_recorder import AttnRecorder
 
         live_pub = TelemetryPublisher()
         attn_rec = AttnRecorder().install()
         logger.info("OmniView live: telemetria em :5557 + atenção da VLA "
                     "(rode tools/live_omniview.py e abra :8013)")
 
-        def _publish_attn(rgb_np):
+        def _publish_attn():
+            # Publica SÓ o heatmap (JET 128×128, ~4KB); o navegador compõe por cima
+            # do RGB AO VIVO — o overlay pronto congelava o frame que a política viu.
             heat = attn_rec.heatmap()
-            if heat is None or rgb_np is None:
+            if heat is None:
                 return
             try:
                 import cv2 as _cv2
-                ov = overlay_heatmap(rgb_np, heat)
-                ok, buf = _cv2.imencode(".jpg", ov, [int(_cv2.IMWRITE_JPEG_QUALITY), 80])
+                hm = _cv2.resize((heat * 255).astype(np.uint8), (128, 128),
+                                 interpolation=_cv2.INTER_CUBIC)
+                hm = _cv2.applyColorMap(hm, _cv2.COLORMAP_JET)
+                ok, buf = _cv2.imencode(".jpg", hm, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
                 if ok:
                     live_pub.publish_extra({
-                        "attn_jpg": "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+                        "attn_hm": "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
                     })
             except Exception as e:
-                logger.debug("attn overlay falhou: %s", e)
+                logger.debug("attn heatmap falhou: %s", e)
 
     # MOVIMENTO LENTO: seed do clamp com a posição MEDIDA atual da direita, pra
     # o 1º comando não saltar da pose atual pro alvo do modelo. A cada ciclo, cada
@@ -465,22 +469,12 @@ def main():
                         batch, raw_obs = build_observation_batch(
                             robot, args.task, device, wants_depth, wants_pressure, depth_camera)
                     latest_obs.update(raw_obs)
-                    rgb_np = None
-                    if attn_rec is not None:
-                        try:
-                            t_img = batch["observation.images.head_camera"]
-                            t_img = t_img[0] if t_img.dim() == 4 else t_img
-                            rgb_np = (t_img.permute(1, 2, 0).float().cpu().numpy() * 255.0
-                                      ).clip(0, 255).astype(np.uint8)
-                        except Exception:
-                            pass
                     b = preprocessor(batch)
                     with torch.no_grad():
                         if attn_rec is not None:
                             with attn_rec:
                                 chunk = policy.predict_action_chunk(
                                     b, inference_delay=delay, prev_chunk_left_over=left_over)
-                            _publish_attn(rgb_np)
                         else:
                             chunk = policy.predict_action_chunk(
                                 b, inference_delay=delay, prev_chunk_left_over=left_over)
@@ -491,6 +485,8 @@ def main():
                     queue.merge(original, processed, math.ceil(dt / time_per_step), idx_before)
                     logger.info("RTC chunk %d: %.0fms delay=%d fila=%d", n, dt * 1000, delay, queue.qsize())
                     n += 1
+                    if attn_rec is not None:
+                        _publish_attn()   # depois do merge: não infla o dt/real_delay do RTC
                 except Exception as e:
                     logger.error("RTC infer falhou: %s", e)
                     time.sleep(0.2)
@@ -538,23 +534,12 @@ def main():
             batch, raw_obs = build_observation_batch(
                 robot, args.task, device, wants_depth, wants_pressure, depth_camera)
 
-            # frame RGB cru (pré-processor) p/ desenhar o overlay de atenção
-            rgb_np = None
-            if attn_rec is not None:
-                try:
-                    t_img = batch["observation.images.head_camera"]
-                    t_img = t_img[0] if t_img.dim() == 4 else t_img
-                    rgb_np = (t_img.permute(1, 2, 0).float().cpu().numpy() * 255.0
-                              ).clip(0, 255).astype(np.uint8)
-                except Exception:
-                    pass
-
             batch = preprocessor(batch)
             with torch.no_grad():
                 if attn_rec is not None:
                     with attn_rec:
                         action_chunk = policy.predict_action_chunk(batch)  # (1, chunk, action_dim)
-                    _publish_attn(rgb_np)
+                    _publish_attn()
                 else:
                     action_chunk = policy.predict_action_chunk(batch)  # (1, chunk, action_dim)
             t_inf = time.perf_counter() - t_obs_start

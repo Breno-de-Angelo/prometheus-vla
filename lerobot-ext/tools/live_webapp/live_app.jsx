@@ -109,13 +109,14 @@
             // acumula data-URLs decodificados (848×480 a 30Hz estourava a memória/aba).
             const prev = imgRef.current;
             const next = {
-              rgb: prev.rgb, depth: prev.depth, attn: prev.attn,
+              rgb: prev.rgb, depth: prev.depth, attn: prev.attn, attnHm: prev.attnHm,
               rgbSize: m.rgbSize || prev.rgbSize,
               depthMeta: m.depthMeta || prev.depthMeta,
             };
             if (m.rgb)   { next.rgb   = dataUrlToBlobUrl(m.rgb);   if (prev.rgb)   URL.revokeObjectURL(prev.rgb); }
             if (m.depth) { next.depth = dataUrlToBlobUrl(m.depth); if (prev.depth) URL.revokeObjectURL(prev.depth); }
             if (m.attn)  { next.attn  = dataUrlToBlobUrl(m.attn);  if (prev.attn)  URL.revokeObjectURL(prev.attn); }
+            if (m.attn_hm) { next.attnHm = dataUrlToBlobUrl(m.attn_hm); if (prev.attnHm) URL.revokeObjectURL(prev.attnHm); }
             imgRef.current = next;
             dirty.current = true;
           } else if (m.type === 'tele') {
@@ -276,19 +277,23 @@
   }
 
   // --------------------------------------------------------------- RGB ao vivo
-  // Com a inferência publicando o mapa de atenção da VLA (attn_jpg), o painel
-  // ganha 2 abas: RGB cru e ATENÇÃO (heatmap JET sobre o frame que a política viu).
-  function LiveRGB({ url, attnUrl, size }) {
+  // Com a inferência publicando o mapa de atenção da VLA, o painel ganha 2 abas:
+  // RGB cru e ATENÇÃO. Preferimos attn_hm (só o heatmap JET pequeno) composto AQUI
+  // por cima do RGB ao vivo — fundo a 30fps, heatmap trocando a cada chunk. O
+  // attn_jpg legado (overlay pronto, frame congelado) segue como fallback.
+  function LiveRGB({ url, attnUrl, attnHmUrl, size }) {
     const [showAttn, setShowAttn] = useState(false);
-    const attnOn = showAttn && attnUrl;
+    const hasAttn = attnHmUrl || attnUrl;
+    const attnOn = showAttn && hasAttn;
     const tab = (on) => ({
       cursor: 'pointer', padding: '0 6px', borderRadius: 3,
       opacity: on ? 1 : 0.45, background: on ? 'rgba(255,255,255,0.12)' : 'none',
     });
+    const liveCompose = attnOn && attnHmUrl && url;
     return (
       <div className="media-panel">
         <div className="media-head">
-          {attnUrl ? (
+          {hasAttn ? (
             <span className="mh-label">
               <span style={tab(!attnOn)} onClick={() => setShowAttn(false)}>RGB</span>{' '}
               <span style={tab(!!attnOn)} onClick={() => setShowAttn(true)}>ATENÇÃO·VLA</span>
@@ -299,7 +304,14 @@
           <span className="mh-meta">{size ? `${size[0]}×${size[1]}` : '—'} · live</span>
         </div>
         <div className="media-body">
-          {(attnOn ? attnUrl : url)
+          {liveCompose ? (
+            <div style={{ position: 'relative' }}>
+              <img src={url} className="rgb-canvas" draggable="false" />
+              <img src={attnHmUrl} draggable="false"
+                   style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
+                            opacity: 0.5, pointerEvents: 'none' }} />
+            </div>
+          ) : (attnOn ? attnUrl : url)
             ? <img src={attnOn ? attnUrl : url} className="rgb-canvas" draggable="false" />
             : <div className="wait mono">aguardando câmera…</div>}
           <span className="real-badge">{attnOn ? 'ATN' : 'LIVE'}</span>
@@ -406,7 +418,7 @@
         </header>
 
         <div className="detail-grid">
-          <div className="cell cell-rgb"><LiveRGB url={img.rgb} attnUrl={img.attn} size={img.rgbSize} /></div>
+          <div className="cell cell-rgb"><LiveRGB url={img.rgb} attnUrl={img.attn} attnHmUrl={img.attnHm} size={img.rgbSize} /></div>
           <div className="cell cell-depth"><LiveDepth url={img.depth} meta={img.depthMeta} /></div>
           <div className="cell cell-tactile">
             {ready
