@@ -751,10 +751,9 @@ class UnitreeG1Dex3(UnitreeG1):
         if self._left_hand_cmd_pub is None or self._right_hand_cmd_pub is None:
             return action
         
-        # Check if action contains hand commands — de QUALQUER lado. O gate antigo
-        # exigia a 1ª junta da ESQUERDA; a inferência right14 manda só a direita e
-        # TODOS os comandos de mão eram descartados em silêncio (mão nunca abria
-        # nem fechava por comando — bug achado em 2026-06-10).
+        # Check if action contains hand commands — de QUALQUER lado (a inferência
+        # right14 manda só a direita; exigir a 1ª junta da esquerda descartava
+        # os comandos de mão em silêncio).
         has_left = f"{self.left_hand_joint_names[0]}.q" in action
         has_right = f"{self.right_hand_joint_names[0]}.q" in action
         if not (has_left or has_right):
