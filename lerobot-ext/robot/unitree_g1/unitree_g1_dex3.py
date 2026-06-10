@@ -647,6 +647,14 @@ class UnitreeG1Dex3(UnitreeG1):
             features[f"{name}.q"] = float
         for name in self.right_hand_joint_names:
             features[f"{name}.q"] = float
+        # Sinais de grasp do controle VR como dims próprias (0-1), no FIM do vetor pra
+        # não deslocar os índices 0-27 (slice right14 intacto). Só em action: são comando
+        # do operador, não medição do robô. NÃO vão pra motor (send_action ignora chaves
+        # desconhecidas). squeeze = fechamento total da mão; trigger = pinça fina do dedo.
+        features["left_grasp_squeeze.q"] = float    # idx 28
+        features["right_grasp_squeeze.q"] = float   # idx 29
+        features["left_grasp_trigger.q"] = float    # idx 30
+        features["right_grasp_trigger.q"] = float   # idx 31
         return features
 
     @cached_property
@@ -743,9 +751,13 @@ class UnitreeG1Dex3(UnitreeG1):
         if self._left_hand_cmd_pub is None or self._right_hand_cmd_pub is None:
             return action
         
-        # Check if action contains hand commands
-        first_joint = self.left_hand_joint_names[0]
-        if f"{first_joint}.q" not in action:
+        # Check if action contains hand commands — de QUALQUER lado. O gate antigo
+        # exigia a 1ª junta da ESQUERDA; a inferência right14 manda só a direita e
+        # TODOS os comandos de mão eram descartados em silêncio (mão nunca abria
+        # nem fechava por comando — bug achado em 2026-06-10).
+        has_left = f"{self.left_hand_joint_names[0]}.q" in action
+        has_right = f"{self.right_hand_joint_names[0]}.q" in action
+        if not (has_left or has_right):
             return action
         
         # Extract and clamp left hand targets
@@ -765,9 +777,12 @@ class UnitreeG1Dex3(UnitreeG1):
         # aqui — elimina o stair-stepping de 30Hz e evita dupla publicação.
         if getattr(self, "_hand_streamer_on", False):
             with self._hand_lock:
-                self._hand_target_right = right_q.astype(float)
+                # só atualiza o alvo do lado que veio na action (right14 manda só a
+                # direita; sem isso a esquerda seria puxada pra zeros)
+                if has_right:
+                    self._hand_target_right = right_q.astype(float)
                 # ESQUERDA: se limp, o streamer força q=0 (kp já é 0); senão persegue o alvo.
-                if not getattr(self, "_left_limp", False):
+                if not getattr(self, "_left_limp", False) and has_left:
                     self._hand_target_left = left_q.astype(float)
             if not getattr(self, "_left_dbg_done", False):
                 kps = [self._left_hand_msg.motor_cmd[j].kp for j in Dex3_1_Left_JointIndex]
@@ -778,11 +793,12 @@ class UnitreeG1Dex3(UnitreeG1):
 
         # ───── MODO LEGADO (G1_HAND_STREAMER=0): EMA + clamp + publish a 30Hz ─────
         # 🪶 anti-tremor: passa-baixa EMA + clamp de velocidade nos dedos (ver _smooth_hand_q)
-        right_q = self._smooth_hand_q(right_q, "right", self._right_hand_state)
+        if has_right:
+            right_q = self._smooth_hand_q(right_q, "right", self._right_hand_state)
 
-        # Update command messages (direita)
-        for idx, joint_id in enumerate(Dex3_1_Right_JointIndex):
-            self._right_hand_msg.motor_cmd[joint_id].q = right_q[idx]
+            # Update command messages (direita)
+            for idx, joint_id in enumerate(Dex3_1_Right_JointIndex):
+                self._right_hand_msg.motor_cmd[joint_id].q = right_q[idx]
 
         # Mão ESQUERDA: depende de --left-arm-limp (env G1_LEFT_ARM_LIMP).
         if getattr(self, "_left_limp", False):
