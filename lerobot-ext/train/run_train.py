@@ -562,6 +562,25 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
     best_val_loss = float("inf")
     best_val_mse = None
     best_checkpoint_step = None
+    # No RESUME, restaura o estado do best salvo em disco — senão a 1ª eval
+    # pós-restart vira best incondicional e sobrescreve um best melhor.
+    if cfg.resume:
+        import json as _json
+
+        _bm = Path(cfg.output_dir) / "checkpoints" / "best" / "best_meta.json"
+        if _bm.exists():
+            try:
+                _meta = _json.loads(_bm.read_text())
+                best_val_loss = float(_meta.get("val_loss", float("inf")))
+                best_val_mse = _meta.get("val_action_mse")
+                best_checkpoint_step = int(_meta["step"])
+                if is_main_process:
+                    logging.info(
+                        f"best restaurado do disco: step {best_checkpoint_step} "
+                        f"val_action_mse={best_val_mse} val_loss={best_val_loss:.4f}"
+                    )
+            except Exception as e:
+                logging.warning(f"best_meta.json ilegível ({e}); estado do best zerado")
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
@@ -768,6 +787,14 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                             preprocessor=preprocessor,
                             postprocessor=postprocessor,
                         )
+                        # métricas do best persistidas junto (lidas no resume)
+                        import json as _json
+
+                        (tmp_dir / "best_meta.json").write_text(_json.dumps({
+                            "step": step,
+                            "val_loss": cur_loss,
+                            "val_action_mse": cur_mse,
+                        }))
                         if best_dir.is_symlink() or best_dir.is_file():
                             best_dir.unlink()
                         elif best_dir.is_dir():
