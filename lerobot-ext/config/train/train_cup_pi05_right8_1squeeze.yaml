@@ -133,6 +133,7 @@ wandb:
   enable: true
   project: prometheus_g1
   entity: prometheus-lcad
+  disable_artifact: true   # checkpoints NAO sobem pro wandb (estouravam o storage do time)
 
 # --- Checkpoints (pedido do usuário 2026-06-10) ---
 # TODOS os checkpoints numerados ficam em disco (a cada save_freq), além de

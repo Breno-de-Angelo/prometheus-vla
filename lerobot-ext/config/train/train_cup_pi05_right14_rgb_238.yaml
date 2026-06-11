@@ -130,6 +130,7 @@ wandb:
   enable: true
   project: prometheus_g1
   entity: prometheus-lcad
+  disable_artifact: true   # checkpoints NAO sobem pro wandb (estouravam o storage do time)
 
 # --- Best/last (definido com o usuário 2026-06-10) ---
 # Só 2 checkpoints em disco: best (cópia real quando o val melhora) e last
