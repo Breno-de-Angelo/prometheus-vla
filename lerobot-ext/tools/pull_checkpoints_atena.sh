@@ -25,6 +25,9 @@ while true; do
     dirs=$(ssh -o ConnectTimeout=10 "$REMOTE" \
         "find ~/$RDIR -maxdepth 1 -mindepth 1 -type d -mmin +5 2>/dev/null" \
         | grep -E '/[0-9]+$' | sort) || dirs=""
+    # 'last' é um SYMLINK pro último ckpt numerado — apagar o alvo quebra o last
+    # (e o resume do treino). Puxa, mas só remove quando o last apontar pra outro.
+    last_target=$(ssh -o ConnectTimeout=10 "$REMOTE" "readlink ~/$RDIR/last 2>/dev/null" || true)
 
     for d in $dirs; do
         name=$(basename "$d")
@@ -34,6 +37,10 @@ while true; do
         pending=$(rsync -ai --dry-run "$REMOTE:$d/" "$LDIR/$name/" | head -1)
         if [ -n "$pending" ]; then
             echo "  verificação acusou pendência ($pending), não removo ainda"
+            continue
+        fi
+        if [ "$name" = "$last_target" ]; then
+            echo "$(date +%F_%T) ✓ $name puxado; é o alvo do 'last' — removo quando houver ckpt mais novo"
             continue
         fi
         ssh "$REMOTE" "rm -rf '$d'"

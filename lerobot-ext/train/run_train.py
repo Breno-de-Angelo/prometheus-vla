@@ -721,17 +721,19 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 if wandb_logger:
                     wandb_logger.log_dict(val_log_dict, step, mode="eval")
 
-                # Critério do BEST (definido com o usuário, 2026-06-10): o candidato
-                # só vira best se for melhor que o best atual NAS DUAS métricas —
-                # val_loss (flow matching) E val_action_mse (erro do chunk gerado).
-                # Uma métrica sozinha pode enganar; exigir dominância é conservador.
+                # Critério do BEST (revisado com o usuário, 2026-06-10): SÓ
+                # val_action_mse (erro do chunk de ação gerado no held-out) — é o
+                # proxy mais direto de comportamento. O critério anterior (dominância
+                # em val_loss E val_action_mse) congelou o best no run right8: as
+                # duas métricas andaram em direções OPOSTAS (flow-loss subiu 0.098→0.18
+                # enquanto o mse caiu 0.093→0.050) e o empate nunca atualizava.
                 # Fallback: sem action_mse disponível, compara só val_loss.
                 cur_loss = val_loss_meter.avg
                 cur_mse = val_action_mse_meter.avg if val_action_mse_meter.count > 0 else None
                 if best_checkpoint_step is None:
                     is_new_best = True
                 elif cur_mse is not None and best_val_mse is not None:
-                    is_new_best = cur_loss <= best_val_loss and cur_mse <= best_val_mse
+                    is_new_best = cur_mse <= best_val_mse
                 else:
                     is_new_best = cur_loss <= best_val_loss
                 if is_new_best:
@@ -739,8 +741,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     best_val_mse = cur_mse
                     best_checkpoint_step = step
                     logging.info(
-                        f"  ↑ NEW BEST (domina nas 2 métricas) val_loss={cur_loss:.4f} "
-                        f"val_action_mse={cur_mse if cur_mse is None else round(cur_mse, 4)} at step {step}"
+                        f"  ↑ NEW BEST (val_action_mse) val_action_mse="
+                        f"{cur_mse if cur_mse is None else round(cur_mse, 4)} "
+                        f"(val_loss={cur_loss:.4f}) at step {step}"
                     )
                     # Salva CÓPIA REAL do best no momento da melhora (granularidade
                     # do eval_freq) — antes o best era só symlink e o mínimo de val
