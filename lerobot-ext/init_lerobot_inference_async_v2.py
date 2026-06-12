@@ -372,7 +372,7 @@ class AttnMapWindow:
         # WINDOW_NORMAL: o Qt backend escala o frame para preencher a janela
         # inteira ao redimensionar — sem bordas brancas, sem distorção.
         cv2.namedWindow(self.win_rgb, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.win_rgb, 640, 545)
+        cv2.resizeWindow(self.win_rgb, 848, 545)
 
         cv2.namedWindow(self.win_panel, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.win_panel, 1200, 900)
@@ -516,13 +516,32 @@ class AttnMapWindow:
             n_img   = max(N - n_extra, 1)
 
             if self._img_token_h is None:
-                if n_img == 300:
-                    self._img_token_h, self._img_token_w = 15, 20
-                elif n_img == 225:
-                    self._img_token_h, self._img_token_w = 15, 15
+                # Mapeamento confirmado por forward pass real do ResNet18.
+                # NÃO use W//32: o padding das convs faz o stride efetivo variar.
+                # Ex: 848 → W_feat=27 (não 26); sempre confirme com backbone(x).
+                _KNOWN = {
+                    300: (15, 20),   # 640×480
+                    225: (15, 15),   # 480×480
+                    405: (15, 27),   # 848×480  ← confirmado por forward pass
+                }
+                if n_img in _KNOWN:
+                    self._img_token_h, self._img_token_w = _KNOWN[n_img]
                 else:
-                    side = int(n_img ** 0.5)
-                    self._img_token_h = self._img_token_w = side
+                    # Fallback: procura fatoração (h, w) com h*w == n_img que
+                    # melhor preserva o aspect ratio do frame RGB atual.
+                    img_H, img_W = rgb_frame.shape[:2]
+                    target_ratio = img_W / img_H
+                    best, best_err = (1, n_img), float('inf')
+                    for h in range(1, n_img + 1):
+                        if n_img % h == 0:
+                            w = n_img // h
+                            err = abs(w / h - target_ratio)
+                            if err < best_err:
+                                best_err, best = err, (h, w)
+                    self._img_token_h, self._img_token_w = best
+                    print(f"[AttnMap] WARN: n_img={n_img} desconhecido → "
+                          f"inferido {self._img_token_h}×{self._img_token_w}. "
+                          f"Confirme com: backbone(zeros(1,3,H,W)).shape")
 
             h_feat, w_feat = self._img_token_h, self._img_token_w
             n_rgb_tokens   = h_feat * w_feat
@@ -768,9 +787,9 @@ class AttnMapWindow:
             frame_panel = self._last_panel_display
 
         # ── placeholder enquanto não há dados ─────────────────────────
-        ph_rgb = np.zeros((545, 640, 3), dtype=np.uint8)
+        ph_rgb = np.zeros((545, 848, 3), dtype=np.uint8)
         cv2.putText(ph_rgb, "Aguardando 1a inferencia...",
-                    (110, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 1)
+                    (200, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 80, 80), 1)
 
         ph_panel = np.zeros((900, 1200, 3), dtype=np.uint8)
         cv2.putText(ph_panel, "Aguardando 1a inferencia...",

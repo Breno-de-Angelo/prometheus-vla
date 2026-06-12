@@ -14,8 +14,8 @@ def start_real_robot_cameras():
     # ==========================================================
     # CONFIGURAÇÕES DE RESOLUÇÃO
     # ==========================================================
-    HEAD_WIDTH, HEAD_HEIGHT = 640, 480
-    DEPTH_WIDTH, DEPTH_HEIGHT = 640, 480 
+    HEAD_WIDTH, HEAD_HEIGHT = 848, 480
+    DEPTH_WIDTH, DEPTH_HEIGHT = 848, 480 
     FPS = 30
 
     # ==========================================================

@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LeRobot Dataset Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+:root {
+  --bg: #0e0e10;
+  --bg2: #16161a;
+  --bg3: #1e1e24;
+  --border: rgba(255,255,255,0.08);
+  --border2: rgba(255,255,255,0.15);
+  --text: #e8e8ec;
+  --muted: #888;
+  --accent: #7c6fcd;
+  --accent2: #5ce0a8;
+  --danger: #e05c5c;
+  --warn: #e0a050;
+  --radius: 8px;
+  --radius-lg: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, 'Segoe UI', sans-serif; font-size: 14px; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+
+/* TOP BAR */
+.topbar { height: 52px; background: var(--bg2); border-bottom: 0.5px solid var(--border); display: flex; align-items: center; padding: 0 20px; gap: 20px; flex-shrink: 0; }
+.logo { font-weight: 600; font-size: 15px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.logo-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); }
+.repo-badge { font-size: 12px; color: var(--muted); background: var(--bg3); padding: 3px 10px; border-radius: 20px; border: 0.5px solid var(--border); max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-stats { display: flex; gap: 16px; margin-left: auto; font-size: 12px; color: var(--muted); }
+.stat-item { display: flex; gap: 5px; }
+.stat-val { color: var(--text); font-weight: 500; }
+
+/* MAIN LAYOUT */
+.layout { display: flex; flex: 1; overflow: hidden; }
+
+/* LEFT PANEL — episode list */
+.panel-left { width: 230px; flex-shrink: 0; background: var(--bg2); border-right: 0.5px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+.panel-header { padding: 12px 14px 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: var(--muted); text-transform: uppercase; border-bottom: 0.5px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.ep-list { flex: 1; overflow-y: auto; padding: 6px; }
+.ep-item { padding: 8px 10px; border-radius: var(--radius); cursor: pointer; display: flex; align-items: center; gap: 8px; margin-bottom: 2px; transition: background 0.1s; user-select: none; }
+.ep-item:hover { background: var(--bg3); }
+.ep-item.active { background: rgba(124, 111, 205, 0.2); border: 0.5px solid rgba(124, 111, 205, 0.4); }
+.ep-item.marked-delete { opacity: 0.45; text-decoration: line-through; }
+.ep-num { font-size: 12px; font-weight: 600; color: var(--accent); min-width: 26px; }
+.ep-info { flex: 1; min-width: 0; }
+.ep-task { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ep-len { font-size: 11px; color: var(--muted); }
+.ep-check { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--border2); flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.ep-check.checked { background: var(--danger); border-color: var(--danger); }
+.ep-check.checked::after { content: '×'; font-size: 10px; color: white; line-height: 1; }
+
+/* DELETE BAR */
+.delete-bar { padding: 10px 14px; border-top: 0.5px solid var(--border); background: var(--bg2); }
+.btn-delete { width: 100%; padding: 8px; background: rgba(224, 92, 92, 0.15); color: var(--danger); border: 0.5px solid rgba(224, 92, 92, 0.3); border-radius: var(--radius); cursor: pointer; font-size: 12px; font-weight: 500; transition: background 0.15s; }
+.btn-delete:hover { background: rgba(224, 92, 92, 0.25); }
+.btn-delete:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* CENTER — main view */
+.panel-center { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.tab-bar { display: flex; background: var(--bg2); border-bottom: 0.5px solid var(--border); padding: 0 16px; flex-shrink: 0; }
+.tab { padding: 12px 16px; font-size: 13px; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); transition: color 0.15s; user-select: none; }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab:hover:not(.active) { color: var(--text); }
+.view { flex: 1; overflow: auto; padding: 16px; display: none; }
+.view.active { display: block; }
+
+/* CAMERA VIEW */
+.cam-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.cam-card { background: var(--bg2); border: 0.5px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+.cam-label { padding: 8px 12px; font-size: 11px; color: var(--muted); font-weight: 500; border-bottom: 0.5px solid var(--border); }
+.cam-img { width: 100%; display: block; background: var(--bg3); min-height: 160px; object-fit: contain; }
+.cam-loading { min-height: 160px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }
+
+/* FRAME SCRUBBER */
+.scrubber-bar { background: var(--bg2); border-top: 0.5px solid var(--border); padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.scrubber-bar input[type=range] { flex: 1; accent-color: var(--accent); }
+.frame-counter { font-size: 12px; color: var(--muted); min-width: 80px; text-align: right; }
+.play-btn { width: 28px; height: 28px; border-radius: 50%; background: var(--accent); border: none; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 10px; }
+.play-btn:hover { opacity: 0.85; }
+.fps-select { font-size: 12px; color: var(--muted); background: var(--bg3); border: 0.5px solid var(--border); border-radius: 4px; padding: 3px 6px; }
+
+/* DATA CHARTS */
+.chart-section { margin-bottom: 24px; }
+.chart-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+.chart-wrap { background: var(--bg2); border: 0.5px solid var(--border); border-radius: var(--radius-lg); padding: 12px; }
+
+/* PRESSURE HEATMAP */
+.pressure-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pressure-card { background: var(--bg2); border: 0.5px solid var(--border); border-radius: var(--radius-lg); padding: 12px; }
+.pressure-title { font-size: 11px; color: var(--muted); margin-bottom: 8px; font-weight: 500; }
+canvas.heatmap { width: 100%; display: block; border-radius: 4px; image-rendering: pixelated; }
+
+/* INFO / FEATURES VIEW */
+.info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin-bottom: 20px; }
+.info-card { background: var(--bg2); border: 0.5px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.info-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.info-val { font-size: 18px; font-weight: 600; color: var(--text); }
+.feat-list { background: var(--bg2); border: 0.5px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+.feat-row { display: flex; align-items: center; padding: 8px 12px; border-bottom: 0.5px solid var(--border); gap: 10px; }
+.feat-row:last-child { border-bottom: none; }
+.feat-key { font-size: 12px; font-family: monospace; color: var(--accent2); flex: 1; }
+.feat-dtype { font-size: 11px; color: var(--muted); }
+.feat-shape { font-size: 11px; color: var(--warn); }
+
+/* LOADING / ERROR */
+.center-msg { display: flex; align-items: center; justify-content: center; height: 200px; color: var(--muted); flex-direction: column; gap: 8px; }
+.loading-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }
+.toast { position: fixed; bottom: 20px; right: 20px; background: var(--bg3); border: 0.5px solid var(--border2); border-radius: var(--radius); padding: 10px 16px; font-size: 13px; z-index: 100; opacity: 0; transform: translateY(8px); transition: all 0.2s; }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.err { border-color: rgba(224, 92, 92, 0.5); color: var(--danger); }
+.toast.ok { border-color: rgba(92, 224, 168, 0.5); color: var(--accent2); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+
+.ep-search { width: 100%; padding: 6px 10px; background: var(--bg3); border: 0.5px solid var(--border); border-radius: var(--radius); color: var(--text); font-size: 12px; margin-bottom: 6px; }
+.ep-search:focus { outline: none; border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo"><div class="logo-dot"></div> LeRobot Viewer</div>
+  <div class="repo-badge" id="repoBadge">Conectando...</div>
+  <div class="topbar-stats" id="topStats"></div>
+</div>
+
+<div class="layout">
+  <!-- LEFT: Episode List -->
+  <div class="panel-left">
+    <div class="panel-header">
+      Episódios
+      <span id="selCount" style="color:var(--danger);font-size:11px;"></span>
+    </div>
+    <div style="padding: 6px 6px 0;">
+      <input class="ep-search" id="epSearch" placeholder="Buscar task..." />
+    </div>
+    <div class="ep-list" id="epList"></div>
+    <div class="delete-bar">
+      <button class="btn-delete" id="btnDelete" disabled onclick="deleteSelected()">
+        Deletar episódios selecionados
+      </button>
+    </div>
+  </div>
+
+  <!-- CENTER -->
+  <div class="panel-center">
+    <div class="tab-bar">
+      <div class="tab active" onclick="switchTab('cameras')">Câmeras</div>
+      <div class="tab" onclick="switchTab('charts')">Dados</div>
+      <div class="tab" onclick="switchTab('pressure')">Pressão Tátil</div>
+      <div class="tab" onclick="switchTab('info')">Dataset Info</div>
+    </div>
+
+    <!-- CAMERAS TAB -->
+    <div class="view active" id="view-cameras">
+      <div class="cam-grid" id="camGrid">
+        <div class="center-msg"><div class="loading-dot"></div><span>Selecione um episódio</span></div>
+      </div>
+    </div>
+
+    <!-- CHARTS TAB -->
+    <div class="view" id="view-charts">
+      <div id="chartsContent">
+        <div class="center-msg"><span>Selecione um episódio para ver os dados</span></div>
+      </div>
+    </div>
+
+    <!-- PRESSURE TAB -->
+    <div class="view" id="view-pressure">
+      <div style="margin-bottom: 12px; font-size: 12px; color: var(--muted);">
+        Frame atual — pressão tátil nas 33 células de cada mão
+      </div>
+      <div class="pressure-row">
+        <div class="pressure-card">
+          <div class="pressure-title">Mão Esquerda</div>
+          <canvas id="hmLeft" class="heatmap" width="165" height="165"></canvas>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px;" id="statLeft">—</div>
+        </div>
+        <div class="pressure-card">
+          <div class="pressure-title">Mão Direita</div>
+          <canvas id="hmRight" class="heatmap" width="165" height="165"></canvas>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px;" id="statRight">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- INFO TAB -->
+    <div class="view" id="view-info">
+      <div id="infoContent">
+        <div class="center-msg"><div class="loading-dot"></div></div>
+      </div>
+    </div>
+
+    <!-- SCRUBBER -->
+    <div class="scrubber-bar" id="scrubberBar">
+      <button class="play-btn" id="playBtn" onclick="togglePlay()">▶</button>
+      <select class="fps-select" id="fpsSelect">
+        <option value="5">5 fps</option>
+        <option value="10" selected>10 fps</option>
+        <option value="20">20 fps</option>
+        <option value="30">30 fps</option>
+      </select>
+      <input type="range" id="frameSlider" min="0" max="0" value="0" oninput="onScrub(this.value)">
+      <div class="frame-counter" id="frameCounter">— / —</div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = 'http://localhost:7860';
+let dsInfo = null;
+let currentEp = null;
+let currentEpData = null;
+let currentFrame = 0;
+let playing = false;
+let playInterval = null;
+let selectedEpisodes = new Set();
+let chartInstances = {};
+let epDataCache = {};
+let allEpisodes = [];
+
+async function fetchJSON(url) {
+  const r = await fetch(API + url);
+  return r.json();
+}
+
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + type;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = 'toast', 2800);
+}
+
+/* ─── INIT ─── */
+async function init() {
+  try {
+    dsInfo = await fetchJSON('/api/info');
+    if (dsInfo.error) { toast('Erro: ' + dsInfo.error, 'err'); return; }
+    
+    document.getElementById('repoBadge').textContent = dsInfo.repo_id;
+    document.getElementById('topStats').innerHTML = `
+      <div class="stat-item"><span>Episódios</span><span class="stat-val">${dsInfo.total_episodes}</span></div>
+      <div class="stat-item"><span>Frames</span><span class="stat-val">${dsInfo.total_frames}</span></div>
+      <div class="stat-item"><span>FPS</span><span class="stat-val">${dsInfo.fps}</span></div>
+    `;
+    
+    allEpisodes = dsInfo.episodes;
+    renderEpList(allEpisodes);
+    renderInfo();
+    
+    if (allEpisodes.length > 0) selectEpisode(0);
+  } catch(e) {
+    toast('Não foi possível conectar ao servidor Python (porta 7860). Inicie lerobot_viz_server.py', 'err');
+    document.getElementById('repoBadge').textContent = 'Servidor desconectado';
+  }
+}
+
+/* ─── EPISODE LIST ─── */
+function renderEpList(episodes) {
+  const list = document.getElementById('epList');
+  list.innerHTML = episodes.map(ep => `
+    <div class="ep-item ${ep.index === currentEp ? 'active' : ''} ${selectedEpisodes.has(ep.index) ? 'marked-delete' : ''}"
+         id="ep-item-${ep.index}" onclick="selectEpisode(${ep.index})">
+      <div class="ep-num">${String(ep.index).padStart(3,'0')}</div>
+      <div class="ep-info">
+        <div style="font-size:12px;color:var(--text)">${ep.length} frames</div>
+        <div class="ep-task">${ep.task || '—'}</div>
+      </div>
+      <div class="ep-check ${selectedEpisodes.has(ep.index) ? 'checked' : ''}"
+           id="chk-${ep.index}"
+           onclick="event.stopPropagation(); toggleSelect(${ep.index})"></div>
+    </div>
+  `).join('');
+}
+
+document.getElementById('epSearch').addEventListener('input', function() {
+  const q = this.value.toLowerCase();
+  const filtered = allEpisodes.filter(ep => 
+    String(ep.index).includes(q) || (ep.task || '').toLowerCase().includes(q)
+  );
+  renderEpList(filtered);
+});
+
+function toggleSelect(idx) {
+  if (selectedEpisodes.has(idx)) selectedEpisodes.delete(idx);
+  else selectedEpisodes.add(idx);
+  
+  const item = document.getElementById('ep-item-' + idx);
+  const chk = document.getElementById('chk-' + idx);
+  if (item) item.classList.toggle('marked-delete', selectedEpisodes.has(idx));
+  if (chk) chk.classList.toggle('checked', selectedEpisodes.has(idx));
+  
+  const n = selectedEpisodes.size;
+  document.getElementById('selCount').textContent = n > 0 ? `${n} selecionado${n>1?'s':''}` : '';
+  document.getElementById('btnDelete').disabled = n === 0;
+}
+
+/* ─── EPISODE SELECT ─── */
+async function selectEpisode(idx) {
+  currentEp = idx;
+  currentFrame = 0;
+  stopPlay();
+  
+  document.querySelectorAll('.ep-item').forEach(el => el.classList.remove('active'));
+  const el = document.getElementById('ep-item-' + idx);
+  if (el) { el.classList.add('active'); el.scrollIntoView({block:'nearest'}); }
+  
+  const ep = allEpisodes.find(e => e.index === idx);
+  if (!ep) return;
+  
+  const frameSlider = document.getElementById('frameSlider');
+  frameSlider.max = ep.length - 1;
+  frameSlider.value = 0;
+  document.getElementById('frameCounter').textContent = `0 / ${ep.length - 1}`;
+  
+  updateCameras(0);
+  
+  if (!epDataCache[idx]) {
+    epDataCache[idx] = fetchJSON('/api/episode?index=' + idx);
+  }
+  currentEpData = await epDataCache[idx];
+  
+  renderCharts();
+  updatePressure(0);
+}
+
+/* ─── FRAME SCRUB ─── */
+function onScrub(val) {
+  currentFrame = parseInt(val);
+  const ep = allEpisodes.find(e => e.index === currentEp);
+  const total = ep ? ep.length - 1 : 0;
+  document.getElementById('frameCounter').textContent = `${currentFrame} / ${total}`;
+  updateCameras(currentFrame);
+  updatePressure(currentFrame);
+}
+
+function togglePlay() {
+  if (playing) stopPlay();
+  else startPlay();
+}
+
+function startPlay() {
+  playing = true;
+  document.getElementById('playBtn').textContent = '⏸';
+  const fps = parseInt(document.getElementById('fpsSelect').value);
+  playInterval = setInterval(() => {
+    const ep = allEpisodes.find(e => e.index === currentEp);
+    if (!ep) return stopPlay();
+    let next = currentFrame + 1;
+    if (next >= ep.length) { next = 0; }
+    currentFrame = next;
+    const slider = document.getElementById('frameSlider');
+    slider.value = next;
+    onScrub(next);
+  }, 1000 / fps);
+}
+
+function stopPlay() {
+  playing = false;
+  document.getElementById('playBtn').textContent = '▶';
+  clearInterval(playInterval);
+}
+
+/* ─── CAMERAS ─── */
+function updateCameras(frame) {
+  if (currentEp === null || !dsInfo) return;
+  const cameras = dsInfo.camera_keys;
+  if (!cameras || cameras.length === 0) {
+    document.getElementById('camGrid').innerHTML = '<div class="center-msg"><span>Sem câmeras neste dataset</span></div>';
+    return;
+  }
+  
+  const grid = document.getElementById('camGrid');
+  
+  if (!grid.dataset.built || parseInt(grid.dataset.ep) !== currentEp) {
+    grid.innerHTML = cameras.map(cam => `
+      <div class="cam-card">
+        <div class="cam-label">${cam.replace('observation.images.','')}</div>
+        <div class="cam-loading" id="cam-loading-${btoa(cam).replace(/=/g,'')}">Carregando...</div>
+        <img class="cam-img" id="cam-img-${btoa(cam).replace(/=/g,'')}" style="display:none" />
+      </div>
+    `).join('');
+    grid.dataset.built = '1';
+    grid.dataset.ep = currentEp;
+  }
+  
+  cameras.forEach(cam => {
+    const safeId = btoa(cam).replace(/=/g,'');
+    const img = document.getElementById('cam-img-' + safeId);
+    const loading = document.getElementById('cam-loading-' + safeId);
+    if (!img) return;
+    
+    const url = `${API}/api/image?episode=${currentEp}&frame=${frame}&camera=${encodeURIComponent(cam)}&t=${Date.now()}`;
+    const tempImg = new Image();
+    tempImg.onload = () => {
+      img.src = tempImg.src;
+      img.style.display = 'block';
+      if (loading) loading.style.display = 'none';
+    };
+    tempImg.onerror = () => {
+      if (loading) loading.textContent = 'Erro ao carregar';
+    };
+    tempImg.src = url;
+  });
+}
+
+/* ─── CHARTS ─── */
+function renderCharts() {
+  if (!currentEpData) return;
+  const container = document.getElementById('chartsContent');
+  
+  Object.values(chartInstances).forEach(c => c.destroy());
+  chartInstances = {};
+  
+  const { action, state, timestamps } = currentEpData;
+  const hasAction = action && action.length > 0;
+  const hasState = state && state.length > 0;
+  
+  if (!hasAction && !hasState) {
+    container.innerHTML = '<div class="center-msg"><span>Sem dados de action/state neste episódio</span></div>';
+    return;
+  }
+  
+  let html = '';
+  if (hasAction) html += `<div class="chart-section"><div class="chart-title">Action (${action[0].length} juntas)</div><div class="chart-wrap"><div style="position:relative;height:${Math.min(action[0].length * 20 + 80, 320)}px"><canvas id="chartAction" role="img" aria-label="Gráfico de ações ao longo do episódio"></canvas></div></div></div>`;
+  if (hasState) html += `<div class="chart-section"><div class="chart-title">Observation State (${state[0].length} dims)</div><div class="chart-wrap"><div style="position:relative;height:${Math.min(state[0].length * 20 + 80, 320)}px"><canvas id="chartState" role="img" aria-label="Gráfico de estado ao longo do episódio"></canvas></div></div></div>`;
+  container.innerHTML = html;
+  
+  const palette = ['#7c6fcd','#5ce0a8','#e0a050','#e05c5c','#60b8e0','#c060e0','#e0c060','#60e0c0',
+                    '#a060e0','#e06090','#90e060','#6090e0','#e09060','#60e090','#9060e0'];
+  
+  if (hasAction) {
+    const dims = action[0].length;
+    const datasets = Array.from({length: Math.min(dims, 15)}, (_, i) => ({
+      label: `J${i}`,
+      data: action.map(f => f[i]),
+      borderColor: palette[i % palette.length],
+      borderWidth: 1,
+      pointRadius: 0,
+      tension: 0.2,
+      borderDash: i >= 8 ? [3,3] : undefined,
+    }));
+    chartInstances['action'] = new Chart(document.getElementById('chartAction'), {
+      type: 'line',
+      data: { labels: timestamps.map(t => t.toFixed(2)), datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: dims <= 10, labels: { color: '#888', font: {size:10}, boxWidth:10 } } },
+        scales: {
+          x: { ticks: { color: '#666', maxTicksLimit: 8, font:{size:10} }, grid: { color: 'rgba(255,255,255,0.04)' } },
+          y: { ticks: { color: '#666', font:{size:10} }, grid: { color: 'rgba(255,255,255,0.04)' } }
+        }
+      }
+    });
+  }
+  
+  if (hasState) {
+    const dims = state[0].length;
+    const datasets = Array.from({length: Math.min(dims, 15)}, (_, i) => ({
+      label: `S${i}`,
+      data: state.map(f => f[i]),
+      borderColor: palette[i % palette.length],
+      borderWidth: 1,
+      pointRadius: 0,
+      tension: 0.2,
+      borderDash: i >= 8 ? [3,3] : undefined,
+    }));
+    chartInstances['state'] = new Chart(document.getElementById('chartState'), {
+      type: 'line',
+      data: { labels: timestamps.map(t => t.toFixed(2)), datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: dims <= 10, labels: { color: '#888', font:{size:10}, boxWidth:10 } } },
+        scales: {
+          x: { ticks: { color: '#666', maxTicksLimit: 8, font:{size:10} }, grid: { color: 'rgba(255,255,255,0.04)' } },
+          y: { ticks: { color: '#666', font:{size:10} }, grid: { color: 'rgba(255,255,255,0.04)' } }
+        }
+      }
+    });
+  }
+}
+
+/* ─── PRESSURE HEATMAP ─── */
+function updatePressure(frame) {
+  if (!currentEpData) return;
+  const { pressure_left, pressure_right } = currentEpData;
+  
+  if ((!pressure_left || pressure_left.length === 0) && (!pressure_right || pressure_right.length === 0)) {
+    return;
+  }
+  
+  const frameIdx = Math.min(frame, (pressure_left || pressure_right || []).length - 1);
+  
+  if (pressure_left && pressure_left.length > 0) {
+    drawHeatmap('hmLeft', pressure_left[frameIdx], 'statLeft');
+  }
+  if (pressure_right && pressure_right.length > 0) {
+    drawHeatmap('hmRight', pressure_right[frameIdx], 'statRight');
+  }
+}
+
+function drawHeatmap(canvasId, data, statId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || !data) return;
+  const ctx = canvas.getContext('2d');
+  const n = Math.ceil(Math.sqrt(data.length));
+  const cellSize = Math.floor(165 / n);
+  
+  canvas.width = n * cellSize;
+  canvas.height = n * cellSize;
+  
+  const maxVal = Math.max(...data, 1);
+  
+  data.forEach((val, i) => {
+    const row = Math.floor(i / n);
+    const col = i % n;
+    const intensity = val / maxVal;
+    const r = Math.round(intensity * 224 + (1-intensity) * 14);
+    const g = Math.round(intensity * 92 + (1-intensity) * 30);
+    const b = Math.round(intensity * 92 + (1-intensity) * 60);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(col * cellSize, row * cellSize, cellSize - 1, cellSize - 1);
+    
+    if (cellSize > 16 && val > maxVal * 0.2) {
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = `${Math.max(8, cellSize - 6)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(Math.round(val), col * cellSize + cellSize/2, row * cellSize + cellSize/2);
+    }
+  });
+  
+  const max = Math.max(...data).toFixed(0);
+  const sum = data.reduce((a,b) => a+b, 0).toFixed(0);
+  const active = data.filter(v => v > 0).length;
+  document.getElementById(statId).textContent = `Max: ${max} | Soma: ${sum} | Células ativas: ${active}/33`;
+}
+
+/* ─── INFO VIEW ─── */
+function renderInfo() {
+  if (!dsInfo) return;
+  const features = dsInfo.features || {};
+  const ep = allEpisodes;
+  
+  const avgLen = ep.length > 0 ? Math.round(ep.reduce((s, e) => s + e.length, 0) / ep.length) : 0;
+  const avgSec = dsInfo.fps > 0 ? (avgLen / dsInfo.fps).toFixed(1) : 0;
+  
+  document.getElementById('infoContent').innerHTML = `
+    <div class="info-grid">
+      <div class="info-card"><div class="info-label">Episódios</div><div class="info-val">${dsInfo.total_episodes}</div></div>
+      <div class="info-card"><div class="info-label">Total Frames</div><div class="info-val">${dsInfo.total_frames}</div></div>
+      <div class="info-card"><div class="info-label">FPS</div><div class="info-val">${dsInfo.fps}</div></div>
+      <div class="info-card"><div class="info-label">Média frames/ep</div><div class="info-val">${avgLen}</div></div>
+      <div class="info-card"><div class="info-label">Duração média</div><div class="info-val">${avgSec}s</div></div>
+      <div class="info-card"><div class="info-label">Câmeras</div><div class="info-val">${dsInfo.camera_keys.length}</div></div>
+    </div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em">Features do Dataset</div>
+    <div class="feat-list">
+      ${Object.entries(features).map(([key, feat]) => `
+        <div class="feat-row">
+          <div class="feat-key">${key}</div>
+          <div class="feat-dtype">${feat.dtype || '—'}</div>
+          <div class="feat-shape">${feat.shape ? JSON.stringify(feat.shape) : '—'}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+/* ─── TAB SWITCH ─── */
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    const names = ['cameras','charts','pressure','info'];
+    t.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+  
+  if (name === 'charts' && currentEpData) renderCharts();
+  if (name === 'pressure' && currentEpData) updatePressure(currentFrame);
+}
+
+/* ─── DELETE ─── */
+async function deleteSelected() {
+  const indices = [...selectedEpisodes];
+  if (indices.length === 0) return;
+  
+  if (!confirm(`Deletar ${indices.length} episódio(s): [${indices.join(', ')}]?\n\nEsta operação é IRREVERSÍVEL.`)) return;
+  
+  try {
+    const r = await fetch(API + '/api/delete_episodes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episode_indices: indices })
+    });
+    const data = await r.json();
+    if (data.error) { toast('Erro: ' + data.error, 'err'); return; }
+    
+    toast(`✓ ${data.message}`, 'ok');
+    selectedEpisodes.clear();
+    epDataCache = {};
+    currentEp = null;
+    currentEpData = null;
+    
+    dsInfo = await fetchJSON('/api/info');
+    allEpisodes = dsInfo.episodes;
+    renderEpList(allEpisodes);
+    renderInfo();
+    document.getElementById('topStats').innerHTML = `
+      <div class="stat-item"><span>Episódios</span><span class="stat-val">${dsInfo.total_episodes}</span></div>
+      <div class="stat-item"><span>Frames</span><span class="stat-val">${dsInfo.total_frames}</span></div>
+      <div class="stat-item"><span>FPS</span><span class="stat-val">${dsInfo.fps}</span></div>
+    `;
+    document.getElementById('btnDelete').disabled = true;
+    document.getElementById('selCount').textContent = '';
+    
+    if (allEpisodes.length > 0) selectEpisode(0);
+  } catch(e) {
+    toast('Erro ao deletar: ' + e.message, 'err');
+  }
+}
+
+init();
+</script>
+</body>
+</html>

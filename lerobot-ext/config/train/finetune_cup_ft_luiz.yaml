@@ -1,0 +1,175 @@
+# ==========================================================
+# FINE-TUNE — pick_up_the_cup (rede completa → mais posições)
+#
+# BASE : train_output/pick_up_the_cup_depth-260610/best_val_checkpoint
+#         → rede do Miguel: pega a xícara E coloca no lugar ✅
+#
+# NOVO DADO: dataset_g1_cup_convertido (Luiz, 96 eps)
+#         → mais variações de posição de pegada
+#         → só pega, não coloca — mas não tem problema pois
+#           a base já sabe colocar; o fine-tune só refina a pegada
+#
+# FREEZE: vision + depth congelados (já sabem ver bem)
+# LIVRE : state encoder + action head (aprendem novas posições)
+# ==========================================================
+
+task_name: "pick_up_the_cup_depth_ft_luiz"
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO — dataset do Luiz
+# ==========================================================
+dataset:
+  repo_id: Mrwlker/dataset_g1_cup_convertido
+  root: meu_dataset/dataset_g1_cup_convertido
+  episodes: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96]
+
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO — dataset do Luiz (eps reservados)
+# ==========================================================
+val_dataset:
+  repo_id: Mrwlker/dataset_g1_cup_convertido
+  root: meu_dataset/dataset_g1_cup_convertido
+  episodes: [45, 25, 5, 66, 53]   # mesmos que o treino original do luiz usou
+
+
+# ==========================================================
+# 3. POLÍTICA — mesma arquitetura do checkpoint base
+# ==========================================================
+policy:
+  type: actdepth
+  repo_id: Mrwlker/pick_up_the_cup_depth
+  push_to_hub: false
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [3, 480, 848]
+    observation.state:
+      type: STATE
+      shape: [28]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [28]
+
+  chunk_size: 100
+  n_action_steps: 100
+  n_obs_steps: 1
+  use_amp: true
+
+  use_depth_3d: true
+  camera_intrinsics:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+  pointnet_num_points: 1024
+
+  use_pressure: false
+  pressure_feature_dim: 66
+  pressure_hidden_dim: 256
+
+  scene_uncertainty_threshold: 0.0
+
+  dropout: 0.1
+  optimizer_weight_decay: 1e-4
+  kl_weight: 10.0
+
+  dim_model: 512
+  n_heads: 4
+  dim_feedforward: 3200
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+
+
+# ==========================================================
+# 4. FREEZE SELETIVO
+# ==========================================================
+# Vision e depth: já sabem ver a xícara e o espaço 3D — congelados
+# State encoder e action head: livres para aprender as novas posições
+# do dataset do Luiz sem apagar o comportamento de "colocar" da sua rede
+freeze_vision_encoder: true
+freeze_depth_encoder: true
+freeze_state_encoder: false
+freeze_action_head: false
+
+
+# ==========================================================
+# 5. CONFIGURAÇÕES DE TREINAMENTO
+# ==========================================================
+output_dir: "train_output/pick_up_the_cup_depth_ft_luiz"
+
+# ~91 eps de treino, batch 32 → ~1 epoch ≈ 182 steps
+# 30k steps ≈ ~165 epochs — bom ponto de partida
+steps: 30000
+
+batch_size: 32
+num_workers: 8
+log_freq: 50
+save_freq: 2000
+save_checkpoint: false
+
+# LR bem menor que o treino original — preserva o comportamento de "colocar"
+optimizer:
+  lr: 5.0e-6
+  lr_scheduler: cosine
+  lr_warmup_steps: 300
+
+save_best_checkpoint: true
+
+# Para se estagnar em 10 avaliações consecutivas
+early_stop_patience: 10
+early_stop_min_delta: 0.0005
+
+neutral_position_loss_weight: 0.0
+
+
+# ==========================================================
+# 6. AVALIAÇÃO E LOGS
+# ==========================================================
+eval_freq: 250
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  run_name: "ft-luiz-freeze-vis-depth"
+  disable_artifact: true
+
+
+# ==========================================================
+# COMO RODAR:
+#
+#   python finetune_from_checkpoint.py \
+#       --checkpoint_path=train_output/pick_up_the_cup_depth-260610/best_val_checkpoint \
+#       --config_path=finetune_cup_ft_luiz.yaml
+#
+# O QUE ESPERAR:
+#   - Primeiros ~5k steps: val_loss cai rápido (adaptando ao dataset do Luiz)
+#   - 5k–20k steps: convergência gradual nas novas posições de pegada
+#   - Se o robô parar de "colocar" no mundo real: o lr está alto demais
+#     → solução: reduza lr para 1e-6 e reinicie do checkpoint base
+# ==========================================================

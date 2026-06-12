@@ -81,6 +81,14 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     early_stop_patience: int = 0
     # Melhora mínima relativa para contar como progresso (ex: 0.001 = 0.1%)
     early_stop_min_delta: float = 0.001
+    # ── Freeze seletivo de encoders (fine-tune) ──────────────
+    # Congela individualmente cada encoder durante o fine-tune.
+    # True  = pesos congelados (não atualizam durante treino)
+    # False = pesos livres (padrão — treino normal)
+    freeze_vision_encoder: bool = False    # ResNet RGB
+    freeze_depth_encoder: bool = False     # PointNet depth/3D
+    freeze_state_encoder: bool = False     # MLP de estado (joints)
+    freeze_action_head: bool = False       # Decoder/cabeça de ação
 
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
@@ -313,8 +321,121 @@ def update_policy(
 
 
 # ═════════════════════════════════════════════════════════════
-# MAIN TRAIN FUNCTION
+# FREEZE SELETIVO DE ENCODERS (fine-tune)
 # ═════════════════════════════════════════════════════════════
+
+def _freeze_module(module: torch.nn.Module, label: str) -> int:
+    """Congela todos os parâmetros de um módulo. Retorna quantos tensores foram congelados."""
+    count = sum(1 for p in module.parameters() if p.requires_grad)
+    for p in module.parameters():
+        p.requires_grad_(False)
+    logging.info(colored(f"  ❄️  [{label}] congelado — {count} tensores.", "cyan"))
+    return count
+
+
+def apply_freeze_encoders(policy: torch.nn.Module, cfg: "CustomTrainPipelineConfig") -> None:
+    """
+    Congela seletivamente encoders da ACT-D com base nas flags do config.
+
+    Hierarquia real (mapeada do modeling_act.py):
+
+      freeze_vision_encoder → policy.model.backbone          (ACTBackbone — ResNet + pos embed)
+                               policy.model.encoder_img_feat_input_proj  (Conv2d de projeção)
+                               policy.model.encoder_cam_feat_pos_embed   (embed de câmera)
+
+      freeze_depth_encoder  → policy.pointnet                (PointNetEncoder — fica na ACTPolicy)
+                               policy.model.encoder_depth_input_proj     (Linear de projeção)
+                               policy.model.vae_encoder_depth_input_proj (Linear VAE, se existir)
+
+      freeze_state_encoder  → policy.model.encoder_robot_state_input_proj  (Linear joints→dim_model)
+                               policy.model.vae_encoder_robot_state_input_proj (Linear VAE)
+                               policy.model.encoder_env_state_input_proj  (Linear env, se existir)
+
+      freeze_action_head    → policy.model.decoder            (ACTDecoder — Transformer decoder)
+                               policy.model.action_head        (Linear dim_model→action_dim)
+                               policy.model.decoder_pos_embed  (Embedding posicional do decoder)
+    """
+    any_frozen = any([
+        cfg.freeze_vision_encoder,
+        cfg.freeze_depth_encoder,
+        cfg.freeze_state_encoder,
+        cfg.freeze_action_head,
+    ])
+    if not any_frozen:
+        return
+
+    logging.info(colored("\n[Freeze Encoders] Aplicando congelamento seletivo...", "cyan", attrs=["bold"]))
+
+    # policy pode estar envolvido por accelerate — pega o modelo real
+    unwrapped = policy
+    if hasattr(policy, "module"):        # DistributedDataParallel
+        unwrapped = policy.module
+    inner = getattr(unwrapped, "model", unwrapped)   # ACT (nn.Module interno)
+
+    total_frozen = 0
+
+    # ── 1. Visão RGB — ResNet (ACTBackbone) + projeções de imagem ─────────
+    if cfg.freeze_vision_encoder:
+        # backbone: ACTBackbone contém body (ResNet) + position_embedding
+        if hasattr(inner, "backbone"):
+            total_frozen += _freeze_module(inner.backbone, "VisionEncoder/backbone(ResNet+posEmbed)")
+        # Conv2d que projeta features da ResNet para dim_model
+        if hasattr(inner, "encoder_img_feat_input_proj"):
+            total_frozen += _freeze_module(inner.encoder_img_feat_input_proj, "VisionEncoder/img_feat_proj")
+        # Embedding que diferencia qual câmera gerou cada token
+        if hasattr(inner, "encoder_cam_feat_pos_embed"):
+            total_frozen += _freeze_module(inner.encoder_cam_feat_pos_embed, "VisionEncoder/cam_pos_embed")
+
+    # ── 2. Depth / PointNet ───────────────────────────────────────────────
+    if cfg.freeze_depth_encoder:
+        # PointNetEncoder fica direto na ACTPolicy (não no ACT interno)
+        if hasattr(unwrapped, "pointnet"):
+            total_frozen += _freeze_module(unwrapped.pointnet, "DepthEncoder/pointnet")
+        # Linear que projeta a feature do PointNet para o encoder principal
+        if hasattr(inner, "encoder_depth_input_proj"):
+            total_frozen += _freeze_module(inner.encoder_depth_input_proj, "DepthEncoder/encoder_depth_proj")
+        # Linear que projeta a feature do PointNet para o VAE encoder
+        if hasattr(inner, "vae_encoder_depth_input_proj"):
+            total_frozen += _freeze_module(inner.vae_encoder_depth_input_proj, "DepthEncoder/vae_depth_proj")
+
+    # ── 3. Estado — joints/propriocepção ──────────────────────────────────
+    if cfg.freeze_state_encoder:
+        # Projeção do estado do robô para o encoder principal
+        if hasattr(inner, "encoder_robot_state_input_proj"):
+            total_frozen += _freeze_module(inner.encoder_robot_state_input_proj, "StateEncoder/robot_state_proj")
+        # Projeção do estado do robô para o VAE encoder
+        if hasattr(inner, "vae_encoder_robot_state_input_proj"):
+            total_frozen += _freeze_module(inner.vae_encoder_robot_state_input_proj, "StateEncoder/vae_robot_state_proj")
+        # Projeção de estado de ambiente (opcional — só existe se o dataset tiver env_state)
+        if hasattr(inner, "encoder_env_state_input_proj"):
+            total_frozen += _freeze_module(inner.encoder_env_state_input_proj, "StateEncoder/env_state_proj")
+
+    # ── 4. Cabeça de Ação — Decoder Transformer + Linear final ───────────
+    if cfg.freeze_action_head:
+        # ACTDecoder: Transformer decoder completo
+        if hasattr(inner, "decoder"):
+            total_frozen += _freeze_module(inner.decoder, "ActionHead/decoder(TransformerDecoder)")
+        # Linear final dim_model → action_dim
+        if hasattr(inner, "action_head"):
+            total_frozen += _freeze_module(inner.action_head, "ActionHead/action_head(Linear)")
+        # Embedding posicional do decoder (chunk_size tokens)
+        if hasattr(inner, "decoder_pos_embed"):
+            total_frozen += _freeze_module(inner.decoder_pos_embed, "ActionHead/decoder_pos_embed")
+
+    # ── Resumo ────────────────────────────────────────────────────────────
+    num_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    num_total     = sum(p.numel() for p in policy.parameters())
+    pct_trainable = 100.0 * num_trainable / max(num_total, 1)
+    logging.info(
+        colored(
+            f"[Freeze Encoders] Concluído. "
+            f"Parâmetros treináveis: {num_trainable:,} / {num_total:,} ({pct_trainable:.1f}%)\n",
+            "cyan", attrs=["bold"]
+        )
+    )
+
+
+
 @parser.wrap()
 def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None):
     cfg.validate()
@@ -416,7 +537,13 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
         policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
+    # ── Freeze seletivo de encoders (fine-tune) ───────────────────────
+    # Deve ocorrer ANTES de make_optimizer para que parâmetros congelados
+    # não sejam passados ao otimizador — economiza memória e acelera treino.
+    if is_main_process:
+        apply_freeze_encoders(policy, cfg)
     accelerator.wait_for_everyone()
+    # ─────────────────────────────────────────────────────────────────
 
     processor_kwargs = {}
     postprocessor_kwargs = {}
