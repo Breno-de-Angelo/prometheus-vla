@@ -3,7 +3,7 @@
 import dataclasses
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -106,6 +106,14 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     # acumular checkpoints numerados (9.1G cada). Pico de disco: ~3x um checkpoint
     # (best + last + tmp do swap atômico).
     keep_only_best_and_last: bool = False
+    # EMA (Exponential Moving Average) dos pesos — run 3 do A/B. Default OFF:
+    # com ema_enabled=False o script é no-op estrito (nenhum objeto EMA, nenhuma
+    # eval/save extra, caminho raw de validação intacto). Quando true, mantém
+    # uma cópia fp32 dos pesos com média móvel e seleciona o best por ela.
+    ema_enabled: bool = False
+    ema_decay: float = 0.999
+    ema_warmup: bool = True   # decay efetivo cresce com o step no começo
+    ema_start_step: int = 0   # só começa a atualizar a EMA a partir deste step
 
 QUANTILE_MIN_RANGE = 1e-3  # rad; abaixo disso a dim é considerada congelada
 
@@ -167,6 +175,72 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.constants import ACTION
+
+class EMA:
+    """Média móvel exponencial dos pesos treináveis (run 3 do A/B).
+
+    Guarda uma sombra em fp32 (no device do param) de cada
+    `p for p in policy.parameters() if p.requires_grad`, indexada pelo nome.
+    `apply_to` troca temporariamente os pesos vivos pelos da EMA pra avaliar/
+    exportar e restaura os pesos raw no `finally` (mesmo sob exceção).
+    """
+
+    @staticmethod
+    def _key(name: str) -> str:
+        # tolera o prefixo "module." que o DDP adiciona quando a policy vem wrapped
+        return name[len("module."):] if name.startswith("module.") else name
+
+    def __init__(self, policy, decay: float = 0.999, warmup: bool = True):
+        self.decay = float(decay)
+        self.warmup = bool(warmup)
+        self.shadow: dict[str, torch.Tensor] = {}
+        for name, p in policy.named_parameters():
+            if p.requires_grad:
+                self.shadow[self._key(name)] = p.detach().clone().float()
+
+    @torch.no_grad()
+    def update(self, policy, step: int) -> None:
+        d = min(self.decay, (1 + step) / (10 + step)) if self.warmup else self.decay
+        for name, p in policy.named_parameters():
+            if not p.requires_grad:
+                continue
+            key = self._key(name)
+            ema = self.shadow.get(key)
+            if ema is None:
+                # param novo (ex.: injeção tardia) — inicia a sombra
+                self.shadow[key] = p.detach().clone().float()
+                continue
+            ema.mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+
+    @contextmanager
+    def apply_to(self, policy):
+        # (a) guarda os pesos raw, (b) copia os pesos EMA pros params vivos,
+        # (c) yield, (d) restaura os raw no finally.
+        backup: list[tuple[Any, torch.Tensor]] = []
+        try:
+            with torch.no_grad():
+                for name, p in policy.named_parameters():
+                    ema = self.shadow.get(self._key(name))
+                    if ema is None:
+                        continue
+                    backup.append((p, p.detach().clone()))
+                    p.copy_(ema.to(dtype=p.dtype, device=p.device))
+            yield
+        finally:
+            with torch.no_grad():
+                for p, raw in backup:
+                    p.copy_(raw)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {k: v.detach().cpu() for k, v in self.shadow.items()}
+
+    def load_state_dict(self, sd: dict[str, torch.Tensor]) -> None:
+        for k, v in sd.items():
+            if k in self.shadow:
+                self.shadow[k].copy_(v.to(self.shadow[k].device).float())
+            else:
+                self.shadow[k] = v.float()
+
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -241,6 +315,22 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def export_ema_checkpoint(policy, ema, out_dir, cfg, preprocessor=None, postprocessor=None) -> None:
+    """Exporta um pretrained_model/ com os pesos EMA já embutidos (carregável por
+    um script de inferência padrão). Dentro de `ema.apply_to`, salva o policy +
+    cfg/processors do mesmo jeito que o save_checkpoint faz."""
+    out_dir = Path(out_dir)
+    with ema.apply_to(policy):
+        policy.save_pretrained(out_dir)
+        cfg.save_pretrained(out_dir)
+        if cfg.peft is not None:
+            policy.config.save_pretrained(out_dir)
+        if preprocessor is not None:
+            preprocessor.save_pretrained(out_dir)
+        if postprocessor is not None:
+            postprocessor.save_pretrained(out_dir)
 
 
 @parser.wrap()
@@ -456,6 +546,23 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
     if cfg.resume:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
+    # EMA dos pesos (run 3) — criada DEPOIS do load_training_state pra os pesos já
+    # estarem carregados e requires_grad setado. No resume, carrega a sombra de
+    # disco se existir; senão inicia dos pesos atuais. Tudo guardado por ema_enabled.
+    ema = None
+    if cfg.ema_enabled:
+        ema = EMA(policy, decay=cfg.ema_decay, warmup=cfg.ema_warmup)
+        if cfg.resume:
+            from safetensors.torch import load_file as _st_load
+
+            ema_path = Path(cfg.checkpoint_path) / "training_state" / "ema_state.safetensors"
+            if ema_path.exists():
+                ema.load_state_dict(_st_load(str(ema_path)))
+                if is_main_process:
+                    logging.info(f"EMA restaurada de {ema_path}")
+            elif is_main_process:
+                logging.info("EMA sem checkpoint prévio; iniciada dos pesos atuais")
+
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
@@ -600,6 +707,13 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         )
 
         step += 1
+
+        # EMA: atualiza a sombra logo após o optimizer.step() (feito dentro de
+        # update_policy), só quando os grads foram sincronizados (sem accum). Guardado
+        # por ema_enabled e pelo ema_start_step. Usa a policy unwrapped.
+        if ema is not None and accelerator.sync_gradients and step >= cfg.ema_start_step:
+            ema.update(accelerator.unwrap_model(policy), step)
+
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = (cfg.save_freq > 0 and step % cfg.save_freq == 0) or step == cfg.steps
@@ -645,84 +759,118 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             # modo de avaliação; policy.train() é restaurado ao fim do loop
             policy.eval()
 
-            val_loss_meter = VarianceMeter("val_loss", ":.3f")
-            val_action_mse_meter = VarianceMeter("val_action_mse", ":.4f")
-            val_metrics = {}
-            # acumuladores per-dim (action MSE e flow loss) — viram val_*_dim_XX
-            val_mse_dim_sum, val_mse_dim_n = None, 0
-            val_lpd_sum, val_lpd_n = None, 0
-
             # action_mse é caro (num_inference_steps forwards por batch), limite em
             # até N batches por eval pra não dominar o wall-clock.
             max_action_mse_batches = getattr(cfg, "val_action_mse_batches", 16)  # mais batches no action_mse pra um best menos ruidoso
-            action_mse_batches_done = 0
             policy_for_predict = accelerator.unwrap_model(policy)
 
             _EVAL_SEED = 1234   # ruído e timestep fixos no eval: val_loss comparável entre checkpoints
-            vb_idx = 0
-            with torch.no_grad():
-                for val_batch in val_dataloader:
-                    val_batch = preprocessor(val_batch)
-                    vb_idx += 1
-                    # ruído e timestep do flow-matching fixos por batch (fork_rng isola o rng do treino)
-                    with torch.random.fork_rng(devices=[0]):
-                        torch.manual_seed(_EVAL_SEED + vb_idx)
-                        with accelerator.autocast():
-                            val_loss, val_output_dict = policy.forward(val_batch)
+            # fork_rng no device atual (antes era hardcoded devices=[0])
+            _dev = [accelerator.device.index] if accelerator.device.type == "cuda" else []
 
-                    if action_mse_batches_done < max_action_mse_batches:
-                        try:
-                            # ruído inicial fixo no predict_action_chunk: val_action_mse comparável
-                            with torch.random.fork_rng(devices=[0]):
-                                torch.manual_seed(_EVAL_SEED + 100000 + vb_idx)
-                                with accelerator.autocast():
-                                    pred_actions = policy_for_predict.predict_action_chunk(val_batch)
-                            gt_actions = val_batch[ACTION].to(pred_actions.device)
-                            # gt pode vir com shape [B, chunk, dim] ou [B, dim]
-                            if gt_actions.dim() == pred_actions.dim():
-                                dim = min(pred_actions.shape[-1], gt_actions.shape[-1])
-                                sq = (pred_actions[..., :dim] - gt_actions[..., :dim]) ** 2
-                                val_action_mse_meter.update(sq.mean().item())
-                                mse_dim = sq.mean(dim=tuple(range(sq.dim() - 1))).float().cpu()
-                                val_mse_dim_sum = mse_dim if val_mse_dim_sum is None else val_mse_dim_sum + mse_dim
-                                val_mse_dim_n += 1
-                            action_mse_batches_done += 1
-                        except Exception as e:
-                            logging.warning("action_mse eval falhou: %s", e)
-                            max_action_mse_batches = 0
-                    
-                    val_loss_gathered = accelerator.gather(val_loss)
+            def _run_val_pass():
+                """Roda um passe completo no val_dataloader e devolve os medidores/
+                acumuladores. Chamado com os pesos raw e (se ema_enabled) também sob
+                ema.apply_to — mesmo seeding _EVAL_SEED pra comparabilidade."""
+                val_loss_meter = VarianceMeter("val_loss", ":.3f")
+                val_action_mse_meter = VarianceMeter("val_action_mse", ":.4f")
+                val_metrics = {}
+                # acumuladores per-dim (action MSE e flow loss) — viram val_*_dim_XX
+                val_mse_dim_sum, val_mse_dim_n = None, 0
+                val_lpd_sum, val_lpd_n = None, 0
 
-                    if val_output_dict:
-                        # loss_per_dim é LISTA (filtrada do loop de meters abaixo);
-                        # acumula aqui pra virar val_loss_dim_XX.
-                        _lpd = val_output_dict.get("loss_per_dim")
-                        if isinstance(_lpd, (list, tuple)):
-                            _lpd_t = torch.tensor(_lpd, dtype=torch.float32)
-                            val_lpd_sum = _lpd_t if val_lpd_sum is None else val_lpd_sum + _lpd_t
-                            val_lpd_n += 1
-                        for k, v in val_output_dict.items():
-                            if isinstance(v, (int, float, torch.Tensor)):
-                                if k not in val_metrics:
-                                    val_metrics[k] = AverageMeter(f"val_{k}", ":.3f")
-                                
-                                val_k_gathered = accelerator.gather(torch.tensor(v, device=val_loss.device) if not isinstance(v, torch.Tensor) else v)
-                                if accelerator.num_processes > 1:
-                                    for l in val_k_gathered:
-                                         if isinstance(l, torch.Tensor): l = l.item()
-                                         val_metrics[k].update(l)
-                                else:
-                                    if isinstance(v, torch.Tensor):
-                                        val = v.mean().item() if v.numel() > 1 else v.item()
+                _max_action_mse_batches = max_action_mse_batches
+                action_mse_batches_done = 0
+                vb_idx = 0
+                with torch.no_grad():
+                    for val_batch in val_dataloader:
+                        val_batch = preprocessor(val_batch)
+                        vb_idx += 1
+                        # ruído e timestep do flow-matching fixos por batch (fork_rng isola o rng do treino)
+                        with torch.random.fork_rng(devices=_dev):
+                            torch.manual_seed(_EVAL_SEED + vb_idx)
+                            with accelerator.autocast():
+                                val_loss, val_output_dict = policy.forward(val_batch)
+
+                        if action_mse_batches_done < _max_action_mse_batches:
+                            try:
+                                # ruído inicial fixo no predict_action_chunk: val_action_mse comparável
+                                with torch.random.fork_rng(devices=_dev):
+                                    torch.manual_seed(_EVAL_SEED + 100000 + vb_idx)
+                                    with accelerator.autocast():
+                                        pred_actions = policy_for_predict.predict_action_chunk(val_batch)
+                                gt_actions = val_batch[ACTION].to(pred_actions.device)
+                                # gt pode vir com shape [B, chunk, dim] ou [B, dim]
+                                if gt_actions.dim() == pred_actions.dim():
+                                    dim = min(pred_actions.shape[-1], gt_actions.shape[-1])
+                                    sq = (pred_actions[..., :dim] - gt_actions[..., :dim]) ** 2
+                                    val_action_mse_meter.update(sq.mean().item())
+                                    mse_dim = sq.mean(dim=tuple(range(sq.dim() - 1))).float().cpu()
+                                    val_mse_dim_sum = mse_dim if val_mse_dim_sum is None else val_mse_dim_sum + mse_dim
+                                    val_mse_dim_n += 1
+                                action_mse_batches_done += 1
+                            except Exception as e:
+                                logging.warning("action_mse eval falhou: %s", e)
+                                _max_action_mse_batches = 0
+
+                        val_loss_gathered = accelerator.gather(val_loss)
+
+                        if val_output_dict:
+                            # loss_per_dim é LISTA (filtrada do loop de meters abaixo);
+                            # acumula aqui pra virar val_loss_dim_XX.
+                            _lpd = val_output_dict.get("loss_per_dim")
+                            if isinstance(_lpd, (list, tuple)):
+                                _lpd_t = torch.tensor(_lpd, dtype=torch.float32)
+                                val_lpd_sum = _lpd_t if val_lpd_sum is None else val_lpd_sum + _lpd_t
+                                val_lpd_n += 1
+                            for k, v in val_output_dict.items():
+                                if isinstance(v, (int, float, torch.Tensor)):
+                                    if k not in val_metrics:
+                                        val_metrics[k] = AverageMeter(f"val_{k}", ":.3f")
+
+                                    val_k_gathered = accelerator.gather(torch.tensor(v, device=val_loss.device) if not isinstance(v, torch.Tensor) else v)
+                                    if accelerator.num_processes > 1:
+                                        for l in val_k_gathered:
+                                             if isinstance(l, torch.Tensor): l = l.item()
+                                             val_metrics[k].update(l)
                                     else:
-                                        val = v
-                                    val_metrics[k].update(val)
+                                        if isinstance(v, torch.Tensor):
+                                            val = v.mean().item() if v.numel() > 1 else v.item()
+                                        else:
+                                            val = v
+                                        val_metrics[k].update(val)
 
-                    if accelerator.num_processes > 1:
-                        for l in val_loss_gathered:
-                            val_loss_meter.update(l.item())
-                    else:
-                        val_loss_meter.update(val_loss.item())
+                        if accelerator.num_processes > 1:
+                            for l in val_loss_gathered:
+                                val_loss_meter.update(l.item())
+                        else:
+                            val_loss_meter.update(val_loss.item())
+
+                return {
+                    "val_loss_meter": val_loss_meter,
+                    "val_action_mse_meter": val_action_mse_meter,
+                    "val_metrics": val_metrics,
+                    "val_mse_dim_sum": val_mse_dim_sum,
+                    "val_mse_dim_n": val_mse_dim_n,
+                    "val_lpd_sum": val_lpd_sum,
+                    "val_lpd_n": val_lpd_n,
+                }
+
+            # caminho RAW (idêntico ao de sempre)
+            raw = _run_val_pass()
+            val_loss_meter = raw["val_loss_meter"]
+            val_action_mse_meter = raw["val_action_mse_meter"]
+            val_metrics = raw["val_metrics"]
+            val_mse_dim_sum = raw["val_mse_dim_sum"]
+            val_mse_dim_n = raw["val_mse_dim_n"]
+            val_lpd_sum = raw["val_lpd_sum"]
+            val_lpd_n = raw["val_lpd_n"]
+
+            # caminho EMA (só quando ema_enabled): mesmo seeding, pesos da média móvel
+            ema_res = None
+            if ema is not None:
+                with ema.apply_to(policy):
+                    ema_res = _run_val_pass()
 
             policy.train()
 
@@ -758,6 +906,53 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     val_log_dict[f"val_{k}"] = meter.avg
                     logging.info(f"  {k}: {meter.avg:.3f}")
 
+                # --- métricas EMA + gaps (só quando ema_enabled) ---
+                # Espelha raw/ema lado a lado: action_mse (+ arm/grasp), val_loss e os
+                # gaps ema_minus_raw. cur_mse_ema alimenta a seleção do best abaixo.
+                cur_mse_ema = None
+                if ema_res is not None:
+                    def _arm_grasp(mse_dim_sum, mse_dim_n):
+                        if not mse_dim_n:
+                            return None, None
+                        _md = (mse_dim_sum / mse_dim_n).tolist()
+                        if len(_md) < 8:
+                            return None, None
+                        return float(sum(_md[:7]) / 7), float(sum(_md[7:]) / len(_md[7:]))
+
+                    raw_mse = val_action_mse_meter.avg if val_action_mse_meter.count > 0 else None
+                    ema_mse_meter = ema_res["val_action_mse_meter"]
+                    cur_mse_ema = ema_mse_meter.avg if ema_mse_meter.count > 0 else None
+                    raw_arm, raw_grasp = _arm_grasp(val_mse_dim_sum, val_mse_dim_n)
+                    ema_arm, ema_grasp = _arm_grasp(ema_res["val_mse_dim_sum"], ema_res["val_mse_dim_n"])
+                    raw_loss = val_loss_meter.avg
+                    ema_loss = ema_res["val_loss_meter"].avg
+
+                    if raw_mse is not None:
+                        val_log_dict["val_action_mse_raw"] = raw_mse
+                    if cur_mse_ema is not None:
+                        val_log_dict["val_action_mse_ema"] = cur_mse_ema
+                    if raw_mse is not None and cur_mse_ema is not None:
+                        val_log_dict["val_action_mse_ema_minus_raw"] = cur_mse_ema - raw_mse
+                    if raw_arm is not None:
+                        val_log_dict["val_action_mse_arm_raw"] = raw_arm
+                    if ema_arm is not None:
+                        val_log_dict["val_action_mse_arm_ema"] = ema_arm
+                    if raw_arm is not None and ema_arm is not None:
+                        val_log_dict["val_action_mse_arm_ema_minus_raw"] = ema_arm - raw_arm
+                    if raw_grasp is not None:
+                        val_log_dict["val_action_mse_grasp_raw"] = raw_grasp
+                    if ema_grasp is not None:
+                        val_log_dict["val_action_mse_grasp_ema"] = ema_grasp
+                    if raw_grasp is not None and ema_grasp is not None:
+                        val_log_dict["val_action_mse_grasp_ema_minus_raw"] = ema_grasp - raw_grasp
+                    val_log_dict["val_loss_raw"] = raw_loss
+                    val_log_dict["val_loss_ema"] = ema_loss
+                    val_log_dict["val_loss_ema_minus_raw"] = ema_loss - raw_loss
+                    logging.info(
+                        f"  [EMA] val_action_mse raw={raw_mse} ema={cur_mse_ema} "
+                        f"val_loss raw={raw_loss:.4f} ema={ema_loss:.4f}"
+                    )
+
                 if wandb_logger:
                     wandb_logger.log_dict(val_log_dict, step, mode="eval")
                     # per-dim + flow-loss na seção separada dim_eval/
@@ -771,21 +966,26 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 # duas métricas andaram em direções OPOSTAS (flow-loss subiu 0.098→0.18
                 # enquanto o mse caiu 0.093→0.050) e o empate nunca atualizava.
                 # Fallback: sem action_mse disponível, compara só val_loss.
+                # Com ema_enabled, o best vira o val_action_mse dos pesos EMA
+                # (o que será exportado/deployado); senão, o raw de sempre.
                 cur_loss = val_loss_meter.avg
                 cur_mse = val_action_mse_meter.avg if val_action_mse_meter.count > 0 else None
+                sel_mse = cur_mse_ema if cfg.ema_enabled else cur_mse
                 if best_checkpoint_step is None:
                     is_new_best = True
-                elif cur_mse is not None and best_val_mse is not None:
-                    is_new_best = cur_mse <= best_val_mse
+                elif sel_mse is not None and best_val_mse is not None:
+                    is_new_best = sel_mse <= best_val_mse
                 else:
                     is_new_best = cur_loss <= best_val_loss
                 if is_new_best:
                     best_val_loss = cur_loss
-                    best_val_mse = cur_mse
+                    # best_val_mse rastreia a métrica que decide o best (ema mse com
+                    # ema_enabled, senão raw mse) — pra o resume comparar igual.
+                    best_val_mse = sel_mse
                     best_checkpoint_step = step
                     logging.info(
-                        f"  ↑ NEW BEST (val_action_mse) val_action_mse="
-                        f"{cur_mse if cur_mse is None else round(cur_mse, 4)} "
+                        f"  ↑ NEW BEST (val_action_mse{'_ema' if cfg.ema_enabled else ''}) "
+                        f"val_action_mse={sel_mse if sel_mse is None else round(sel_mse, 4)} "
                         f"(val_loss={cur_loss:.4f}) at step {step}"
                     )
                     # Salva CÓPIA REAL do best no momento da melhora (granularidade
@@ -811,14 +1011,37 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                             preprocessor=preprocessor,
                             postprocessor=postprocessor,
                         )
-                        # métricas do best persistidas junto (lidas no resume)
+                        # métricas do best persistidas junto (lidas no resume).
+                        # val_action_mse = métrica que decidiu o best (sel_mse); raw/ema
+                        # guardados à parte quando ema_enabled.
                         import json as _json
 
-                        (tmp_dir / "best_meta.json").write_text(_json.dumps({
+                        _meta = {
                             "step": step,
                             "val_loss": cur_loss,
-                            "val_action_mse": cur_mse,
-                        }))
+                            "val_action_mse": sel_mse,
+                        }
+                        if cfg.ema_enabled:
+                            _meta["val_action_mse_raw"] = cur_mse
+                            _meta["val_action_mse_ema"] = cur_mse_ema
+                        (tmp_dir / "best_meta.json").write_text(_json.dumps(_meta))
+                        # EMA: salva a sombra no training_state do best e exporta um
+                        # pretrained_model_ema/ com os pesos EMA embutidos (deploy).
+                        if cfg.ema_enabled and ema is not None:
+                            from safetensors.torch import save_file as _st_save
+
+                            _st_save(
+                                ema.state_dict(),
+                                str(tmp_dir / "training_state" / "ema_state.safetensors"),
+                            )
+                            export_ema_checkpoint(
+                                accelerator.unwrap_model(policy),
+                                ema,
+                                tmp_dir / "pretrained_model_ema",
+                                cfg,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                            )
                         if best_dir.is_symlink() or best_dir.is_file():
                             best_dir.unlink()
                         elif best_dir.is_dir():
@@ -868,6 +1091,15 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                         postprocessor=postprocessor,
                     )
                     update_last_checkpoint(checkpoint_dir)
+                # EMA: salva a sombra junto do checkpoint periódico (last ou numerado),
+                # no mesmo training_state/ que o save_checkpoint criou. Guardado por ema_enabled.
+                if cfg.ema_enabled and ema is not None:
+                    from safetensors.torch import save_file as _st_save
+
+                    _st_save(
+                        ema.state_dict(),
+                        str(Path(checkpoint_dir) / "training_state" / "ema_state.safetensors"),
+                    )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
