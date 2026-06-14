@@ -91,6 +91,10 @@ RIGHT_TARGET: list[float] = [0.0, -0.920, -1.74, 1.57, 1.74, 1.57, 1.74]
 #   "right14" -> ação 14 dims (7 braço + 7 dedos diretos)
 #   "right8"  -> ação 8 dims  (7 braço + 1 squeeze; dedos via RIGHT_TARGET)
 ACTION_MODE: str = "right14"
+# Dim do observation.state que o checkpoint espera (auto-detectado no load):
+#   14 -> right8/right14 (7 braço + 7 dedos medidos);  7 -> armstate7 (só braço).
+# O state_vec é montado com as 14 juntas e FATIADO pra STATE_DIM (as 7 primeiras = braço).
+STATE_DIM: int = 14
 
 
 def _soft_start_open_hand(robot, args) -> None:
@@ -165,7 +169,7 @@ def build_observation_batch(
     missing = [n for n in RIGHT14_FEATURES if n not in obs]
     if missing:
         logger.warning("juntas ausentes na observação (usando 0.0): %s", missing)
-    state_vec = [float(obs.get(n, 0.0)) for n in RIGHT14_FEATURES]
+    state_vec = [float(obs.get(n, 0.0)) for n in RIGHT14_FEATURES][:STATE_DIM]
     state_tensor = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)
 
     def to_tensor(img: np.ndarray | None, fallback_hw=(480, 848)) -> torch.Tensor:
@@ -364,6 +368,20 @@ def main():
         raise ValueError(
             f"action_dim={action_dim} não suportado por este script (esperado 8 ou 14). "
             f"Checkpoint: {args.checkpoint}")
+
+    # Auto-detect da dim do STATE (right8/right14 = 14; armstate7 = 7 só-braço).
+    global STATE_DIM
+    try:
+        STATE_DIM = int(policy.config.input_features["observation.state"].shape[0])
+    except (KeyError, AttributeError, TypeError, IndexError):
+        STATE_DIM = 14
+        logger.warning("input_features['observation.state'] ausente no config — assumindo 14 dims")
+    if STATE_DIM != 14:
+        logger.info("=" * 70)
+        logger.info("STATE DO CHECKPOINT: %d dims → fatiando state_vec[:%d] "
+                    "(só o braço, sem os dedos medidos — armstate%d)",
+                    STATE_DIM, STATE_DIM, STATE_DIM)
+        logger.info("=" * 70)
 
     # Latência: desliga gradient checkpointing (otimização de TREINO, inútil em eval)
     # e, se pedido, reduz os passos de denoising do flow-matching.
