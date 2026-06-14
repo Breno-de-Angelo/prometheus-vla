@@ -1,0 +1,186 @@
+# ==========================================================
+# CONFIGURAÇÃO DE TREINAMENTO — ACT-D IMPROVED
+# Projeto: Unitree G1 com Dex3 + Câmera de Profundidade
+#
+# NOVIDADES NESTA VERSÃO:
+#   1. save_best_checkpoint: salva automaticamente quando val_loss bate recorde
+#   2. neutral_position_loss_weight: curriculum que ensina retorno ao neutro
+#   3. scene_uncertainty_threshold: gate de incerteza VAE durante inferência
+#   4. Ctrl+C salva o estado e encerra limpo (sem configuração adicional)
+# ==========================================================
+
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
+# ==========================================================
+dataset:
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+  repo_id: Mrwlker/dataset_g1_cup_convertido
+  root: meu_dataset/dataset_g1_cup_convertido
+  episodes: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96]
+
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO
+# ==========================================================
+val_dataset:
+  repo_id: Mrwlker/dataset_g1_cup_convertido
+  root: meu_dataset/dataset_g1_cup_convertido
+  episodes: [ 45, 25, 05, 66, 53]
+
+
+# ==========================================================
+# 3. ARQUITETURA DA IA (ACT-D)
+# ==========================================================
+policy:
+  type: actdepth
+  repo_id: Mrwlker/pick_up_the_cup_depth
+  push_to_hub: false
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+
+    # Depth: processado pela PointNet, NÃO vai para a ResNet
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [3, 480, 848]
+
+    observation.state:
+      type: STATE
+      shape: [28]
+
+    #observation.left_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+
+    #observation.right_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [28]
+
+  chunk_size: 100
+  n_action_steps: 100
+  n_obs_steps: 1
+  use_amp: true
+
+  # ── ACT-D: Nuvem de Pontos 3D ──────────────────────────
+  use_depth_3d: true
+  camera_intrinsics:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+  pointnet_num_points: 1024
+
+  # ── ACT-D: Percepção Tátil ──────────────────────────────
+  use_pressure: false
+  pressure_feature_dim: 66
+  pressure_hidden_dim: 256
+
+  # ── Scene Uncertainty Gate ──────────────────────────────
+  # Durante inferência: se a incerteza VAE (desvio padrão latente médio)
+  # superar este limiar, a ação é suavemente misturada com a posição neutra.
+  # Efeito: em cenários não vistos, o robô desacelera/volta ao neutro
+  # em vez de fazer movimentos explosivos.
+  #
+  # Valores guia:
+  #   0.0  → gate desligado (comportamento original)
+  #   0.5  → ativa em cenários moderadamente incertos (recomendado para início)
+  #   0.8  → mais conservador, gate só em alta incerteza
+  #   0.3  → mais agressivo, retorno ao neutro mais frequente
+  scene_uncertainty_threshold: 0.0
+
+  # ── Anti-Overfitting (dataset pequeno) ─────────────────
+  dropout: 0.1
+  optimizer_weight_decay: 1e-4
+  kl_weight: 10.0
+
+  # ── Arquitetura Transformer ─────────────────────────────
+  dim_model: 512
+  n_heads: 4
+  dim_feedforward: 3200
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+
+  # ── Backbone Visual ────────────────────────────────────
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+
+
+# ==========================================================
+# 4. CONFIGURAÇÕES DE TREINAMENTO
+# ==========================================================
+output_dir: "train_output/pick_up_the_cup_depth-260612"
+steps: 200000
+
+batch_size: 32
+num_workers: 20
+log_freq: 50
+save_freq: 5000
+save_checkpoint: false
+early_stop_patience: 0
+early_stop_min_delta: 0.001
+
+# ── Best-Val Checkpoint ────────────────────────────────────
+# Salva automaticamente em 'output_dir/best_val_checkpoint/'
+# sempre que val_loss for o menor já visto, sem precisar apertar nada.
+# O arquivo 'best_val_meta.txt' dentro da pasta registra o step e o valor.
+save_best_checkpoint: true
+
+# ── Curriculum de Posição Neutra ───────────────────────────
+# A cada 50 steps, injeta exemplos sintéticos ensinando o robô
+# que "posição neutra = ação correta quando incerto".
+# Peso do loss: 0.3 significa 30% do loss de treino normal.
+# Coloque 0.0 para desabilitar.
+neutral_position_loss_weight: 0.0
+
+
+# ==========================================================
+# 5. AVALIAÇÃO E LOGS
+# ==========================================================
+eval_freq: 250
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  disable_artifact: true
+
+
+# ==========================================================
+# REFERÊNCIA RÁPIDA — CTRL+C
+# ==========================================================
+# Pressionar Ctrl+C UMA VEZ durante o treinamento:
+#   → Finaliza o step atual
+#   → Salva o estado em 'output_dir/emergency_checkpoint/'
+#   → Encerra o processo limpo
+#
+# Pressionar Ctrl+C DUAS VEZES:
+#   → Encerra imediatamente (sem salvar)
+#
+# ESTRUTURA DE CHECKPOINTS GERADOS:
+#   output_dir/
+#   ├── best_val_checkpoint/       ← melhor val_loss automático
+#   │   └── best_val_meta.txt      ← registra step e valor
+#   ├── emergency_checkpoint/      ← salvo no Ctrl+C
+#   └── checkpoints/step_XXXXX/    ← checkpoints periódicos (save_freq)

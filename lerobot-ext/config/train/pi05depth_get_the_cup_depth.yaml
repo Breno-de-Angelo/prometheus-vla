@@ -37,7 +37,7 @@ val_dataset:
 # ==========================================================
 policy:
   type: pi05depth
-  repo_id: Mrwlker/pick_up_the_cup_pi05_depth_20260529
+  repo_id: Mrwlker/pick_up_the_cup_pi05_depth_20260609
   push_to_hub: false
 
   # ── Modelos base ────────────────────────────────────────
@@ -97,8 +97,8 @@ policy:
       type: ACTION
       shape: [28]
 
-  chunk_size: 50
-  n_action_steps: 50
+  chunk_size: 100
+  n_action_steps: 100
   n_obs_steps: 1
 
   # ── Hiperparâmetros Flow Matching ───────────────────────
@@ -110,7 +110,7 @@ policy:
 
 
   train_expert_only: false        # ← ADICIONE ISSO
-  freeze_vision_encoder: true    # ← E ISSO
+  freeze_vision_encoder: false    # ← E ISSO
 
   # Com isso: 3B → ~300M parâmetros treináveis
   # O PaliGemma já sabe ver — só ensina o expert a agir
@@ -119,11 +119,11 @@ policy:
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_pi05_depth_20260529"
+output_dir: "train_output/pick_up_the_cup_pi05_depth_20260609"
 steps: 100000
 
 batch_size: 8
-num_workers: 0
+num_workers: 8
 log_freq: 100
 save_freq: 1000
 save_checkpoint: false
@@ -149,6 +149,7 @@ eval_freq: 100
 wandb:
   enable: true
   project: prometheus_g1
+  disable_artifact: true
 
 
 # ==========================================================

@@ -102,20 +102,20 @@ def merge_configs(base_train_config: dict, finetune_yaml: dict) -> dict:
 def patch_config_for_finetune(merged: dict, pretrained_model_path: str,
                                output_dir: str, freeze_encoder: bool) -> dict:
     """Injeta campos obrigatórios para o fine-tune funcionar corretamente."""
-    merged.setdefault("training", {})
     merged.setdefault("policy", {})
 
     # Aponta para o modelo pré-treinado
     merged["policy"]["pretrained_path"] = pretrained_model_path
 
-    # Diretório de saída do fine-tune
-    merged["training"]["output_dir"] = output_dir
+    # output_dir fica no nível raiz (não dentro de 'training')
+    merged["output_dir"] = output_dir
 
-    # Flag de fine-tune para os motores que suportam
-    merged["training"]["finetune_from_pretrained"] = True
+    # Remove bloco 'training' herdado do train_config.json do checkpoint —
+    # esse campo não existe no CustomTrainPipelineConfig do lerobot.
+    merged.pop("training", None)
 
     if freeze_encoder:
-        merged["training"]["freeze_encoder"] = True
+        merged["freeze_vision_encoder"] = True
         print("[INFO]: Encoder congelado — apenas a cabeça de ação será treinada.")
 
     return merged
@@ -190,13 +190,17 @@ def main():
     merged = merge_configs(base_config, finetune_yaml)
 
     # ── Define output_dir ──
+    # Prioridade: 1) --output_dir na linha de comando
+    #             2) output_dir definido no YAML de fine-tune
+    #             3) fallback automático com timestamp
     if args.output_dir:
         output_dir = args.output_dir
+    elif finetune_yaml.get("output_dir"):
+        output_dir = finetune_yaml["output_dir"]
     else:
         from datetime import datetime
         timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-        task_name = finetune_yaml.get("task_name", "finetune")
-        output_dir = os.path.join("train_output", f"{task_name}-ft-{timestamp}")
+        output_dir = os.path.join("train_output", f"finetune-ft-{timestamp}")
 
     print(f"[INFO]: Saída do fine-tune: {output_dir}")
 
@@ -208,8 +212,13 @@ def main():
         freeze_encoder=args.freeze_encoder,
     )
 
-    # ── Salva config mesclado como YAML temporário ──
-    tmp_config_path = save_merged_config(merged, output_dir)
+    # ── Salva config mesclado num subdiretório temporário separado ──
+    # NÃO salvar dentro do output_dir definitivo — o lerobot valida que
+    # output_dir não existe antes de iniciar o treino (resume=False).
+    # Usamos um subdiretório .ft_tmp que não conflita com essa validação.
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="ft_cfg_")
+    tmp_config_path = save_merged_config(merged, tmp_dir)
 
     # ── Detecta o tipo de política ──
     policy_type = merged.get("policy", {}).get("type", "")
