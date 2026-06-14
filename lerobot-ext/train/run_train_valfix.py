@@ -765,8 +765,14 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             policy_for_predict = accelerator.unwrap_model(policy)
 
             _EVAL_SEED = 1234   # ruído e timestep fixos no eval: val_loss comparável entre checkpoints
-            # fork_rng no device atual (antes era hardcoded devices=[0])
-            _dev = [accelerator.device.index] if accelerator.device.type == "cuda" else []
+            # fork_rng no device atual (antes era hardcoded devices=[0]). O index pode
+            # vir None quando o device é só "cuda" (single-GPU mascarada) → cai pro
+            # torch.cuda.current_device(), que é sempre um inteiro válido.
+            if accelerator.device.type == "cuda":
+                _idx = accelerator.device.index
+                _dev = [_idx if _idx is not None else torch.cuda.current_device()]
+            else:
+                _dev = []
 
             def _run_val_pass():
                 """Roda um passe completo no val_dataloader e devolve os medidores/
