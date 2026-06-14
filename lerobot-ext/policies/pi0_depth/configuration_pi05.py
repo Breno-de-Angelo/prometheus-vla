@@ -22,6 +22,8 @@ class PI05DEPTHConfig(PreTrainedConfig):
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"
 
+    override_task: str | None = None
+    
     n_obs_steps: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50

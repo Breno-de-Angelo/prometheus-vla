@@ -54,6 +54,7 @@ class Pi05DEPTHPrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    override_task: str | None = None
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -78,7 +79,10 @@ class Pi05DEPTHPrepareStateTokenizerProcessorStep(ProcessorStep):
 
         full_prompts = []
         for i, task in enumerate(tasks):
-            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            # Se o override_task foi passado no YAML, usa ele. Se não, usa o do dataset.
+            current_task = self.override_task if self.override_task is not None else task
+            
+            cleaned_text = current_task.strip().replace("_", " ").replace("\n", " ")
             state_str = " ".join(map(str, discretized_states[i]))
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             full_prompts.append(full_prompt)
@@ -135,12 +139,16 @@ def make_pi05depth_pre_post_processors(
         AddBatchDimensionProcessorStep(),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
+        # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05DEPTHPrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        Pi05DEPTHPrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim,
+            override_task=getattr(config, "override_task", None) # ← ADICIONE AQUI
+        ),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
