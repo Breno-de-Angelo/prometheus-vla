@@ -25,6 +25,56 @@ from .unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 GR00T_WBC_ROOT = Path(__file__).resolve().parent.parent  # Points to mujoco_sim_g1/
 
 
+def _apply_robot_keyframe(model, data, key_name: str = "home"):
+    """Aplica o keyframe APENAS nas juntas do robo, sem tocar no qpos de objetos da cena.
+    
+    Identifica o body 'pelvis' como raiz do robo e copia apenas os qpos
+    correspondentes aos joints da arvore do robo (floating_base + todos os joints).
+    Objetos com freejoint (copo, etc.) ficam intocados.
+    """
+    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, key_name)
+    if key_id < 0:
+        return  # keyframe nao existe, nao faz nada
+
+    key_qpos = model.key_qpos[key_id]  # qpos completo salvo no keyframe
+
+    # Iterar por todos os joints e copiar apenas os que pertencem ao robo
+    # Joints do robo: floating_base_joint + todos os joints de corpo/braco/mao
+    # Objetos da cena (copo, botao) ficam com seus valores atuais
+    robot_joint_names = {
+        "floating_base_joint",
+        # pernas
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        # cintura
+        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+        # bracos
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+        # maos
+        "left_hand_thumb_0_joint", "left_hand_thumb_1_joint", "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint", "left_hand_middle_1_joint",
+        "left_hand_index_0_joint", "left_hand_index_1_joint",
+        "right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint", "right_hand_middle_1_joint",
+        "right_hand_index_0_joint", "right_hand_index_1_joint",
+    }
+
+    for j in range(model.njnt):
+        jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        if jname not in robot_joint_names:
+            continue
+        qadr = model.jnt_qposadr[j]
+        jtype = model.jnt_type[j]
+        # free joint = 7 valores, ball = 4, slide/hinge = 1
+        nq = 7 if jtype == mujoco.mjtJoint.mjJNT_FREE else (4 if jtype == mujoco.mjtJoint.mjJNT_BALL else 1)
+        data.qpos[qadr: qadr + nq] = key_qpos[qadr: qadr + nq]
+
+
 class DefaultEnv:
     """Base environment class that handles simulation environment setup and step"""
 
@@ -86,8 +136,10 @@ class DefaultEnv:
             str(assets_root / self.config["ROBOT_SCENE"])
         )
         self.mj_data = mujoco.MjData(self.mj_model)
-        # Set valid floating base quaternion (MjData initializes qpos to zeros)
+        # Garantir quaternion valido
         self.mj_data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        # Aplicar keyframe "home" APENAS nas juntas do robo (preserva objetos da cena)
+        _apply_robot_keyframe(self.mj_model, self.mj_data, "home")
         self.mj_model.opt.timestep = self.sim_dt
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
@@ -108,7 +160,7 @@ class DefaultEnv:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model,
                     self.mj_data,
-                    key_callback=self.elastic_band.MujuocoKeyCallback,
+                    key_callback=self._make_key_callback(self.elastic_band.MujuocoKeyCallback),
                     show_left_ui=False,
                     show_right_ui=False,
                 )
@@ -118,7 +170,11 @@ class DefaultEnv:
         else:
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
-                    self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
+                    self.mj_model,
+                    self.mj_data,
+                    key_callback=self._make_key_callback(None),
+                    show_left_ui=False,
+                    show_right_ui=False,
                 )
             else:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
@@ -561,30 +617,62 @@ class DefaultEnv:
         """Get privileged observation. Should be implemented by subclasses."""
         return {}
 
-    def update_render_caches(self):
-        """Update render cache and shared memory for subprocess."""
-        # Lazy init renderers on first call (creates OpenGL context in calling thread)
-        if not self._renderers_initialized and self.offscreen:
-            self.init_renderers()
-            self._renderers_initialized = True
-            print(f"✓ Renderers initialized lazily in thread {__import__('threading').current_thread().name}")
-        
-        render_caches = {}
-        for camera_name, camera_config in self.camera_configs.items():
-            renderer = self.renderers.get(camera_name)
-            if renderer is None:
-                continue
-            if "params" in camera_config:
-                renderer.update_scene(self.mj_data, camera=camera_config["params"])
-            else:
-                renderer.update_scene(self.mj_data, camera=camera_name)
-            render_caches[camera_name + "_image"] = renderer.render()
-        
-        # Update shared memory if image publishing process is available
-        if self.image_publish_process is not None:
-            self.image_publish_process.update_shared_memory(render_caches)
+    def reset_cup(self):
+        """Reseta a xicara para a posicao inicial (mesma logica do botao fisico)."""
+        if not hasattr(self, 'cup_qpos_adr'):
+            print("Aviso: junta da xicara nao encontrada no modelo.")
+            return
 
-        return render_caches
+        # Ruído aleatório de ±5 cm
+        noise_x = np.random.uniform(-0.06, 0.06)
+        noise_y = np.random.uniform(-0.06, 0.06)
+
+        cup_idx = self.cup_qpos_adr
+        self.mj_data.qpos[cup_idx : cup_idx + 3] = [
+            0.28 + noise_x,
+            0.00 + noise_y,
+            1.10
+        ]
+
+        self.mj_data.qpos[cup_idx + 3 : cup_idx + 7] = [1.0, 0.0, 0.0, 0.0]
+
+        vel_idx = self.cup_dof_adr
+        self.mj_data.qvel[vel_idx : vel_idx + 6] = np.zeros(6)
+
+        self.button_cooldown = int(2.0 / self.sim_dt)
+
+        print(
+            f"Xicara resetada via teclado (C)! "
+            f"dx={noise_x:.3f}, dy={noise_y:.3f}"
+        )
+
+    def _make_key_callback(self, elastic_band_callback):
+        """Cria um callback GLFW unificado que intercepta teclas customizadas
+        e repassa o resto para o callback da ElasticBand (se houver).
+
+        No ABNT2, a tecla C-cedilha (C) eh reportada pelo GLFW como keycode 59.
+        Na primeira vez que cada tecla for pressionada, o keycode aparece no
+        terminal - use isso para descobrir keycodes de outras teclas.
+        """
+        self._debug_keycodes_printed = set()
+
+        def _callback(key):
+            # Debug: imprime cada keycode apenas uma vez
+            if key not in self._debug_keycodes_printed:
+                print(f"[key_callback] keycode={key}")
+                self._debug_keycodes_printed.add(key)
+
+            # Teclado ABNT2: C-cedilha -> keycode GLFW 59 (equivalente ao ; no US)
+            # Em alguns sistemas pode ser 186 - o print acima confirma qual e o seu
+            if key in (59, 186):
+                self.reset_cup()
+                return
+
+            # Repassa para a ElasticBand se existir
+            if elastic_band_callback is not None:
+                elastic_band_callback(key)
+
+        return _callback
 
     def handle_keyboard_button(self, key):
         if self.elastic_band is not None:
@@ -596,6 +684,7 @@ class DefaultEnv:
             self.update_viewer_camera()
         if key in ["up", "down", "left", "right"]:
             self.apply_perturbation(key)
+
 
     def check_fall(self):
         """Check if the robot has fallen"""
@@ -620,8 +709,9 @@ class DefaultEnv:
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
         # Set valid floating base quaternion (identity: w=1, x=y=z=0)
-        # mj_resetData sets qpos to zeros, which gives invalid [0,0,0,0] quaternion
         self.mj_data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        # Aplicar keyframe "home" APENAS nas juntas do robo (preserva objetos da cena)
+        _apply_robot_keyframe(self.mj_model, self.mj_data, "home")
         # Propagate qpos to derived quantities (xquat, xpos, etc.)
         mujoco.mj_forward(self.mj_model, self.mj_data)
 

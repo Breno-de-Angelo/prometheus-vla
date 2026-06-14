@@ -90,11 +90,11 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
         if self.is_simulation:
             self.robot_ip = "127.0.0.1"
             # Simulação: Leve e rápida para não gargalar a GPU/CPU
-            cam2_width = 640
+            cam2_width = 848
             cam2_height = 480
         else:
             # Hardware Real: Resolução máxima da Intel RealSense
-            cam2_width = 640
+            cam2_width = 848
             cam2_height = 480
 
             

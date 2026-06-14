@@ -44,6 +44,10 @@ kTopicLowState          = "rt/lowstate"
 # Porta ZMQ onde o servidor anuncia o modo ativo ("loco" ou "debug")
 _STATUS_PORT = 6004
 
+# Índice do campo de peso do arm_sdk (kNotUsedJoint na SDK oficial da Unitree)
+# motor_cmd[29].q = 1.0 ativa o controle de braço via rt/arm_sdk
+_ARM_SDK_WEIGHT_IDX = 29
+
 
 @dataclass
 class MotorState:
@@ -120,6 +124,10 @@ class UnitreeG1(Robot):
 
         self.last_action_q = {}
         self.smoothing_alpha = 0.1  # Ajuste entre 0.05 (muito suave) e 0.3 (mais responsivo)
+
+        # Modo ativo: "loco" (rt/arm_sdk) ou "debug" (rt/lowcmd)
+        # Inicializado em connect() após handshake com o servidor
+        self._active_mode = "debug"
 
     def _query_server_mode(self, robot_ip: str, timeout: float = 5.0) -> str:
         """
@@ -264,7 +272,9 @@ class UnitreeG1(Robot):
 
         else:
             # ── Robô real ─────────────────────────────────────────────────
-            self._ChannelFactoryInitialize(0)
+            # Passa robot_ip para que os sockets ZMQ apontem para o robô.
+            # O handshake abaixo busca o modo ativo na porta 6004.
+            self._ChannelFactoryInitialize(0, self.config.robot_ip)
 
         # ----------------------------------------------------------------
         # HANDSHAKE DE MODO (robô real e simulação remota):
@@ -275,6 +285,10 @@ class UnitreeG1(Robot):
             active_mode = self._query_server_mode(self.config.robot_ip)
             logger.info(f"[UnitreeG1] Modo reportado pelo servidor: '{active_mode}'")
 
+        # Salva o modo ativo — usado no send_action para manter o peso do arm_sdk
+        self._active_mode = active_mode
+
+        # Escolhe o tópico de comando baseado no modo
         if active_mode == "loco":
             lowcmd_topic = kTopicLowCommand_Motion
             logger.info("[UnitreeG1] → Usando rt/arm_sdk (High Level / WBC ativo)")
@@ -299,10 +313,13 @@ class UnitreeG1(Robot):
 
         logger.info(f"Connected {len(self._cameras)} camera(s).")
 
-        # Initialize lowcmd message
+        # ----------------------------------------------------------------
+        # Cria o objeto de mensagem AQUI — tudo que usa self.msg vem depois
+        # ----------------------------------------------------------------
         self.crc = CRC()
         self.msg = LowCmdMsg()
         self.msg.mode_pr = 0
+        print(f"[DEBUG] motor_cmd size: {len(self.msg.motor_cmd)}")
 
         # Wait for first state message to arrive
         lowstate = None
@@ -318,30 +335,41 @@ class UnitreeG1(Robot):
         self.kp = np.array(self.config.kp, dtype=np.float32)
         self.kd = np.array(self.config.kd, dtype=np.float32)
 
+        # Configura os motores baseado no modo de controle.
+        # No modo loco: WBC cuida de tudo — só controlamos os braços (idx 15..28).
+        # Cintura (12,13,14) e pernas (0..11) ficam com mode=0 para o WBC gerenciar.
+        ARM_IDX_MIN = G1_29_JointArmIndex.kLeftShoulderPitch   # 15
+        ARM_IDX_MAX = G1_29_JointArmIndex.kRightWristYaw        # 28
 
-        #  Soltas as configurações para o Carmen Controla as pernas ou o LOCO
         for id in G1_29_JointIndex:
-            motor_name = id.name.lower()
-            
-            # Se estivermos no modo upper_body ou high_level, DESLIGAMOS a força das pernas e cintura
-            # (no high_level o WBC/IA controla as pernas — não interferimos)
-            if self.config.control_mode in ("upper_body", "high_level") and ('leg' in motor_name or 'waist' in motor_name):
-                self.msg.motor_cmd[id.value].mode = 0  # 0 = Motor livre para outro controlador (WBC/Joystick)
+            is_arm = ARM_IDX_MIN <= id.value <= ARM_IDX_MAX  # índices 15..28
+
+            if not is_arm and self.config.control_mode in ("upper_body", "high_level"):
+                # Pernas + cintura: cede ao WBC completamente (mode=0 = sem torque daqui)
+                self.msg.motor_cmd[id.value].mode = 0
                 self.msg.motor_cmd[id.value].kp = 0.0
                 self.msg.motor_cmd[id.value].kd = 0.0
                 self.msg.motor_cmd[id.value].q = 0.0
+                self.msg.motor_cmd[id.value].dq = 0.0
+                self.msg.motor_cmd[id.value].tau = 0.0
             else:
-                # Comportamento normal para os braços
+                # Braços: controlados pelo modelo de ML
                 self.msg.motor_cmd[id.value].mode = 1
                 self.msg.motor_cmd[id.value].kp = self.kp[id.value]
                 self.msg.motor_cmd[id.value].kd = self.kd[id.value]
                 self.msg.motor_cmd[id.value].q = lowstate.motor_state[id.value].q
+                self.msg.motor_cmd[id.value].dq = 0.0
+                self.msg.motor_cmd[id.value].tau = 0.0
 
-        #for id in G1_29_JointIndex:
-        #    self.msg.motor_cmd[id].mode = 1
-        #    self.msg.motor_cmd[id].kp = self.kp[id.value]
-        #    self.msg.motor_cmd[id].kd = self.kd[id.value]
-        #    self.msg.motor_cmd[id].q = lowstate.motor_state[id.value].q
+        # ----------------------------------------------------------------
+        # Ativa o arm_sdk: motor_cmd[29].q=1 (kNotUsedJoint) sinaliza ao WBC
+        # que este cliente controla os braços via rt/arm_sdk.
+        # mode_pr=1 = controle por posição.
+        # ----------------------------------------------------------------
+        if active_mode == "loco":
+            self.msg.mode_pr = 1
+            self.msg.motor_cmd[_ARM_SDK_WEIGHT_IDX].q = 1.0
+            logger.info(f"[UnitreeG1] arm_sdk ativado: mode_pr=1, motor_cmd[{_ARM_SDK_WEIGHT_IDX}].q=1.0")
 
     def reset(self, default_positions: list[float] | None = None, **kwargs):
         # Reseta o corpo (braços) – isso já existe na classe pai
@@ -440,7 +468,6 @@ class UnitreeG1(Robot):
         for cam_name, cam in self._cameras.items():
             obs[cam_name] = cam.async_read()
 
-        
         return obs
 
     @property
@@ -485,32 +512,40 @@ class UnitreeG1(Robot):
             key = f"{motor.name}.q"
             if key in action:
                 target_q = action[key]
-                
-                # Inicializa se for a primeira vez. 
+
+                # Inicializa se for a primeira vez.
                 # Pega a posição ATUAL do robô para evitar um tranco no primeiro frame.
                 if key not in self.last_action_q:
                     if self._lowstate is not None:
                         self.last_action_q[key] = self._lowstate.motor_state[motor.value].q
                     else:
                         self.last_action_q[key] = target_q
-                
+
                 # 1. FILTRO: Suaviza a transição (Low-pass)
                 smoothed_q = (1 - self.smoothing_alpha) * self.last_action_q[key] + self.smoothing_alpha * target_q
-                
+
                 # 2. LIMITADOR: Garante que a variação não ultrapasse o max_delta
                 delta = smoothed_q - self.last_action_q[key]
                 delta_clipped = np.clip(delta, -max_delta, max_delta)
                 final_q = float(self.last_action_q[key] + delta_clipped)
-                
+
                 # 3. ATUALIZA ESTADO E COMANDO
                 self.last_action_q[key] = final_q
                 self.msg.motor_cmd[motor.value].q = final_q
-                
+
                 # Restante dos parâmetros...
                 self.msg.motor_cmd[motor.value].qd = 0  # Velocidade desejada zero
                 self.msg.motor_cmd[motor.value].kp = self.kp[motor.value]
                 self.msg.motor_cmd[motor.value].kd = self.kd[motor.value]
                 self.msg.motor_cmd[motor.value].tau = 0
+
+        # ----------------------------------------------------------------
+        # Reenvia o peso do arm_sdk a cada frame — mantém o WBC obedecendo.
+        # motor_cmd[29].q=1 e mode_pr=1 precisam estar presentes em todo frame.
+        # ----------------------------------------------------------------
+        if self._active_mode == "loco":
+            self.msg.mode_pr = 1
+            self.msg.motor_cmd[_ARM_SDK_WEIGHT_IDX].q = 1.0
 
         self.msg.crc = self.crc.Crc(self.msg)
         self.lowcmd_publisher.Write(self.msg)

@@ -59,6 +59,7 @@ kTopicDex3LeftCommand = "rt/dex3/left/cmd"
 kTopicDex3RightCommand = "rt/dex3/right/cmd"
 kTopicDex3LeftState = "rt/dex3/left/state"
 kTopicDex3RightState = "rt/dex3/right/state"
+kTopicLowCommand_Motion = "rt/arm_sdk"  # adiciona esta linha
 
 
 # ==============================================================================
@@ -302,10 +303,8 @@ class ChannelPublisher:
         """Initialize the publisher (no-op for ZMQ)."""
         pass
 
-    def Write(self, msg: Any) -> None:  # noqa: N802
-        """Serialize and send a command message to the robot."""
-        # Select appropriate socket based on topic
-        if self.topic == kTopicLowCommand_Debug:
+    def Write(self, msg: Any) -> None:
+        if self.topic in (kTopicLowCommand_Debug, kTopicLowCommand_Motion):  # era só kTopicLowCommand_Debug
             if _lowcmd_sock is None:
                 raise RuntimeError("ChannelFactoryInitialize must be called first")
             payload = json.dumps(lowcmd_to_dict(self.topic, msg)).encode("utf-8")

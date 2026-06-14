@@ -113,10 +113,12 @@ class ImageUtils:
 
     @staticmethod
     def decode_image(image: str) -> np.ndarray:
-        """Decode base64-encoded JPEG string to numpy image"""
+        """Decode base64-encoded JPEG string to numpy image (Returns RGB)"""
         color_data = base64.b64decode(image)
         color_array = np.frombuffer(color_data, dtype=np.uint8)
-        return cv2.imdecode(color_array, cv2.IMREAD_COLOR)
+        bgr_image = cv2.imdecode(color_array, cv2.IMREAD_COLOR)
+        # CORREÇÃO: Retorna o array em RGB nativo para o cliente
+        return cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
 
     @staticmethod
     def decode_depth_image(image: str) -> np.ndarray:

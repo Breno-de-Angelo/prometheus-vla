@@ -34,13 +34,15 @@ class ImagePublishProcess:
             # CORREÇÃO: 1 Canal para Depth, 3 Canais para RGB
             # =========================================================
             if 'depth' in camera_name.lower():
-                size = height * width * 1
+                # CORREÇÃO: 1 Canal, 16-bits (2 bytes por pixel)
+                size = height * width * 2 
                 shape = (height, width, 1)
+                dtype = np.uint16
             else:
                 size = height * width * 3
                 shape = (height, width, 3)
+                dtype = np.uint8
                 
-            dtype = np.uint8
 
             try:
                 shm = shared_memory.SharedMemory(name=target_name, create=True, size=size)
@@ -67,17 +69,9 @@ class ImagePublishProcess:
                 image = render_caches[image_key]
 
                 if 'depth' in camera_name.lower():
-                    # =========================================================
-                    # PROFUNDIDADE REAL (1 Canal)
-                    # =========================================================
-                    # O simulador (MuJoCo) manda a distância em metros.
-                    depth_clipped = np.clip(image, 0.0, 2.0)
-                    
-                    # Converte de 2.0m para a escala de 8-bits (0 a 255)
-                    depth_8bit = (depth_clipped * (255.0 / 2.0)).astype(np.uint8)
-                    
-                    # Adiciona a dimensão do canal para ficar (Height, Width, 1)
-                    processed_img = np.expand_dims(depth_8bit, axis=-1)
+                    # CORREÇÃO: O base_sim.py já entrega em uint16 (mm). 
+                    # Basta repassar a imagem diretamente.
+                    processed_img = image
                         
                 elif 'ir_' in camera_name.lower():
                     if len(image.shape) == 3 and image.shape[2] == 3:
@@ -87,11 +81,7 @@ class ImagePublishProcess:
                         processed_img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
                         
                 else:
-                    if len(image.shape) == 3 and image.shape[2] == 3:
-                        # Convertendo a imagem normal RGB para BGR para o OpenCV empacotar certo
-                        processed_img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                    else:
-                        processed_img = image
+                    processed_img = image
 
                 shm = self.shared_memory_blocks.get(camera_name)
                 if shm is None: continue
@@ -138,6 +128,9 @@ class ImagePublishProcess:
             sys.path.insert(0, root_dir)
 
         from sim.sensor_utils import ImageUtils, SensorServer
+
+        # ✅ ADICIONE ISTO AQUI, ANTES DO TRY:
+        shared_arrays, shm_blocks = {}, {}
         
         try:
             sensor_server = SensorServer()
@@ -158,7 +151,11 @@ class ImagePublishProcess:
                         
                         encoded_images = {}
                         for camera_name, image_copy in image_copies.items():
-                            encoded_images[camera_name] = ImageUtils.encode_image(image_copy)
+                            # CORREÇÃO: Roteamento correto do encoder (Lossless vs Lossy)
+                            if 'depth' in camera_name.lower():
+                                encoded_images[camera_name] = ImageUtils.encode_depth_image(image_copy)
+                            else:
+                                encoded_images[camera_name] = ImageUtils.encode_image(image_copy)
                             
                         serialized_data = {"timestamps": timestamps, "images": encoded_images}
                         sensor_server.send_message(serialized_data)

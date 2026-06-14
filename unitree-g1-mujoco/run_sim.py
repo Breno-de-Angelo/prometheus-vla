@@ -67,4 +67,3 @@ def main(n_envs=1, use_async_envs: bool = False,
 
 if __name__ == "__main__":
     main()
-
