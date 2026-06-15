@@ -30,7 +30,7 @@ from .configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-from .depth_encoder import PointNetEncoder, depth_to_pointcloud
+from .depth_encoder import build_depth_encoder, depth_to_pointcloud
 
 
 # ══════════════════════════════════════════════════════════════
@@ -78,7 +78,11 @@ class ACTPolicy(PreTrainedPolicy):
 
         # ── Módulos ACT-D (só instanciados se ativados no config) ────────────
         if config.use_depth_3d:
-            self.pointnet = PointNetEncoder(output_dim=config.dim_model)
+            # Factory seleciona o encoder baseado em config.depth_encoder_type:
+            #   "pointnet"           → PointNetEncoder  (padrão, leve)
+            #   "point_transformer"  → PointTransformerEncoder (mais robusto)
+            # Controlado 100% pelo YAML — não precisa mexer no código.
+            self.pointnet = build_depth_encoder(config)
             self.camera_intrinsics = config.camera_intrinsics
 
         if config.use_pressure:

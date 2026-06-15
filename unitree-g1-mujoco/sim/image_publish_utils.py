@@ -33,11 +33,11 @@ class ImagePublishProcess:
             # =========================================================
             # CORREÇÃO: 1 Canal para Depth, 3 Canais para RGB
             # =========================================================
+            # Agora a depth tem 3 canais e 8-bits, igualzinha à RGB
             if 'depth' in camera_name.lower():
-                # CORREÇÃO: 1 Canal, 16-bits (2 bytes por pixel)
-                size = height * width * 2 
-                shape = (height, width, 1)
-                dtype = np.uint16
+                size = height * width * 3
+                shape = (height, width, 3)
+                dtype = np.uint8
             else:
                 size = height * width * 3
                 shape = (height, width, 3)
@@ -151,11 +151,8 @@ class ImagePublishProcess:
                         
                         encoded_images = {}
                         for camera_name, image_copy in image_copies.items():
-                            # CORREÇÃO: Roteamento correto do encoder (Lossless vs Lossy)
-                            if 'depth' in camera_name.lower():
-                                encoded_images[camera_name] = ImageUtils.encode_depth_image(image_copy)
-                            else:
-                                encoded_images[camera_name] = ImageUtils.encode_image(image_copy)
+                            # Usa encode_image para TUDO (incluindo depth), igual no robô real
+                            encoded_images[camera_name] = ImageUtils.encode_image(image_copy)
                             
                         serialized_data = {"timestamps": timestamps, "images": encoded_images}
                         sensor_server.send_message(serialized_data)

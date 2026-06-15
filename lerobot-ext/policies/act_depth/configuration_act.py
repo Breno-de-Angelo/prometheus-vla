@@ -86,21 +86,57 @@ class ACTConfig(PreTrainedConfig):
     chunk_size: int = 100
     n_action_steps: int = 100
 
-    # ==========================================
-    # Configurações Nativas do ACT-D (Depth e Tato)
-    # ==========================================
+    # ══════════════════════════════════════════════════════════
+    # Configurações ACT-D: Depth 3D e Tato
+    # ══════════════════════════════════════════════════════════
+
     use_depth_3d: bool = True
     camera_intrinsics: dict = field(
         default_factory=lambda: {'fx': 600.0, 'fy': 600.0, 'cx': 320.0, 'cy': 240.0}
     )
     pointnet_num_points: int = 1024
 
+    # ── Seleção do encoder de profundidade ──────────────────
+    # Valores aceitos no YAML:
+    #   depth_encoder_type: "pointnet"           # padrão — leve e rápido
+    #   depth_encoder_type: "point_transformer"  # robusto — melhor para cenas complexas
+    #
+    # Comparação rápida:
+    #   PointNet         → max-pool global, sem atenção local, ~2M params
+    #   Point Transformer → atenção k-NN local, position encoding relativo, ~5-10M params
+    #
+    # Recomendação:
+    #   - Comece com "pointnet" para verificar o pipeline
+    #   - Use "point_transformer" para tarefas com múltiplos objetos ou oclusão
+    depth_encoder_type: str = "pointnet"  # "pointnet" | "point_transformer"
+
+    # ── Hiperparâmetros do Point Transformer ────────────────
+    # Só usados quando depth_encoder_type: "point_transformer"
+    #
+    # point_transformer_k:
+    #   Número de vizinhos k-NN por ponto. Mais vizinhos = mais contexto local,
+    #   mas mais VRAM e tempo de forward. Recomendado: 8-32.
+    point_transformer_k: int = 16
+
+    # point_transformer_layers:
+    #   Número de camadas de atenção local. Mais camadas = campo receptivo maior,
+    #   mas risco de over-smoothing. Recomendado: 2-4.
+    point_transformer_layers: int = 3
+
+    # point_transformer_dim:
+    #   Dimensão interna do Point Transformer antes da projeção final para dim_model.
+    #   Reduzir para 128 se VRAM for limitada. Aumentar para 512 com GPUs potentes.
+    point_transformer_dim: int = 256
+
+    # ── Tato (Pressão Dex3) ─────────────────────────────────
     use_pressure: bool = True
-    pressure_feature_dim: int = 66  # Ex: 33 (left) + 33 (right)
+    pressure_feature_dim: int = 66   # 33 sensores esquerda + 33 direita
     pressure_hidden_dim: int = 256
 
+    # ── Uncertainty Gate ────────────────────────────────────
     scene_uncertainty_threshold: float = 0.0
-    # ==========================================
+
+    # ══════════════════════════════════════════════════════════
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -165,6 +201,24 @@ class ACTConfig(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
+            )
+
+        # Valida depth_encoder_type
+        valid_encoders = ("pointnet", "point_transformer")
+        if self.depth_encoder_type not in valid_encoders:
+            raise ValueError(
+                f"`depth_encoder_type` deve ser um de {valid_encoders}. "
+                f"Recebeu '{self.depth_encoder_type}'."
+            )
+
+        # Aviso de custo computacional
+        if self.depth_encoder_type == "point_transformer" and self.pointnet_num_points > 1024:
+            import warnings
+            warnings.warn(
+                f"Point Transformer com {self.pointnet_num_points} pontos pode ser lento. "
+                f"Considere reduzir pointnet_num_points para 512.",
+                UserWarning,
+                stacklevel=2,
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:

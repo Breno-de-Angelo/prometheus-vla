@@ -17,11 +17,8 @@ class ImageMessageSchema:
     def serialize(self) -> Dict[str, Any]:
         serialized_msg = {"timestamps": self.timestamps, "images": {}}
         for key, image in self.images.items():
-            # Proteção dupla: garante que manda PNG (Lossless) para 16-bits
-            if 'depth' in key.lower():
-                serialized_msg["images"][key] = ImageUtils.encode_depth_image(image)
-            else:
-                serialized_msg["images"][key] = ImageUtils.encode_image(image)
+            # Padronizado para enviar tudo em JPG (Lossy) para o modelo VLA
+            serialized_msg["images"][key] = ImageUtils.encode_image(image)
         return serialized_msg
 
     @staticmethod
@@ -30,11 +27,8 @@ class ImageMessageSchema:
         images = {}
         for key, value in data.get("images", {}).items():
             if isinstance(value, str):
-                # Descomprime do jeito certo com base no nome da lente
-                if 'depth' in key.lower():
-                    images[key] = ImageUtils.decode_depth_image(value)
-                else:
-                    images[key] = ImageUtils.decode_image(value)
+                # Descomprime tudo via JPG
+                images[key] = ImageUtils.decode_image(value)
             else:
                 images[key] = value
         return ImageMessageSchema(timestamps=timestamps, images=images)

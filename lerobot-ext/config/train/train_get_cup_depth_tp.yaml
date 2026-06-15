@@ -1,0 +1,146 @@
+# ==========================================================
+# CONFIGURAÇÃO DE TREINAMENTO — ACT-D IMPROVED (Point Transformer)
+# Projeto: Unitree G1 com Dex3 + Câmera de Profundidade
+# ==========================================================
+
+dataset:
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+  repo_id: Mrwlker/pick_up_the_cup_2026-06-09
+  root: meu_dataset/pick_up_the_cup_2026-06-09
+  episodes: [1, 3, 4, 5, 6, 7 ,8 ,9 ,10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34]
+
+
+val_dataset:
+  repo_id: Mrwlker/pick_up_the_cup_2026-06-09
+  root: meu_dataset/pick_up_the_cup_2026-06-09
+  episodes: [2, 21, 19]
+
+
+policy:
+  type: actdepth
+  repo_id: Mrwlker/pick_up_the_cup_depth_pointtransformer
+  push_to_hub: false
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [3, 480, 848]
+
+    observation.state:
+      type: STATE
+      shape: [28]
+
+    #observation.left_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+
+    #observation.right_hand_pressure:
+    #  type: STATE
+    #  shape: [33]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [28]
+
+  chunk_size: 100
+  n_action_steps: 100
+  n_obs_steps: 1
+  use_amp: true
+
+  # ── ACT-D: Nuvem de Pontos 3D ──────────────────────────
+  use_depth_3d: true
+  camera_intrinsics:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+
+  # Point Transformer geralmente precisa de menos pontos que PointNet
+  # para caber confortavelmente na VRAM (atenção k-NN é mais cara por ponto)
+  pointnet_num_points: 512
+
+  # ── Seleção do Encoder de Profundidade ─────────────────
+  # "pointnet"          → max-pool global, rápido, baixa VRAM
+  # "point_transformer" → atenção k-NN + position encoding relativo,
+  #                        mais expressivo para cenas com múltiplos
+  #                        objetos / oclusão parcial
+  depth_encoder_type: "point_transformer"
+
+  # ── Hiperparâmetros do Point Transformer ───────────────
+  point_transformer_k: 16            # nº de vizinhos k-NN (8-32)
+  point_transformer_layers: 3        # nº de camadas de atenção (2-4)
+  point_transformer_dim: 256         # dimensão interna (128-512)
+
+  # ── ACT-D: Percepção Tátil ──────────────────────────────
+  use_pressure: false
+  pressure_feature_dim: 66
+  pressure_hidden_dim: 256
+
+  # ── Scene Uncertainty Gate ──────────────────────────────
+  scene_uncertainty_threshold: 0.0
+
+  # ── Anti-Overfitting (dataset pequeno) ─────────────────
+  dropout: 0.1
+  optimizer_weight_decay: 1e-4
+  kl_weight: 10.0
+
+  # ── Arquitetura Transformer ─────────────────────────────
+  dim_model: 512
+  n_heads: 4
+  dim_feedforward: 3200
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+
+  # ── Backbone Visual ────────────────────────────────────
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+
+
+# ==========================================================
+# 4. CONFIGURAÇÕES DE TREINAMENTO
+# ==========================================================
+output_dir: "train_output/pick_up_the_cup_depth_pointtransformer-2606014"
+steps: 100000
+
+batch_size: 2
+num_workers: 8
+log_freq: 50
+save_freq: 5000
+save_checkpoint: false
+early_stop_patience: 0
+early_stop_min_delta: 0.001
+
+save_best_checkpoint: true
+
+neutral_position_loss_weight: 0.0
+
+
+# ==========================================================
+# 5. AVALIAÇÃO E LOGS
+# ==========================================================
+eval_freq: 250
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  disable_artifact: true

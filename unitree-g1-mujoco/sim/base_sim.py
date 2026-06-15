@@ -263,11 +263,22 @@ class DefaultEnv:
             else:
                 renderer.update_scene(self.mj_data, camera=camera_name)
                 
-            # MATEMÁTICA DO DEPTH: METROS PARA MILÍMETROS (16-bits)
+            # MATEMÁTICA DO DEPTH: IGUAL AO ROBÔ REAL (Prometheus)
             if 'depth' in camera_name.lower():
+                import cv2 # Garanta que está importado
                 depth_meters = renderer.render()
-                depth_mm = (depth_meters * 1000.0).astype(np.uint16)
-                render_caches[camera_name + "_image"] = depth_mm[..., np.newaxis]
+                depth_mm = depth_meters * 1000.0
+                
+                # 1. Corta tudo acima de 2 metros
+                depth_clipped = np.clip(depth_mm, 0, 2000)
+                
+                # 2. Converte metricamente para 8-bits (escala de cinza linear)
+                depth_8bit = (depth_clipped * (255.0 / 2000.0)).astype(np.uint8)
+                
+                # 3. Replica o canal cinza 3 vezes (R=Depth, G=Depth, B=Depth)
+                depth_3c = cv2.cvtColor(depth_8bit, cv2.COLOR_GRAY2RGB)
+                
+                render_caches[camera_name + "_image"] = depth_3c
             else:
                 render_caches[camera_name + "_image"] = renderer.render()
         
