@@ -218,27 +218,54 @@ class NeutralPositionCurriculum:
         """
         Clona o batch, substitui as ações pela posição neutra e computa o loss.
         Isso força a política a aprender que "quando incerta → volte ao neutro".
+
+        IMPORTANTE — gestão de VRAM:
+        O forward do PaliGemma aloca ~60 GB de ativações para o grafo de gradiente.
+        Ter dois grafos simultâneos (main loss + neutral loss) estoura a VRAM mesmo
+        em GPUs A100-80 GB. Por isso este método NÃO retorna um tensor com grafo —
+        ele faz o backward() aqui mesmo, dentro de um bloco isolado, e devolve apenas
+        o valor escalar (.detach()) para logging. O backward do loss principal é feito
+        separadamente em update_policy(), garantindo que apenas UM grafo gigante
+        existe na VRAM por vez.
+
+        Fluxo em update_policy():
+          1. neutral forward → backward → grafo liberado   ← aqui
+          2. main    forward → backward → grafo liberado   ← update_policy
+          3. optimizer.step() acumula os dois gradientes
         """
         neutral_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         B = neutral_batch["action"].shape[0]
+        half_B = max(1, B // 2)  # metade do batch para reduzir pico de VRAM
         device = neutral_batch["action"].device
+
+        # Trunca o batch para half_B (menos VRAM, sinal de gradiente ainda útil)
+        neutral_batch = {
+            k: v[:half_B] if isinstance(v, torch.Tensor) else v
+            for k, v in neutral_batch.items()
+        }
 
         # Preenche todas as ações do chunk com a posição neutra
         neutral_actions = (
             self.neutral_position
             .unsqueeze(0)              # [1, action_dim]
             .unsqueeze(0)              # [1, 1, action_dim]
-            .expand(B, self.chunk_size, self.action_dim)
+            .expand(half_B, self.chunk_size, self.action_dim)
             .to(device)
         )
         neutral_batch["action"] = neutral_actions
         # Remove o pad mask para que todos os steps sejam usados
-        neutral_batch["action_is_pad"] = torch.zeros(B, self.chunk_size, dtype=torch.bool, device=device)
+        neutral_batch["action_is_pad"] = torch.zeros(half_B, self.chunk_size, dtype=torch.bool, device=device)
 
         with accelerator.autocast():
             neutral_loss, _ = policy.forward(neutral_batch)
 
-        return neutral_loss * self.loss_weight
+        scaled_loss = neutral_loss * self.loss_weight
+
+        # Backward imediato: libera o grafo antes do forward principal
+        accelerator.backward(scaled_loss)
+
+        # Retorna apenas o valor escalar para logging — sem grafo residual na VRAM
+        return scaled_loss.detach()
 
 
 # ═════════════════════════════════════════════════════════════
@@ -260,6 +287,22 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
+    # ── Zero grad antes de qualquer backward ─────────────────────────────────
+    # Movido para cá pois o neutral curriculum faz seu próprio backward()
+    # internamente — precisamos do zero_grad antes dele, não depois.
+    optimizer.zero_grad()
+
+    output_dict = {}
+
+    # ── Passo 1: Curriculum de posição neutra (backward separado) ────────────
+    # compute_neutral_loss() faz forward + backward + libera o grafo por conta
+    # própria. Isso garante que apenas UM grafo gigante (PaliGemma) existe na
+    # VRAM por vez, evitando OOM em GPUs com ~79 GB.
+    if neutral_curriculum is not None and neutral_curriculum.should_inject(step):
+        neutral_loss_val = neutral_curriculum.compute_neutral_loss(policy, batch, accelerator)
+        output_dict["neutral_curriculum_loss"] = neutral_loss_val.item()
+
+    # ── Passo 2: Loss principal (backward separado) ──────────────────────────
     rabc_batch_weights = None
     rabc_batch_stats = None
     if rabc_weights_provider is not None:
@@ -267,21 +310,16 @@ def update_policy(
 
     with accelerator.autocast():
         if rabc_batch_weights is not None:
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            per_sample_loss, main_output_dict = policy.forward(batch, reduction="none")
             epsilon = 1e-6
             loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
-            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            main_output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+            main_output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+            main_output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
         else:
-            loss, output_dict = policy.forward(batch)
+            loss, main_output_dict = policy.forward(batch)
 
-        # ── Curriculum de posição neutra ──────────────────
-        if neutral_curriculum is not None and neutral_curriculum.should_inject(step):
-            neutral_loss = neutral_curriculum.compute_neutral_loss(policy, batch, accelerator)
-            loss = loss + neutral_loss
-            output_dict["neutral_curriculum_loss"] = neutral_loss.item()
-
+    output_dict.update(main_output_dict)
     accelerator.backward(loss)
 
     if grad_clip_norm > 0:
@@ -293,7 +331,6 @@ def update_policy(
 
     with lock if lock is not None else nullcontext():
         optimizer.step()
-    optimizer.zero_grad()
 
     if lr_scheduler is not None:
         lr_scheduler.step()
@@ -671,7 +708,15 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:
-                        wandb_log_dict.update(output_dict)
+                        flat_output = {}
+                        for k, v in output_dict.items():
+                            if isinstance(v, (list, tuple)):
+                                # Expande listas em chaves indexadas: loss_per_dim/0, loss_per_dim/1, ...
+                                for i, val in enumerate(v):
+                                    flat_output[f"{k}/{i}"] = val
+                            else:
+                                flat_output[k] = v
+                        wandb_log_dict.update(flat_output)
                     if rabc_weights is not None:
                         rabc_stats = rabc_weights.get_stats()
                         wandb_log_dict.update({

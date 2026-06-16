@@ -62,6 +62,68 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _get_lm(paligemma):
+    """Compatibilidade entre versões do transformers.
+    4.46.x: PaliGemmaForConditionalGeneration
+              .model (PaliGemmaModel)
+                .language_model (GemmaModel)   ← aqui
+    4.49+ : PaliGemmaForConditionalGeneration
+              .language_model (GemmaModel)     ← direto
+    """
+    # Tenta direto no objeto (4.49+)
+    lm = getattr(paligemma, "language_model", None)
+    if lm is not None:
+        return lm
+    # Tenta via .model (4.46.x)
+    inner = getattr(paligemma, "model", None)
+    if inner is not None:
+        lm = getattr(inner, "language_model", None)
+        if lm is not None:
+            return lm
+    raise RuntimeError(
+        f"_get_lm: não encontrei language_model em {type(paligemma)}. "
+        f"Sub-módulos: {[n for n, _ in paligemma.named_children()]}"
+    )
+
+
+def _get_vision_tower(paligemma):
+    """Retorna o vision encoder independente da versão do transformers.
+    4.46.x: paligemma.model.vision_tower
+    4.49+ : paligemma.vision_tower
+    """
+    vt = getattr(paligemma, "vision_tower", None)
+    if vt is not None:
+        return vt
+    inner = getattr(paligemma, "model", None)
+    if inner is not None:
+        vt = getattr(inner, "vision_tower", None)
+        if vt is not None:
+            return vt
+    raise RuntimeError(
+        f"_get_vision_tower: não encontrei vision_tower em {type(paligemma)}. "
+        f"Sub-módulos: {[n for n, _ in paligemma.named_children()]}"
+    )
+
+
+def _get_projector(paligemma):
+    """Retorna o multi_modal_projector independente da versão do transformers.
+    4.46.x: paligemma.model.multi_modal_projector
+    4.49+ : paligemma.multi_modal_projector
+    """
+    proj = getattr(paligemma, "multi_modal_projector", None)
+    if proj is not None:
+        return proj
+    inner = getattr(paligemma, "model", None)
+    if inner is not None:
+        proj = getattr(inner, "multi_modal_projector", None)
+        if proj is not None:
+            return proj
+    raise RuntimeError(
+        f"_get_projector: não encontrei multi_modal_projector em {type(paligemma)}. "
+        f"Sub-módulos: {[n for n, _ in paligemma.named_children()]}"
+    )
+
+
 def get_safe_dtype(target_dtype, device_type):
     if device_type == "mps" and target_dtype == torch.float64:
         return torch.float32
@@ -169,7 +231,7 @@ def resize_with_pad_torch(
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
 ):
-    models = [paligemma.language_model, gemma_expert.model]
+    models = [_get_lm(paligemma), gemma_expert.model]
     query_states = []
     key_states = []
     value_states = []
@@ -200,21 +262,21 @@ def compute_layer_complete(
         dtype=query_states.dtype,
     )
 
-    cos, sin = paligemma.language_model.rotary_emb(dummy_tensor, position_ids)
+    cos, sin = _get_lm(paligemma).rotary_emb(dummy_tensor, position_ids)
     query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
 
     batch_size = query_states.shape[0]
-    scaling = paligemma.language_model.layers[layer_idx].self_attn.scaling
+    scaling = _get_lm(paligemma).layers[layer_idx].self_attn.scaling
 
     att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.language_model.layers[layer_idx].self_attn,
+        _get_lm(paligemma).layers[layer_idx].self_attn,
         query_states, key_states, value_states,
         attention_mask, scaling,
     )
 
-    head_dim = paligemma.language_model.layers[layer_idx].self_attn.head_dim
+    head_dim = _get_lm(paligemma).layers[layer_idx].self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
 
     outputs_embeds = []
@@ -311,7 +373,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.gemma_expert = GemmaForCausalLM(expert_config_hf)
 
         if freeze_vision_encoder:
-            for param in self.paligemma.vision_tower.parameters():
+            for param in _get_vision_tower(self.paligemma).parameters():
                 param.requires_grad = False
 
         if train_expert_only:
@@ -319,10 +381,23 @@ class PaliGemmaWithExpertModel(nn.Module):
                 param.requires_grad = False
 
     def embed_image(self, image):
-        return self.paligemma.get_image_features(pixel_values=image)
+        # Passo 1: vision encoder → [B, num_patches, 1152]
+        vision_out = _get_vision_tower(self.paligemma)(pixel_values=image, output_hidden_states=False)
+        if isinstance(vision_out, torch.Tensor):
+            vision_feats = vision_out
+        elif hasattr(vision_out, "last_hidden_state"):
+            vision_feats = vision_out.last_hidden_state
+        elif hasattr(vision_out, "pooler_output"):
+            vision_feats = vision_out.pooler_output
+        else:
+            raise RuntimeError(f"embed_image: tipo inesperado do vision encoder: {type(vision_out)}")
+
+        # Passo 2: projeta para o espaço do LM → [B, num_patches, lm_hidden_size]
+        vision_feats = _get_projector(self.paligemma)(vision_feats)
+        return vision_feats
 
     def embed_language_tokens(self, tokens):
-        return self.paligemma.language_model.get_input_embeddings()(tokens)
+        return _get_lm(self.paligemma).get_input_embeddings()(tokens)
 
     def forward(
         self,
@@ -336,7 +411,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.language_model.forward(
+            prefix_output = _get_lm(self.paligemma).forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -360,7 +435,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
-            models = [self.paligemma.language_model, self.gemma_expert.model]
+            models = [_get_lm(self.paligemma), self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
             use_gradient_checkpointing = (
@@ -455,14 +530,14 @@ class PI05Pytorch(nn.Module):
 
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        _get_lm(self.paligemma_with_expert.paligemma).gradient_checkpointing = True
+        _get_vision_tower(self.paligemma_with_expert.paligemma).gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        _get_lm(self.paligemma_with_expert.paligemma).gradient_checkpointing = False
+        _get_vision_tower(self.paligemma_with_expert.paligemma).gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
     def _rtc_enabled(self):
@@ -604,7 +679,7 @@ class PI05Pytorch(nn.Module):
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            _get_lm(self.paligemma_with_expert.paligemma).layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
@@ -667,7 +742,7 @@ class PI05Pytorch(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        _get_lm(self.paligemma_with_expert.paligemma).config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -971,8 +1046,15 @@ class PI05DEPTHPolicy(PreTrainedPolicy):
         # Trunca para a dimensão real da ação
         losses = losses[:, :, : self._original_action_dim]
 
+        loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu()  # [action_dim]
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            # Cada dimensão vira uma chave escalar: loss_per_dim/0, /1, ...
+            # O WandBLogger só aceita scalars — listas causam o WARNING que você viu.
+            **{f"loss_per_dim/{i}": v.item() for i, v in enumerate(loss_per_dim)},
+            # Resumo estatístico útil para monitorar evolução geral
+            "loss_per_dim_mean": loss_per_dim.mean().item(),
+            "loss_per_dim_max": loss_per_dim.max().item(),
+            "loss_per_dim_min": loss_per_dim.min().item(),
         }
 
         if reduction == "none":

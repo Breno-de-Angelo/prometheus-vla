@@ -37,7 +37,7 @@ val_dataset:
 # ==========================================================
 policy:
   type: pi05depth
-  repo_id: Mrwlker/pick_up_the_cup_pi05_nodepth
+  repo_id: Mrwlker/pick_up_the_cup_pi05_depth
   push_to_hub: false
 
   # ── Modelos base ────────────────────────────────────────
@@ -49,10 +49,10 @@ policy:
 
   # ── ACT-D: Nuvem de Pontos 3D ──────────────────────────
   # false = depth comentado abaixo, consistente
-  use_depth_3d: false
+  use_depth_3d: true
 
   # ── ACT-D: Tato / Pressão ──────────────────────────────
-  use_pressure: false
+  use_pressure: true
 
   # ── Scene Uncertainty Gate ──────────────────────────────
   # O PI05 estima incerteza rodando n_samples_uncertainty
@@ -76,21 +76,21 @@ policy:
       shape: [3, 480, 640]
 
     # Depth: descomente E mude use_depth_3d para true para ativar
-    # observation.images.head_camera_depth:
-    #   type: VISUAL
-    #   shape: [3, 480, 640]
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [3, 480, 640]
 
     observation.state:
       type: STATE
       shape: [28]
 
     # Pressão: descomente E mude use_pressure para true para ativar
-    # observation.left_hand_pressure:
-    #   type: STATE
-    #   shape: [33]
-    # observation.right_hand_pressure:
-    #   type: STATE
-    #   shape: [33]
+    observation.left_hand_pressure:
+      type: STATE
+      shape: [33]
+    observation.right_hand_pressure:
+      type: STATE
+      shape: [33]
 
   output_features:
     action:
@@ -112,11 +112,14 @@ policy:
   train_expert_only: true        # ← ADICIONE ISSO
   freeze_vision_encoder: true    # ← E ISSO
 
+  # Com isso: 3B → ~300M parâmetros treináveis
+  # O PaliGemma já sabe ver — só ensina o expert a agir
+
 
 # ==========================================================
 # 4. CONFIGURAÇÕES DE TREINAMENTO
 # ==========================================================
-output_dir: "train_output/pick_up_the_cup_pi05_nodepth"
+output_dir: "train_output/pick_up_the_cup_pi05_depth"
 steps: 5000
 
 batch_size: 4
