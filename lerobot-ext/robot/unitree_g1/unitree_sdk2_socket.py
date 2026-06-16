@@ -269,7 +269,9 @@ def ChannelFactoryInitialize(domain_id: int = 0, robot_ip: str | None = None, *a
 
     # Hand command: send hand commands
     handcmd_sock = ctx.socket(zmq.PUSH)
-    handcmd_sock.setsockopt(zmq.CONFLATE, 1)
+    # CONFLATE removido: com CONFLATE=1 só 1 msg fica no buffer, então enviar esquerda+direita
+    # em sequência faz o servidor receber APENAS a última (direita), descartando a esquerda.
+    # Sem CONFLATE, ambas chegam. A 30Hz não há risco de fila crescer.
     handcmd_sock.connect(f"tcp://{_robot_ip}:{HANDCMD_PORT}")
     _handcmd_sock = handcmd_sock
 

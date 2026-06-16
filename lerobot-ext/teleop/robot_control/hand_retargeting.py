@@ -1,9 +1,15 @@
 from dex_retargeting import RetargetingConfig
 from pathlib import Path
+import os
 import yaml
 from enum import Enum
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
+
+# lerobot-ext/ (3 níveis acima deste arquivo) -> usado para montar caminhos
+# absolutos de assets, independente de onde o script é executado.
+_LEROBOT_EXT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ASSETS_DIR = os.path.join(_LEROBOT_EXT_DIR, "assets")
 
 class HandType(Enum):
     INSPIRE_HAND = "../assets/inspire_hand/inspire_hand.yml"
@@ -15,20 +21,14 @@ class HandType(Enum):
 
 class HandRetargeting:
     def __init__(self, hand_type: HandType):
-        if hand_type == HandType.UNITREE_DEX3:
-            RetargetingConfig.set_default_urdf_dir('assets')
-        elif hand_type == HandType.UNITREE_DEX3_Unit_Test:
-            RetargetingConfig.set_default_urdf_dir('../../assets')
-        elif hand_type == HandType.INSPIRE_HAND:
-            RetargetingConfig.set_default_urdf_dir('../assets')
-        elif hand_type == HandType.INSPIRE_HAND_Unit_Test:
-            RetargetingConfig.set_default_urdf_dir('../../assets')
-        elif hand_type == HandType.BRAINCO_HAND:
-            RetargetingConfig.set_default_urdf_dir('../assets')
-        elif hand_type == HandType.BRAINCO_HAND_Unit_Test:
-            RetargetingConfig.set_default_urdf_dir('../../assets')
+        # URDFs e YAMLs de retargeting ficam todos em lerobot-ext/assets/.
+        RetargetingConfig.set_default_urdf_dir(_ASSETS_DIR)
 
-        config_file_path = Path(hand_type.value)
+        # O value do enum tem prefixos relativos (../, ../../) que assumiam um
+        # CWD específico. Pegamos só o trecho depois de "assets/" e ancoramos
+        # no diretório absoluto de assets.
+        rel_after_assets = hand_type.value.split("assets/", 1)[-1]
+        config_file_path = Path(os.path.join(_ASSETS_DIR, rel_after_assets))
 
         try:
             with config_file_path.open('r') as f:

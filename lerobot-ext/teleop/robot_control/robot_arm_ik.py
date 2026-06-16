@@ -25,12 +25,10 @@ class G1_29_ArmIK:
         # fixed cache file path
         self.cache_path = "g1_29_model_cache.pkl"
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../assets/g1/'
-        else:
-            self.urdf_path = '../../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../../assets/g1/'
+        # Caminhos absolutos baseados em parent2_dir (== lerobot-ext/), assim
+        # funcionam independente do diretório de onde o script é executado.
+        self.urdf_path = os.path.join(parent2_dir, 'assets/g1/g1_body29_hand14.urdf')
+        self.model_dir = os.path.join(parent2_dir, 'assets/g1/')
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -178,6 +176,11 @@ class G1_29_ArmIK:
         self.opti.solver("ipopt", opts)
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
+        # 4 taps (RESTAURADO). O 2-tap [0.7,0.3] de c4fb596 partia da premissa de que o
+        # "clip de 250Hz do streamer suaviza o degrau" — mas no ROBÔ REAL o streamer publica
+        # via ponte JSON+ZMQ(CONFLATE)+DDS no Jetson, que não aguenta 250Hz → a rampa é
+        # descartada e NÃO chega suave ao firmware. Logo reduzir o filtro do IK só tirou
+        # suavização → reintroduziu o tremor do punho. 4 taps = estado bom de 2026-06-03.
         self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
         self.vis = None
 
@@ -308,7 +311,18 @@ class G1_29_ArmIK:
 
             # return sol_q, sol_tauff
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
-        
+
+    def forward_kinematics(self, q):
+        """Retorna as poses homogêneas 4x4 dos end-effectors L_ee e R_ee para a
+        configuração de juntas q (14 ângulos). Usado pelo clutch da teleop para
+        saber onde os pulsos do robô estão no instante do destrave."""
+        q = np.asarray(q, dtype=float)
+        pin.framesForwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        T_left = np.array(self.reduced_robot.data.oMf[self.L_hand_id].homogeneous)
+        T_right = np.array(self.reduced_robot.data.oMf[self.R_hand_id].homogeneous)
+        return T_left, T_right
+
+
 class G1_23_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)

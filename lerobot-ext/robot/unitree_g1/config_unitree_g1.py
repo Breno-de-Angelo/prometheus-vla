@@ -63,8 +63,13 @@ class UnitreeG1Config(RobotConfig):
     # Launch mujoco simulation
     is_simulation: bool = False
 
+    # Backend de simulacao quando is_simulation=True:
+    #   "mujoco" (padrao) = sim MuJoCo in-process (comportamento original)
+    #   "isaac"           = conecta na ponte ZMQ externa do Isaac (robot_ip = IP do lcad232)
+    sim_backend: str = "mujoco"
+
     # Socket config for ZMQ bridge
-    robot_ip: str = "192.168.123.164"  # default G1 IP
+    robot_ip: str = "192.168.123.164"  # default G1 IP (cabo ethernet direto)
 
 
     # Cameras (ZMQ-based remote cameras)

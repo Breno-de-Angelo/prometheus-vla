@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from sim.sensor_utils import SensorServer, ImageUtils
+from sim.sensor_utils import SensorServer
 
 
 def start_realsense_zmq():
@@ -14,8 +14,8 @@ def start_realsense_zmq():
     cfg = rs.config()
 
     # RGB + Depth streams da D435i
-    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    cfg.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
+    cfg.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
 
     try:
         profile = pipeline.start(cfg)
@@ -41,28 +41,18 @@ def start_realsense_zmq():
                 continue
 
             rgb = np.asanyarray(color_frame.get_data())
-            depth_raw = np.asanyarray(depth_frame.get_data())  # uint16, mm
+            depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 (unidades do sensor)
 
-            # Normaliza depth para [0, 1] = [0, 2 m] (convencao usada no ACT-D / pi05-D)
-            depth_m = depth_raw.astype(np.float32) * depth_scale  # metros
-            depth_norm = np.clip(depth_m / 2.0, 0.0, 1.0)         # [0, 1]
-            depth_u8 = (depth_norm * 255.0).astype(np.uint8)
-            depth_3ch = cv2.merge([depth_u8, depth_u8, depth_u8])  # 3 canais p/ encoder
-
-            encoded_rgb = ImageUtils.encode_image(rgb)
-            encoded_depth = ImageUtils.encode_image(depth_3ch)
+            # Depth em mm como uint16 (1 canal), enviado como PNG no multipart ZMQ.
+            depth_mm = np.clip(
+                depth_raw.astype(np.float32) * depth_scale * 1000.0, 0.0, 32767.0
+            ).astype(np.uint16)
 
             t = time.time()
-            server.send_message({
-                "images": {
-                    "head_camera": encoded_rgb,
-                    "head_camera_depth": encoded_depth,
-                },
-                "timestamps": {
-                    "head_camera": t,
-                    "head_camera_depth": t,
-                },
-            })
+            server.send_images(
+                {"head_camera": rgb, "head_camera_depth": depth_mm},
+                {"head_camera": t, "head_camera_depth": t},
+            )
 
     except KeyboardInterrupt:
         print("Encerrando...")

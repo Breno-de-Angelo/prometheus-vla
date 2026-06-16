@@ -208,7 +208,7 @@ class VuerTeleop(Teleoperator):
         # 3. Multiplica o Grasp (0 a 1) pelos alvos de fechamento dos dedos Dex3
         for i, name in enumerate(LEFT_HAND_NAMES):
             robot_action[name] = float(left_grasp * LEFT_HAND_CLOSED_TARGETS[i])
-            
+
         for i, name in enumerate(RIGHT_HAND_NAMES):
             robot_action[name] = float(right_grasp * RIGHT_HAND_CLOSED_TARGETS[i])
 

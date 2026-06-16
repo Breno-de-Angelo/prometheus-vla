@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import os
 import struct
 import threading
 import time
@@ -33,6 +34,14 @@ from lerobot.robots.robot import Robot
 from .config_unitree_g1 import UnitreeG1Config
 
 logger = logging.getLogger(__name__)
+
+
+def left_arm_limp_enabled() -> bool:
+    """True se --left-arm-limp (env G1_LEFT_ARM_LIMP) está ativo (lado esquerdo solto:
+    braço juntas 15-21 + mão Dex3). Presença com valor real liga; '', '0', 'false' e
+    ausência = desligado (evita o footgun de bool('0') == True)."""
+    return os.environ.get("G1_LEFT_ARM_LIMP", "") not in ("", "0", "false", "False")
+
 
 # DDS topic names follow Unitree SDK naming conventions
 # ruff: noqa: N816
@@ -174,7 +183,7 @@ class UnitreeG1(Robot):
     def connect(self, calibrate: bool = True) -> None:  # connect to DDS
         # Import channel classes and message types based on mode
         # (deferred imports to avoid circular import in unitree_sdk2py)
-        if self.config.is_simulation:
+        if self.config.is_simulation and getattr(self.config, "sim_backend", "mujoco") != "isaac":
             from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
                 LowCmd_ as hg_LowCmd,
@@ -188,7 +197,7 @@ class UnitreeG1(Robot):
             )
             LowCmdMsg = unitree_hg_msg_dds__LowCmd_
         else:
-            # Use SDK-free wrappers for ZMQ mode to avoid circular import
+            # Use SDK-free wrappers for ZMQ mode to avoid circular import (Isaac backend uses this)
             from .unitree_sdk2_socket import (
                 ChannelFactoryInitialize,
                 ChannelPublisher,
@@ -204,17 +213,25 @@ class UnitreeG1(Robot):
         self._ChannelSubscriber = ChannelSubscriber
 
         # Initialize DDS channel and simulation environment
-        if self.config.is_simulation:
-            # Como o seu env.py já inicializa o canal internamente, 
+        if self.config.is_simulation and getattr(self.config, "sim_backend", "mujoco") == "isaac":
+            # Backend Isaac: a ponte ZMQ externa (lcad232) faz o step; NAO cria MuJoCo in-process
+            self.sim_env = None
+            logger.info("[UnitreeG1] sim_backend=isaac -> ponte Isaac externa (sem MuJoCo in-process)")
+        elif self.config.is_simulation:
+            # Como o seu env.py já inicializa o canal internamente,
             # podemos só chamar a função principal dele.
             
             # --- INÍCIO DA MODIFICAÇÃO PARA USAR SEU SIMULADOR LOCAL ---
             import sys
             import os
             
-            local_sim_path = os.path.expanduser("../unitree-g1-mujoco")
+            # Caminho ABSOLUTO p/ o sim local (antes era relativo "../unitree-g1-mujoco",
+            # que só resolvia se o CWD fosse lerobot-ext/ → quebrava com ModuleNotFoundError
+            # 'env' rodando da raiz do repo). Resolve a partir deste arquivo: robot/unitree_g1 -> repo.
+            _repo_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+            local_sim_path = os.path.join(_repo_root, "unitree-g1-mujoco")
             if local_sim_path not in sys.path:
-                sys.path.append(local_sim_path)
+                sys.path.insert(0, local_sim_path)
             
             # Importamos a função criadora do seu env.py (renomeamos para não dar conflito)
             from env import make_env as make_local_env
@@ -227,13 +244,12 @@ class UnitreeG1(Robot):
             # Chamamos a sua função passando a lista de câmeras exigida!
             self.sim_env = make_local_env(cameras=lista_de_cameras)
 
-            import time
             time.sleep(3.0)
-            
+
             # --- FIM DA MODIFICAÇÃO ---
 
         else:
-            self._ChannelFactoryInitialize(0)
+            self._ChannelFactoryInitialize(0, self.config.robot_ip)
 
         # Initialize direct motor control interface
         self.lowcmd_publisher = self._ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
@@ -289,11 +305,25 @@ class UnitreeG1(Robot):
                 self.msg.motor_cmd[id.value].kd = self.kd[id.value]
                 self.msg.motor_cmd[id.value].q = lowstate.motor_state[id.value].q
 
-        #for id in G1_29_JointIndex:
-        #    self.msg.motor_cmd[id].mode = 1
-        #    self.msg.motor_cmd[id].kp = self.kp[id.value]
-        #    self.msg.motor_cmd[id].kd = self.kd[id.value]
-        #    self.msg.motor_cmd[id].q = lowstate.motor_state[id.value].q
+        # 🚀 ARM STREAMER (jeito Unitree): publica o braço a 250Hz com clip de
+        # velocidade, desacoplando o controle do record loop de 30Hz. Sem isso, o
+        # robô recebe um DEGRAU de alvo a cada 33ms → stair-stepping/tremor. Com a
+        # thread, o alvo (self._arm_target, atualizado por send_action) é entregue
+        # ao firmware como uma RAMPA contínua. Desligável via G1_ARM_STREAMER=0.
+        import os as _os_str
+        self._arm_target = {}                    # motor.value -> q alvo (do send_action)
+        self._arm_lock = threading.Lock()
+        self._arm_streamer_stop = threading.Event()
+        self._arm_streamer_on = _os_str.environ.get("G1_ARM_STREAMER", "1") not in ("", "0", "false", "False")
+        # Seed: alvo inicial = posição MEDIDA atual do braço → a thread interpola
+        # medida→medida (parado) até o 1º send_action, sem publicar pose desatualizada.
+        for _m in G1_29_JointArmIndex:
+            self._arm_target[_m.value] = float(lowstate.motor_state[_m.value].q)
+        if self._arm_streamer_on:
+            self._arm_streamer_thread = threading.Thread(
+                target=self._arm_streamer_worker, daemon=True, name="ArmStreamer")
+            self._arm_streamer_thread.start()
+            logger.info("[arm-streamer] thread de 250Hz iniciada (clip de velocidade, jeito Unitree).")
 
     def reset(self, default_positions: list[float] | None = None, **kwargs):
         # Reseta o corpo (braços) – isso já existe na classe pai
@@ -304,6 +334,15 @@ class UnitreeG1(Robot):
     def disconnect(self):
         # Signal thread to stop and unblock any waits
         self._shutdown_event.set()
+
+        # Para o ARM STREAMER (senão continua publicando lowcmd após desconectar).
+        if hasattr(self, "_arm_streamer_stop"):
+            self._arm_streamer_stop.set()
+        _str_thr = getattr(self, "_arm_streamer_thread", None)
+        if _str_thr is not None:
+            _str_thr.join(timeout=2.0)
+            if _str_thr.is_alive():
+                logger.warning("[arm-streamer] thread não encerrou no timeout (pode estar travada em Write).")
 
         # Wait for subscribe thread to finish
         if self.subscribe_thread is not None:
@@ -427,45 +466,224 @@ class UnitreeG1(Robot):
     def observation_features(self) -> dict[str, type | tuple]:
         return {**self._motors_ft, **self._cameras_ft}
 
+    # Grupos de junta do braço por motor.value (15-21 esquerdo, 22-28 direito).
+    _ARM_ELBOW = (18, 25)
+    _ARM_WRIST = (19, 20, 21, 26, 27, 28)
+
+    def _arm_gains(self, motor_value, tun):
+        """kp/kd por GRUPO de junta do braço (ombro/cotovelo/punho).
+
+        Forçar um arm_kp UNIFORME alto (ex: 100) quebrava o amortecimento: o punho
+        era kp=40 no config e virava 100 (2.5x mais rígido) com o MESMO kd → ficava
+        subamortecido (ζ baixo) → oscilação/tremor. Aqui cada grupo tem kp/kd próprios,
+        editáveis a quente no g1_tuning.json. Fallback: arm_kp uniforme antigo + kd do config."""
+        if motor_value in self._ARM_ELBOW:
+            grp = "elbow"
+        elif motor_value in self._ARM_WRIST:
+            grp = "wrist"
+        else:
+            grp = "shoulder"
+        kp = tun.get(f"arm_kp_{grp}", tun.get("arm_kp", 100.0))
+        kd = tun.get(f"arm_kd_{grp}", self.kd[motor_value])
+        return kp, kd
+
+    def _read_tuning(self):
+        """Lê ganhos/filtros de g1_tuning.json ($G1_TUNING), recarregando quando o arquivo muda."""
+        import os
+        import json
+        defaults = {
+            "arm_kp": 150.0, "smoothing_alpha": 0.3, "max_delta": 0.12,
+            # kp/kd por grupo (restauram o amortecimento; ver _arm_gains)
+            "arm_kp_shoulder": 80.0, "arm_kp_elbow": 80.0, "arm_kp_wrist": 40.0,
+            "arm_kd_shoulder": 3.0,  "arm_kd_elbow": 3.0,  "arm_kd_wrist": 1.5,
+            # limite de velocidade do arm streamer (rad/s) — backstop de segurança
+            "arm_velocity_limit": 20.0,
+            # frequência do IK: define a janela de interpolação (1/arm_interp_hz segundos).
+            # Deve coincidir com o fps do record_loop (30Hz). Ajuste aqui se mudar o fps.
+            "arm_interp_hz": 30.0,
+        }
+        path = os.environ.get("G1_TUNING", "lerobot-ext/config/g1_tuning.json")
+        try:
+            mt = os.path.getmtime(path)
+            if mt != getattr(self, "_tuning_mtime", None):
+                with open(path) as f:
+                    self._tuning = {**defaults, **json.load(f)}
+                self._tuning_mtime = mt
+                logger.info(f"[tuning] g1_tuning.json recarregado: {self._tuning}")
+        except FileNotFoundError:
+            self._tuning = getattr(self, "_tuning", defaults)
+        except Exception as e:
+            logger.warning(f"[tuning] erro lendo g1_tuning.json ({e}); mantendo anterior")
+            self._tuning = getattr(self, "_tuning", defaults)
+        return self._tuning
+
+    def _action_log(self):
+        """Abre o JSONL de log de ações se $G1_ACTION_LOG estiver setado, senão retorna None."""
+        if getattr(self, "_action_log_f", "unset") == "unset":
+            import os
+            _p = os.environ.get("G1_ACTION_LOG")
+            self._action_log_f = open(_p, "a") if _p else None
+            if self._action_log_f:
+                logger.warning(f"[action_log] gravando target/sent/obs em {_p}")
+        return self._action_log_f
+
+    def _arm_streamer_worker(self):
+        """Publica self.msg a ~250Hz com INTERPOLAÇÃO TEMPORAL entre alvos de IK de 30Hz.
+
+        Em vez de clip puro contra prev_cmd (que só saltava ao alvo e ficava parado),
+        faz uma rampa linear start_q → tgt ao longo de interp_s (= 1/arm_interp_hz ≈ 33ms),
+        produzindo ~8 sub-passos reais por ciclo de IK → elimina o staircase.
+
+        Backstop de segurança: clip vetorial de velocidade (arm_velocity_limit) entre
+        prev_cmd e interp_q — protege contra glitch de IK sem afetar movimentos normais.
+        arm_interp_hz e arm_velocity_limit são ajustáveis a quente em g1_tuning.json."""
+        dt = float(getattr(self.config, "control_dt", 1.0 / 250.0))
+        if dt <= 0:
+            dt = 1.0 / 250.0
+        # Estado de interpolação temporal (fora do lock — apenas lido/escrito por esta thread)
+        interp_s: float = 1.0 / 30.0  # janela inicial; atualizada a cada leitura de tuning
+        seg_t0:   float = 0.0          # timestamp (perf_counter) do início do segmento atual
+        start_q:  np.ndarray | None = None   # q no início do segmento
+        _last_tgt: np.ndarray | None = None  # último alvo visto (detecta mudança)
+        fails = 0
+        while not self._arm_streamer_stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                with self._arm_lock:
+                    tun = getattr(self, "_tuning", None) or {}
+                    vlim = float(tun.get("arm_velocity_limit", 20.0))
+                    interp_hz = float(tun.get("arm_interp_hz", 30.0))
+                    interp_s = 1.0 / interp_hz if interp_hz > 0 else 1.0 / 30.0
+                    ls = self._lowstate
+                    items = list(self._arm_target.items())
+                    if items and ls is not None:
+                        # Compensa starvation do GIL: usa o tempo real decorrido.
+                        # Se a thread engasgar e pular frames, real_dt compensa 
+                        # avançando a rampa e o limite de velocidade na proporção correta.
+                        now = time.perf_counter()
+                        real_dt = max(now - getattr(self, "_last_stream_t", now - dt), 0.001)
+                        self._last_stream_t = now
+
+                        mvs = [mv for mv, _ in items]
+                        tgt = np.array([q for _, q in items], dtype=float)
+                        prev_cmd = np.array([self.msg.motor_cmd[mv].q for mv in mvs], dtype=float)
+                        vmax = vlim * real_dt
+                        if getattr(self.config, "is_simulation", False):
+                            # SIM: publica o alvo diretamente (sem rampa), igual à Unitree.
+                            newq = tgt
+                        elif vmax > 0:
+
+                            # Filtro EMA (Exponential Moving Average) a 250Hz.
+                            # Muito superior à rampa linear para teleoperação via WiFi:
+                            # adapta-se naturalmente ao jitter dos pacotes do Quest e
+                            # nunca dá "hard stop" (tranco) se um pacote atrasar.
+                            ema_alpha = min(real_dt / (interp_s + real_dt), 1.0)
+                            interp_q  = prev_cmd + ema_alpha * (tgt - prev_cmd)
+                            # Backstop de segurança: clip vetorial entre prev_cmd e interp_q
+                            # (protege contra glitch de IK sem impactar movimentos normais).
+                            mx = float(np.max(np.abs(interp_q - prev_cmd))) if interp_q.size else 0.0
+                            scale = max(mx / vmax, 1.0)
+                            newq = prev_cmd + (interp_q - prev_cmd) / scale
+                        else:
+                            newq = prev_cmd
+                        if not np.any(np.isnan(newq)) and not np.any(np.isinf(newq)):
+                            for i, mv in enumerate(mvs):
+                                self.msg.motor_cmd[mv].q = float(newq[i])
+                        else:
+                            logger.error("[arm-streamer] newq inválido (NaN/Inf) — frame ignorado.")
+                    # Re-checa o stop p/ não publicar depois do disconnect.
+                    if (not self._arm_streamer_stop.is_set()
+                            and getattr(self, "msg", None) is not None
+                            and self.lowcmd_publisher is not None):
+                        self.msg.crc = self.crc.Crc(self.msg)
+                        self.lowcmd_publisher.Write(self.msg)
+                fails = 0  # ciclo ok → zera o contador de falhas
+            except Exception as e:
+                fails += 1
+                if fails <= 3 or fails % 250 == 0:
+                    logger.warning(f"[arm-streamer] erro no worker (#{fails}): {type(e).__name__}: {e}")
+                if fails >= 10:
+                    # falha persistente: encerra a thread; o heartbeat detecta (is_alive) e assume o corpo.
+                    logger.error("[arm-streamer] 10 falhas consecutivas — encerrando thread; heartbeat assume.")
+                    break
+            elapsed = time.perf_counter() - t0
+            self._arm_streamer_stop.wait(max(0.0, dt - elapsed))
+
     def send_action(self, action: RobotAction) -> RobotAction:
         # Select joints based on control mode
         joint_index = G1_29_JointArmIndex if self.config.control_mode == "upper_body" else G1_29_JointIndex
 
-        max_delta = 0.004  # Radianos por ciclo. (~5 rad/s a 250Hz). Ajuste conforme necessário.
+        tun = self._read_tuning()
+        smoothing_alpha = tun["smoothing_alpha"]
+        max_delta = tun["max_delta"]
+        streamer = getattr(self, "_arm_streamer_on", False)
+
+        _logf = self._action_log()
+        _rec = {"t": round(time.time(), 3), "names": [], "tgt": [], "sent": [], "obs": []} if _logf else None
 
         for motor in joint_index:
             key = f"{motor.name}.q"
             if key in action:
-                target_q = action[key]
-                
-                # Inicializa se for a primeira vez. 
-                # Pega a posição ATUAL do robô para evitar um tranco no primeiro frame.
-                if key not in self.last_action_q:
-                    if self._lowstate is not None:
-                        self.last_action_q[key] = self._lowstate.motor_state[motor.value].q
-                    else:
-                        self.last_action_q[key] = target_q
-                
-                # 1. FILTRO: Suaviza a transição (Low-pass)
-                smoothed_q = (1 - self.smoothing_alpha) * self.last_action_q[key] + self.smoothing_alpha * target_q
-                
-                # 2. LIMITADOR: Garante que a variação não ultrapasse o max_delta
-                delta = smoothed_q - self.last_action_q[key]
-                delta_clipped = np.clip(delta, -max_delta, max_delta)
-                final_q = float(self.last_action_q[key] + delta_clipped)
-                
-                # 3. ATUALIZA ESTADO E COMANDO
-                self.last_action_q[key] = final_q
-                self.msg.motor_cmd[motor.value].q = final_q
-                
-                # Restante dos parâmetros...
-                self.msg.motor_cmd[motor.value].qd = 0  # Velocidade desejada zero
-                self.msg.motor_cmd[motor.value].kp = self.kp[motor.value]
-                self.msg.motor_cmd[motor.value].kd = self.kd[motor.value]
-                self.msg.motor_cmd[motor.value].tau = 0
+                target_q = float(action[key])
+                mv = motor.value
+                is_limp = left_arm_limp_enabled() and 15 <= mv <= 21
+                kp_arm, kd_arm = self._arm_gains(mv, tun)
 
-        self.msg.crc = self.crc.Crc(self.msg)
-        self.lowcmd_publisher.Write(self.msg)
+                # Inicializa o histórico do smoother (modo legado) com a posição
+                # MEDIDA, p/ não dar tranco no 1º frame.
+                if key not in self.last_action_q:
+                    self.last_action_q[key] = (self._lowstate.motor_state[mv].q
+                                               if self._lowstate is not None else target_q)
+
+                if streamer:
+                    # Modo STREAMER: send_action só atualiza o ALVO + ganhos; a thread de
+                    # 250Hz interpola até ele com clip de velocidade (sem stair-stepping).
+                    with self._arm_lock:
+                        self.msg.motor_cmd[mv].qd = 0
+                        self.msg.motor_cmd[mv].tau = 0
+                        if is_limp:
+                            self.msg.motor_cmd[mv].kp = 0.0
+                            self.msg.motor_cmd[mv].kd = 0.0
+                            self.msg.motor_cmd[mv].q = 0.0
+                            self._arm_target.pop(mv, None)   # esquerda mole sai do streaming
+                            self.last_action_q[key] = 0.0
+                        else:
+                            self.msg.motor_cmd[mv].kp = kp_arm
+                            self.msg.motor_cmd[mv].kd = kd_arm
+                            self._arm_target[mv] = target_q
+                            self.last_action_q[key] = target_q
+                    final_q = target_q  # p/ o log (o q real é interpolado pela thread)
+                else:
+                    # Modo LEGADO (G1_ARM_STREAMER=0): smoother EMA + clamp + publish a 30Hz.
+                    smoothed_q = (1 - smoothing_alpha) * self.last_action_q[key] + smoothing_alpha * target_q
+                    delta_clipped = np.clip(smoothed_q - self.last_action_q[key], -max_delta, max_delta)
+                    final_q = float(self.last_action_q[key] + delta_clipped)
+                    self.last_action_q[key] = final_q
+                    self.msg.motor_cmd[mv].q = final_q
+                    self.msg.motor_cmd[mv].qd = 0
+                    self.msg.motor_cmd[mv].kp = kp_arm
+                    self.msg.motor_cmd[mv].kd = kd_arm
+                    self.msg.motor_cmd[mv].tau = 0
+                    if is_limp:
+                        self.msg.motor_cmd[mv].kp = 0.0
+                        self.msg.motor_cmd[mv].kd = 0.0
+                        self.msg.motor_cmd[mv].tau = 0.0
+
+                if _rec is not None:
+                    _rec["names"].append(motor.name)
+                    _rec["tgt"].append(round(float(target_q), 4))
+                    _rec["sent"].append(round(float(final_q), 4))
+                    _rec["obs"].append(round(float(self._lowstate.motor_state[mv].q), 4) if self._lowstate else None)
+
+        if _rec is not None:
+            import json as _json
+            _logf.write(_json.dumps(_rec) + "\n")
+            _logf.flush()
+
+        # No modo streamer, quem publica é a thread de 250Hz (não publicar aqui).
+        if not streamer:
+            self.msg.crc = self.crc.Crc(self.msg)
+            self.lowcmd_publisher.Write(self.msg)
         return action
 
     def get_gravity_orientation(self, quaternion):  # get gravity orientation from quaternion
@@ -503,8 +721,13 @@ class UnitreeG1(Robot):
                 self.msg.motor_cmd[motor.value].kp = self.kp[motor.value]
                 self.msg.motor_cmd[motor.value].kd = self.kd[motor.value]
                 self.msg.motor_cmd[motor.value].tau = 0
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+                # Mantém o streamer consistente: senão a thread reverteria pro alvo antigo.
+                if getattr(self, "_arm_streamer_on", False):
+                    with self._arm_lock:
+                        self._arm_target[motor.value] = float(default_positions[motor.value])
+            if not getattr(self, "_arm_streamer_on", False):
+                self.msg.crc = self.crc.Crc(self.msg)
+                self.lowcmd_publisher.Write(self.msg)
         else:
             total_time = 3.0
             num_steps = int(total_time / control_dt)

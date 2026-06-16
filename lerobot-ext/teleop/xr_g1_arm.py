@@ -1,8 +1,10 @@
 import zmq
 import time
 import cv2
+import os
 import threading
 import logging
+import contextlib
 import numpy as np
 from dataclasses import dataclass
 from typing import Any
@@ -13,11 +15,18 @@ from lerobot.processor import RobotAction
 
 # Imports do ecossistema Unitree (ajuste os caminhos conforme sua pasta)
 from televuer import TeleVuerWrapper
-from .utils.sensor_utils import SensorClient, ImageUtils
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
 
 logger = logging.getLogger(__name__)
+
+
+def _left_arm_limp() -> bool:
+    """True se --left-arm-limp (env G1_LEFT_ARM_LIMP) está ativo.
+    Presença com valor real liga; '', '0', 'false' e ausência = desligado
+    (evita o footgun de bool('0') == True)."""
+    return os.environ.get("G1_LEFT_ARM_LIMP", "") not in ("", "0", "false", "False")
+
 
 @TeleoperatorConfig.register_subclass("xr_g1_arm")
 @dataclass
@@ -40,8 +49,8 @@ class XRG1Arm(Teleoperator):
         self.config = config
         self._is_connected = False
 
-        if not self.config.is_simulation:
-            self.config.img_server_ip = "192.168.123.164"
+        # Removemos o hardcode do IP do robô para que o VR possa usar o Proxy Local
+        # se configurado, aliviando a rede.
         
         # Carrega os nomes das juntas do seu robô no LeRobot
         from robot.unitree_g1.g1_utils import G1_29_JointIndex, LEFT_HAND_JOINT_NAMES, RIGHT_HAND_JOINT_NAMES
@@ -50,6 +59,20 @@ class XRG1Arm(Teleoperator):
         
         self.body_joints = {f"{motor.name}.q": 0.0 for motor in G1_29_JointIndex}
         self.hand_joints = {f"{name}.q": 0.0 for name in self._left_hand_names + self._right_hand_names}
+        # Sinais de grasp do controle gravados como dims próprias (NÃO são juntas; ficam no
+        # hand_joints só pra propagar a todos os returns e ao action_features). squeeze =
+        # fechamento total da mão; trigger = pinça fina. Atualizados no get_action.
+        for _gk in ("left_grasp_squeeze.q", "right_grasp_squeeze.q",
+                    "left_grasp_trigger.q", "right_grasp_trigger.q"):
+            self.hand_joints[_gk] = 0.0
+
+        # Filtro EMA para squeeze e trigger do Quest (que são quasi-binários 0/1).
+        # Sem filtro, cada frame onde o squeeze muda de 0→1 vira um step de ±1.5 rad
+        # nos dedos → tremor. Alpha=0.2 suaviza em ~5 frames (150ms a 30Hz).
+        self._sq_r = 0.0; self._sq_l = 0.0
+        self._tr_r = 0.0; self._tr_l = 0.0
+        _EMA_ALPHA = 0.5   # mão: ~3 frames (100ms) pra 95% do alvo; 0.2 era lento demais (~15 frames)
+        self._EMA_ALPHA = _EMA_ALPHA
 
         # Inicializa o Wrapper do VR e o Solver IK
         self.tv_wrapper = None
@@ -60,14 +83,40 @@ class XRG1Arm(Teleoperator):
         self.current_arm_q = np.zeros(14)
         self.current_arm_dq = np.zeros(14)
 
-        # NOVAS VARIÁVEIS DE SEGURANÇA
+
+        # Modo "hand": rastreia se as mãos já foram detectadas pelo menos uma vez.
         self.vr_started = False
-        self.start_time = None
-        self.countdown_done = False
-        
+
+        # Sempre começa travado — botão X (left_ctrl_aButton) destrava em
+        # qualquer modo (hand ou controller).
         self.controller_enabled = False
         self.last_x_state = False
         self.last_y_state = False
+
+
+        # Estado do CLUTCH (alinhamento relativo). Ao destravar, ancora a pose
+        # atual do controle e a pose atual do robô; daí em diante o robô se move
+        # apenas pelo DELTA do controle. Isso elimina o "salto" que jogava o
+        # braço para a pose absoluta do controle (e forçava contra a mesa).
+        self.clutch_anchored = False
+        self.ctrl_ref_left = None
+        self.ctrl_ref_right = None
+        self.robot_ref_left = None
+        self.robot_ref_right = None
+        # Última pose-alvo comandada para cada braço. Usada para re-ancorar o
+        # clutch (ex: ao salvar episódio) sem o robô saltar: o robô continua de
+        # onde estava em vez de voltar para FK(0).
+        self.last_left_target = None
+        self.last_right_target = None
+        # Watchdog de tempo: se o loop congelar (ex: encoding de vídeo ao salvar)
+        # e voltar depois de um gap, re-ancora o clutch para o robô não aplicar
+        # de uma vez o movimento que o controle acumulou durante o freeze.
+        self._last_clutch_time = None
+        self._video_stop = threading.Event()
+        self._latest_vr_frame = None
+        self._latest_vr_seq = 0
+        self._rendered_vr_seq = 0
+        self._vr_frame_lock = threading.Lock()
 
     def connect(self, calibrate: bool = True) -> None:
         if self._is_connected:
@@ -76,10 +125,11 @@ class XRG1Arm(Teleoperator):
         logger.info("Iniciando conexão com o Vuer VR...")
         
         # 1. Inicia o servidor WebRTC / WebSocket do Vuer
+        camera_shape = (480, 640) if self.config.is_simulation else (480, 848)
         self.tv_wrapper = TeleVuerWrapper(
             use_hand_tracking=(self.config.input_mode == "hand"),
             binocular=False,
-            img_shape=(720, 1280),
+            img_shape=camera_shape,
             display_mode=self.config.display_mode,
             zmq=self.config.zmq,
             webrtc=self.config.webrtc,
@@ -97,77 +147,85 @@ class XRG1Arm(Teleoperator):
 
         self._is_connected = True
 
-        # NOVA PARTE: Usando o SensorClient que já funciona!
-        if self.config.zmq:
-            logger.info(f"Conectando ao feed de vídeo ZMQ via SensorClient em {self.config.img_server_ip}:5555...")
-            self.sensor_client = SensorClient()
-            self.sensor_client.start_client(server_ip=self.config.img_server_ip, port=5555)
-            
-            # Inicia uma thread em background para receber as imagens
+        # Câmera do Quest: usa stream local RGB-only (:5558 por padrão), separado
+        # do stream completo RGB+Depth (:5555) usado pelo dataset/OmniView.
+        if self.config.zmq and self.config.display_mode != "pass-through":
+            self.vr_cam_port = int(os.environ.get("G1_VR_CAM_PORT", "5558"))
+            self.vr_display_fps = float(os.environ.get("G1_VR_DISPLAY_FPS", "60"))
+            logger.info(
+                "Conectando ao feed RGB-only do VR em %s:%d (render %.1f FPS)...",
+                self.config.img_server_ip,
+                self.vr_cam_port,
+                self.vr_display_fps,
+            )
+
             self.video_thread = threading.Thread(target=self._receive_video_feed, daemon=True)
+            self.video_render_thread = threading.Thread(target=self._render_video_feed, daemon=True)
             self.video_thread.start()
+            self.video_render_thread.start()
 
         logger.info("VR Teleoperator Conectado! Visite o link do Vuer no navegador do headset.")
 
     def _receive_video_feed(self):
-        while self._is_connected:
+        ctx = zmq.Context.instance()
+        while self._is_connected and not self._video_stop.is_set():
+            sock = ctx.socket(zmq.SUB)
+            sock.setsockopt(zmq.CONFLATE, 1)
+            sock.setsockopt(zmq.RCVHWM, 1)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVTIMEO, 1000)
+            sock.setsockopt_string(zmq.SUBSCRIBE, "")
+            sock.connect(f"tcp://{self.config.img_server_ip}:{self.vr_cam_port}")
             try:
-                # Recebe a mensagem estruturada usando o client oficial do seu sim
-                data = self.sensor_client.receive_message()
-                
-                if not data:
-                    time.sleep(0.005)
-                    continue
-
-                # Extrai a imagem do dicionário (lidando com os dois formatos que seu script suporta)
-                img_data = None
-                cam_name = "head_camera"  # Nome padrão, mas vamos buscar dinamicamente se falhar
-                
-                if "images" in data and cam_name in data["images"]:
-                    img_data = data["images"][cam_name]
-                elif cam_name in data:
-                    img_data = data[cam_name]
-                else:
-                    # Pega a primeira câmera que encontrar no dicionário
-                    keys = [k for k in data.keys() if k not in ["timestamps", "images"]]
-                    if keys:
-                        img_data = data[keys[0]]
-
-                # Se achou a imagem, decodifica usando o ImageUtils
-                if img_data is not None:
-                    if isinstance(img_data, str):
-                        img = ImageUtils.decode_image(img_data)
-                    else:
-                        img = img_data  # Assume que já é numpy array
-
-                    if img is not None and isinstance(img, np.ndarray):
-                        # Converte de BGR para RGB
-                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        
-                        # REDIMENSIONAMENTO DE SEGURANÇA: Garante HD exato pro Vuer
-                        img_rgb = cv2.resize(img_rgb, (1280, 720)) 
-                        
-                        # Envia para o VR
-                        self.tv_wrapper.render_to_xr(img_rgb)
-
+                while self._is_connected and not self._video_stop.is_set():
+                    try:
+                        jpg_bytes = sock.recv()
+                    except zmq.Again:
+                        continue
+                    img = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
+                    with self._vr_frame_lock:
+                        self._latest_vr_frame = img
+                        self._latest_vr_seq += 1
             except Exception as e:
-                logger.error(f"Erro no feed de vídeo ZMQ: {e}")
-                time.sleep(0.01) # Pausa curta para não floodar o log em caso de erro contínuo
+                logger.error(f"Erro no feed de vídeo RGB-only do VR: {e}")
+                time.sleep(0.1)
+            finally:
+                sock.close(0)
+
+    def _render_video_feed(self):
+        period = 1.0 / max(1.0, getattr(self, "vr_display_fps", 30.0))
+        while self._is_connected and not self._video_stop.is_set():
+            start = time.perf_counter()
+            frame = None
+            with self._vr_frame_lock:
+                if self._latest_vr_seq != self._rendered_vr_seq and self._latest_vr_frame is not None:
+                    frame = self._latest_vr_frame
+                    self._rendered_vr_seq = self._latest_vr_seq
+            if frame is not None:
+                try:
+                    self.tv_wrapper.render_to_xr(frame)
+                except Exception as e:
+                    logger.error(f"Erro renderizando feed no VR: {e}")
+            time.sleep(max(0.0, period - (time.perf_counter() - start)))
 
     def disconnect(self) -> None:
         if self._is_connected:
             self._is_connected = False
+            self._video_stop.set()
             
             # Aguarda a thread de vídeo encerrar
             if hasattr(self, 'video_thread') and self.video_thread.is_alive():
                 self.video_thread.join(timeout=1.0)
+            if hasattr(self, 'video_render_thread') and self.video_render_thread.is_alive():
+                self.video_render_thread.join(timeout=1.0)
             
             if self.tv_wrapper:
                 self.tv_wrapper.close()
                 
-            # Fecha o client corretamente
-            if hasattr(self, 'sensor_client'):
-                self.sensor_client.stop_client()
+            with contextlib.suppress(Exception):
+                self._latest_vr_frame = None
 
     @property
     def is_connected(self) -> bool:
@@ -213,33 +271,42 @@ class XRG1Arm(Teleoperator):
             events = getattr(main_mod, "global_events", None)
             
             if action_type == "save" and events is not None:
-                print("\n   🎮 [CONTROLE VR] Ação: SALVANDO e preparando o próximo... ✅")
+                print("\n   🎮 [CONTROLE VR] Ação: SALVANDO e gravando o próximo... ✅")
+                # Sem reset (reset_time_s=0): só encerra o episódio. O clutch
+                # re-ancora para o robô continuar no mesmo estado, sem salto.
                 events["exit_early"] = True
-                def auto_skip():
-                    time.sleep(1.0)
-                    if events: events["exit_early"] = True
-                threading.Thread(target=auto_skip, daemon=True).start()
-                
+                self.clutch_anchored = False
+
             elif action_type == "discard" and events is not None:
-                print("\n   🎮 [CONTROLE VR] Ação: DESCARTANDO lixo e recomeçando... ❌")
+                print("\n   🎮 [CONTROLE VR] Ação: DESCARTANDO e regravando... ❌")
                 events["rerecord_episode"] = True
-                def auto_restart():
-                    time.sleep(0.5)
-                    if events: events["exit_early"] = True
-                    time.sleep(0.5)
-                    if events: events["exit_early"] = True
-                threading.Thread(target=auto_restart, daemon=True).start()
+                events["exit_early"] = True
+                self.clutch_anchored = False
+                # Reseta o timer do episódio no viewer OpenCV imediatamente
+                try:
+                    import json as _json, time as _time
+                    with open("/tmp/g1_record_status.json") as _f:
+                        _st = _json.load(_f)
+                    _st["start_time"] = _time.time()
+                    with open("/tmp/g1_record_status.json", "w") as _f:
+                        _json.dump(_st, _f)
+                except Exception:
+                    pass
 
             elif action_type == "toggle_pause":
-                # Inverte o estado local da teleoperação
                 self.controller_enabled = not self.controller_enabled
-                
-                # Se estiver rodando no gravador, sincroniza a variável global dele também
-                if hasattr(main_mod, "robot_paused"):
-                    main_mod.robot_paused = not self.controller_enabled
-                
-                estado = "DESTRAVADO ▶️" if self.controller_enabled else "CONGELADO 🧊"
-                print(f"\n   🎮 [CONTROLE VR] Ação: Robô {estado}")
+                self.clutch_anchored = False
+
+                if self.controller_enabled:
+                    # Destravado: libera o gravador para seguir o VR
+                    if hasattr(main_mod, "robot_paused"):
+                        main_mod.robot_paused = False
+                    print("\n   🎮 [CONTROLE VR] Ação: Robô DESTRAVADO ▶️")
+                else:
+                    # Congelado: para o robô na posição física atual
+                    if hasattr(main_mod, "robot_paused"):
+                        main_mod.robot_paused = True
+                    print("\n   🎮 [CONTROLE VR] Ação: Robô CONGELADO 🧊")
 
             elif action_type == "exit":
                 print("\n   🎮 [CONTROLE VR] Ação: ENCERRANDO o sistema... 🛑")
@@ -307,53 +374,65 @@ class XRG1Arm(Teleoperator):
         if not self.controller_enabled:
             return {**self.body_joints, **self.hand_joints}
 
-        # --- LÓGICA DE SEGURANÇA CORRIGIDA ---
-        
-        # Ignoramos a cabeça (head_pose) pois a biblioteca cria uma "falsa" ao carregar a página.
-        # A forma 100% garantida é verificar se as mãos/controles estão sendo rastreados,
-        # o que só acontece APÓS você clicar em "Enter VR" no óculos.
+        # Em modo "hand": garante que as mãos estejam sendo rastreadas antes de mover.
         if self.config.input_mode == "hand":
             has_right_hand = np.any(tele_data.right_hand_pos != 0.0)
             has_left_hand = np.any(tele_data.left_hand_pos != 0.0)
-            active_session = has_right_hand or has_left_hand
-        else:
-            active_session = self.controller_enabled
-
-        if not active_session:
-            if self.vr_started:
-                logger.warning("Rastreamento de mãos não detectado (VR inativo). Mantendo posição.")
-                self.vr_started = False
-                self.countdown_done = False
-            
-            # Retorna a posição atual para manter o robô imóvel
-            return {**self.body_joints, **self.hand_joints}
-
-        # Inicia contagem se detectou as mãos no VR
-        if active_session and not self.vr_started:
-            logger.info(">>> MÃOS DETECTADAS NO VR! AGUARDANDO 3 SEGUNDOS PARA INICIAR...")
-            self.vr_started = True
-            self.start_time = time.time()
-
-        if self.vr_started and not self.countdown_done:
-            elapsed = time.time() - self.start_time
-            if elapsed < 3.0:
-                if int(elapsed * 10) % 10 == 0: 
-                    print(f"--- ESTABILIZANDO ROBÔ: {5 - int(elapsed)}s ---", end='\r')
+            if not (has_right_hand or has_left_hand):
+                if self.vr_started:
+                    logger.warning("Rastreamento de mãos não detectado (VR inativo). Mantendo posição.")
+                    self.vr_started = False
                 return {**self.body_joints, **self.hand_joints}
+            if not self.vr_started:
+                logger.info(">>> MÃOS DETECTADAS NO VR! MOVENDO G1...")
+                self.vr_started = True
+
+
+        # 2. Calcula IK dos Braços (retorna 14 ângulos) — com CLUTCH
+        # Watchdog: se houve um congelamento do loop (> 0.5s, típico do encoding
+        # de vídeo ao salvar), re-ancora para o robô não saltar ao retomar.
+        now = time.time()
+        if self.clutch_anchored and self._last_clutch_time is not None and (now - self._last_clutch_time) > 0.5:
+            self.clutch_anchored = False
+        self._last_clutch_time = now
+
+        # Ancora a referência no 1º frame após destravar: a partir daqui o robô
+        # parte da pose ATUAL e segue apenas o DELTA do controle (sem salto).
+        if not self.clutch_anchored:
+            self.ctrl_ref_left = tele_data.left_wrist_pose.copy()
+            self.ctrl_ref_right = tele_data.right_wrist_pose.copy()
+            # Re-ancoragem (ex: após salvar): parte da ÚLTIMA pose comandada para
+            # o robô continuar de onde estava, sem salto. Na 1ª vez (sem
+            # histórico), usa a FK da config atual (q≈0, comandada no countdown).
+            if self.last_left_target is not None:
+                self.robot_ref_left = self.last_left_target.copy()
+                self.robot_ref_right = self.last_right_target.copy()
             else:
-                logger.info("\n>>> SISTEMA LIBERADO! MOVIMENTANDO G1...")
-                self.countdown_done = True
-        
-        # --- FIM DA LÓGICA DE SEGURANÇA ---
+                self.robot_ref_left, self.robot_ref_right = self.arm_ik.forward_kinematics(self.current_arm_q)
+            self.clutch_anchored = True
+            logger.info(">>> CLUTCH ancorado: robô parado. Mova os controles para movê-lo.")
 
+        # Alvo = pose de referência do robô + movimento RELATIVO do controle
+        # (translação somada no mundo; rotação relativa aplicada à rotação base)
+        left_target = self.robot_ref_left.copy()
+        left_target[:3, 3] = self.robot_ref_left[:3, 3] + (tele_data.left_wrist_pose[:3, 3] - self.ctrl_ref_left[:3, 3])
+        left_target[:3, :3] = (tele_data.left_wrist_pose[:3, :3] @ self.ctrl_ref_left[:3, :3].T) @ self.robot_ref_left[:3, :3]
 
-        # 2. Calcula IK dos Braços (retorna 14 ângulos)
-        sol_q, _ = self.arm_ik.solve_ik(
-            tele_data.left_wrist_pose, 
-            tele_data.right_wrist_pose, 
-            self.current_arm_q, 
-            self.current_arm_dq
-        )
+        right_target = self.robot_ref_right.copy()
+        right_target[:3, 3] = self.robot_ref_right[:3, 3] + (tele_data.right_wrist_pose[:3, 3] - self.ctrl_ref_right[:3, 3])
+        right_target[:3, :3] = (tele_data.right_wrist_pose[:3, :3] @ self.ctrl_ref_right[:3, :3].T) @ self.robot_ref_right[:3, :3]
+
+        # Guarda a pose-alvo para permitir re-ancorar sem salto (ex: ao salvar)
+        self.last_left_target = left_target.copy()
+        self.last_right_target = right_target.copy()
+
+        # Seed = None → o solver faz warm-start da PRÓPRIA solução anterior
+        # (self.init_data) e o custo de suavidade (var_q_last) passa a penalizar o
+        # salto desde o último frame. Antes passávamos self.current_arm_q, que NUNCA
+        # é atualizado (send_feedback não é chamado no record loop) e ficava em zeros:
+        # isso resetava o seed pra zero todo frame e anulava o smooth cost → o IPOPT
+        # caía em soluções ligeiramente diferentes a cada frame (cotovelo "pulando") → tremor.
+        sol_q, _ = self.arm_ik.solve_ik(left_target, right_target, None, None)
 
         # Mapeia os 14 ângulos para o dicionário do LeRobot
         # Esquerdo (índices 0 a 6)
@@ -420,11 +499,13 @@ class XRG1Arm(Teleoperator):
                     
                     right_hand_q[5] += (FORCA_PUNHO * punho_dir)
                     right_hand_q[6] += (FORCA_PUNHO * punho_dir)
-                    right_hand_q[3] += (FORCA_PUNHO * punho_dir) 
+                    right_hand_q[3] += (FORCA_PUNHO * punho_dir)
                     right_hand_q[4] += (FORCA_PUNHO * punho_dir)
 
-                    for i, name in enumerate(self._left_hand_names):
-                        self.hand_joints[f"{name}.q"] = left_hand_q[i]
+                    # Por padrão controla as DUAS mãos; com --left-arm-limp só a direita.
+                    if not _left_arm_limp():
+                        for i, name in enumerate(self._left_hand_names):
+                            self.hand_joints[f"{name}.q"] = left_hand_q[i]
 
                     for i, name in enumerate(self._right_hand_names):
                         self.hand_joints[f"{name}.q"] = right_hand_q[i]
@@ -440,16 +521,28 @@ class XRG1Arm(Teleoperator):
                     for obj in gc.get_objects():
                         if type(obj).__name__ == "UnitreeG1Dex3":
                             
-                            NOVO_KP = 0.3  # Padrão era 0.8 (Trator). 0.3 deixa como Mola.
-                            NOVO_KD = 0.1  # Amortecimento suave
-                            KP_BASE_POLEGAR = 0.8  # <--- Mantemos forte para conseguir voltar!
+                            # "MOLA" (grasp complacente) — design original que NAO trava.
+                            # kp alto (1.0/2.0) contra objeto/batente => erro de posicao sustentado
+                            # => tau=kp*erro grande => sobrecorrente => firmware Dex3 desliga o motor.
+                            # kp=0.3 mantem o torque baixo mesmo no limite => fecha sem travar.
+                            NOVO_KP = 0.3   # dedos: mola
+                            NOVO_KD = 0.2
+                            KP_BASE_POLEGAR = 0.8  # polegar um pouco mais firme p/ conseguir retornar
                             
+                            # Mão ESQUERDA: por padrão recebe o MESMO kp da direita (ATIVA).
+                            # Com --left-arm-limp (env G1_LEFT_ARM_LIMP) fica mole (kp=0).
+                            _left_limp = _left_arm_limp()
                             if hasattr(obj, "_left_hand_msg") and obj._left_hand_msg is not None:
                                 for i in range(7):
-                                    # Aplica força total apenas no motor 0 (base do polegar)
-                                    obj._left_hand_msg.motor_cmd[i].kp = KP_BASE_POLEGAR if i == 0 else NOVO_KP
-                                    obj._left_hand_msg.motor_cmd[i].kd = NOVO_KD
-                                    
+                                    if _left_limp:
+                                        obj._left_hand_msg.motor_cmd[i].kp = 0.0
+                                        obj._left_hand_msg.motor_cmd[i].kd = 0.0
+                                        obj._left_hand_msg.motor_cmd[i].q = 0.0
+                                        obj._left_hand_msg.motor_cmd[i].tau = 0.0
+                                    else:
+                                        obj._left_hand_msg.motor_cmd[i].kp = KP_BASE_POLEGAR if i == 0 else NOVO_KP
+                                        obj._left_hand_msg.motor_cmd[i].kd = NOVO_KD
+
                             if hasattr(obj, "_right_hand_msg") and obj._right_hand_msg is not None:
                                 for i in range(7):
                                     obj._right_hand_msg.motor_cmd[i].kp = KP_BASE_POLEGAR if i == 0 else NOVO_KP
@@ -459,16 +552,30 @@ class XRG1Arm(Teleoperator):
                             print(f"\n   🪽 [HACK] Kp ajustado! Dedos em {NOVO_KP}, mas base do polegar em {KP_BASE_POLEGAR} para conseguir retornar.")
                             break
 
-                # --- LEITURA DOS GATILHOS COM DEADZONE ---
-                left_trigger = np.clip((10.0 - tele_data.left_ctrl_triggerValue) / 10.0, 0.0, 1.0)
-                right_trigger = np.clip((10.0 - tele_data.right_ctrl_triggerValue) / 10.0, 0.0, 1.0)
+                # --- LEITURA DOS GATILHOS E SQUEEZE COM FILTRO EMA ---
+                # O squeeze e o trigger do Quest são quasi-binários (saltam 0→1 abruptamente).
+                # Sem filtro, cada salto vira um step de ±1.5 rad nos dedos → tremor visível.
+                # EMA (alpha=0.2) suaviza em ~5 frames / 150ms sem atrasar a resposta perceptivelmente.
+                raw_tr_l = np.clip((10.0 - tele_data.left_ctrl_triggerValue)  / 10.0, 0.0, 1.0)
+                raw_tr_r = np.clip((10.0 - tele_data.right_ctrl_triggerValue) / 10.0, 0.0, 1.0)
+                raw_sq_l = np.clip(tele_data.left_ctrl_squeezeValue,  0.0, 1.0)
+                raw_sq_r = np.clip(tele_data.right_ctrl_squeezeValue, 0.0, 1.0)
+                a = self._EMA_ALPHA
+                self._tr_l = a * raw_tr_l + (1 - a) * self._tr_l
+                self._tr_r = a * raw_tr_r + (1 - a) * self._tr_r
+                self._sq_l = a * raw_sq_l + (1 - a) * self._sq_l
+                self._sq_r = a * raw_sq_r + (1 - a) * self._sq_r
+                left_trigger  = 0.0 if self._tr_l < 0.05 else self._tr_l
+                right_trigger = 0.0 if self._tr_r < 0.05 else self._tr_r
+                left_squeeze  = self._sq_l
+                right_squeeze = self._sq_r
 
-                # FORÇA O RETORNO AO ZERO: Se o gatilho for solto (mesmo com folga no controle), zera o valor.
-                if left_trigger < 0.05: left_trigger = 0.0
-                if right_trigger < 0.05: right_trigger = 0.0
-
-                left_squeeze = np.clip(tele_data.left_ctrl_squeezeValue, 0.0, 1.0)
-                right_squeeze = np.clip(tele_data.right_ctrl_squeezeValue, 0.0, 1.0)
+                # Grava os 4 sinais de grasp brutos do controle como dims do dataset
+                # (0-1, filtrados por EMA). Não vão pra motor — só registro.
+                self.hand_joints["left_grasp_squeeze.q"]  = float(left_squeeze)
+                self.hand_joints["right_grasp_squeeze.q"] = float(right_squeeze)
+                self.hand_joints["left_grasp_trigger.q"]  = float(left_trigger)
+                self.hand_joints["right_grasp_trigger.q"] = float(right_trigger)
 
                 # =========================
                 # LÓGICA DE MOVIMENTO
@@ -476,8 +583,12 @@ class XRG1Arm(Teleoperator):
                 left_hand_q = np.zeros(7)
                 right_hand_q = np.zeros(7)
 
-                LEFT_TARGET = np.array([0.0,  1.5,  1.5, -1.5, -1.5, -1.5, -1.5])
-                RIGHT_TARGET = np.array([0.0, -1.5, -1.5,  1.5,  1.5,  1.5,  1.5])
+                # Alvos de FECHAMENTO TOTAL = limites do Dex3 (g1_utils.DEX3_*_LIMITS).
+                # Antes usava ±1.5 (genérico), que subutilizava o range real (até ±1.74)
+                # e ainda clipava o thumb_1 → a mão só fechava ~85%. Agora bate o limite.
+                # Ordem: [thumb_0(rot), thumb_1, thumb_2, index_0, index_1, middle_0, middle_1]
+                LEFT_TARGET  = np.array([0.0,  0.920,  1.74, -1.57, -1.74, -1.57, -1.74])
+                RIGHT_TARGET = np.array([0.0, -0.920, -1.74,  1.57,  1.74,  1.57,  1.74])
 
                 # Grip completo
                 left_hand_q  = left_squeeze  * LEFT_TARGET
@@ -524,15 +635,18 @@ class XRG1Arm(Teleoperator):
                 left_hand_q[1] += 0.8 * left_trigger
                 left_hand_q[2] += 0.8 * left_trigger
 
-                right_hand_q[1] -= 0.8 * right_trigger 
+                right_hand_q[1] -= 0.8 * right_trigger
                 right_hand_q[2] -= 0.8 * right_trigger
+
 
                 # =========================
                 # APLICAÇÃO FINAL
+                # Por padrão controla as DUAS mãos. Com --left-arm-limp, a esquerda
+                # fica travada em aberto (q=0) e só a direita é controlada.
                 # =========================
-                for i, name in enumerate(self._left_hand_names):
-                    self.hand_joints[f"{name}.q"] = left_hand_q[i]
-
+                if not _left_arm_limp():
+                    for i, name in enumerate(self._left_hand_names):
+                        self.hand_joints[f"{name}.q"] = left_hand_q[i]
                 for i, name in enumerate(self._right_hand_names):
                     self.hand_joints[f"{name}.q"] = right_hand_q[i]
 
