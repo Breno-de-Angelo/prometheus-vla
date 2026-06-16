@@ -17,6 +17,8 @@
 dataset:
   repo_id: lewislf/G1_Dex3_right14_dataset
   root: lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432
+  revision: main        # evita get_safe_version/404 para dataset local
+  video_backend: pyav   # torchcodec quebrado (libffi) no ms3
 
   image_transforms:
     enable: true
@@ -59,6 +61,8 @@ dataset:
 val_dataset:
   repo_id: lewislf/G1_Dex3_right14_dataset
   root: lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432
+  revision: main
+  video_backend: pyav
   episodes: [12, 13, 14]
 
 

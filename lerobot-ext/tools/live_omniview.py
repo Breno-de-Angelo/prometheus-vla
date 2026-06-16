@@ -143,14 +143,23 @@ def _image_thread(host: str, port: int, stop: threading.Event, show_depth: bool,
                     depth_info = images.get("head_camera_depth")
                     out = {}
 
-                    # RGB — multipart (dict c/ índice 'part', bytes JPEG crus) ou legado (base64 str)
+                    # RGB — multipart (dict c/ índice 'part', bytes JPEG crus) ou legado (base64 str).
+                    # O JPEG da câmera é codificado na convenção do OpenCV (cv2.imencode = BGR). O MODELO
+                    # usa cv2.imdecode → vê o RGB CORRETO. Mas o BROWSER lê JPEG na convenção oposta (RGB),
+                    # então o passthrough sairia com R↔B trocado. Pra exibir EXATAMENTE o array que o modelo
+                    # vê: decodificamos como o modelo (cv2.imdecode) e re-encodamos browser-fiel via
+                    # _jpg_dataurl (que espera BGR) → _m[:, :, ::-1] é o BGR do que o modelo enxerga.
+                    _rgb_jpg = None
                     if isinstance(rgb_info, dict) and protocol == "zmq.compressed.v1":
                         idx = rgb_info.get("part")
                         if idx is not None and idx < len(parts):
-                            out["rgb"] = "data:image/jpeg;base64," + base64.b64encode(parts[idx]).decode("ascii")
+                            _rgb_jpg = parts[idx]
                     elif isinstance(rgb_info, str):
-                        # legado: RGB já chega como JPEG/base64; OmniView é só viz, não re-encoda.
-                        out["rgb"] = "data:image/jpeg;base64," + rgb_info
+                        _rgb_jpg = base64.b64decode(rgb_info)
+                    if _rgb_jpg is not None:
+                        _m = cv2.imdecode(np.frombuffer(_rgb_jpg, np.uint8), cv2.IMREAD_COLOR)  # = visão do modelo
+                        out["rgb"] = (_jpg_dataurl(_m[:, :, ::-1]) if _m is not None
+                                      else "data:image/jpeg;base64," + base64.b64encode(_rgb_jpg).decode("ascii"))
 
                     # Depth — multipart (PNG uint16 crus) ou legado (base64 str)
                     if show_depth:
@@ -274,11 +283,27 @@ def _tele_thread(port: int, stop: threading.Event):
 
 
 # ----------------------------------------------------------------------------- web / ws
+async def _safe_close(ws):
+    try:
+        await ws.close()
+    except Exception:
+        pass
+
+
 async def _ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(max_msg_size=0)
     await ws.prepare(request)
-    request.app["clients"].add(ws)
-    logger.info("ws conectado (%d clientes)", len(request.app["clients"]))
+    clients = request.app["clients"]
+    # SÓ 1 CLIENTE: derruba as conexões anteriores. Reconexões órfãs (o ws cai sem o
+    # servidor perceber e o browser reconecta) acumulavam no set e multiplicavam o
+    # broadcast — 1 aba virava 5 clientes e a CPU do viewer estourava. O cliente novo
+    # substitui o antigo; o discard é imediato (para o broadcast já), o close roda em
+    # segundo plano pra não travar caso o socket velho esteja morto.
+    for old in list(clients):
+        clients.discard(old)
+        asyncio.create_task(_safe_close(old))
+    clients.add(ws)
+    logger.info("ws conectado (%d clientes)", len(clients))
     try:
         async for m in ws:  # só mantém viva; o broadcast empurra os frames
             if m.type == WSMsgType.ERROR:

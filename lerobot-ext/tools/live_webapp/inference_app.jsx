@@ -163,29 +163,70 @@
     </MediaPanel>;
   });
 
-  // ───────── ramps panel (reusa window.Ramps) ─────────
-  function RampsPanel({ tele, frame, group, setGroup, sig, setSig }) {
-    const names = OV.LAYOUT[group].kind === 'arm' ? OV.ARM_JOINTS : (group === 'rightHand' ? OV.RHAND_JOINTS : OV.LHAND_JOINTS);
-    const Toggle = ({ k, c, l }) => <button className={'sig' + (sig[k] ? ' on' : '')} style={{ color: sig[k] ? c : undefined }}
-      onClick={() => setSig(s => ({ ...s, [k]: !s[k] }))}><i style={{ borderColor: c, background: sig[k] ? c : 'transparent' }} />{l}</button>;
+  // ───────── arm joint blocks (Shoulder / Elbow / Wrist como painéis próprios) ─────────
+  // Cada grupo de juntas vira um painel (igual aos de câmera), com as juntas sobrepostas
+  // (cor por junta) e auto-escala do BLOCO — assim cada bloco tem altura p/ respirar.
+  // cor ÚNICA por junta do braço (dim 7..13) — não se repete entre blocos
+  const JOINT_COLS = ['#38bdf8', '#34d399', '#a78bfa', '#fb923c', '#f472b6', '#facc15', '#f87171'];
+  const colOf = (d, base) => JOINT_COLS[(((d - base) % 7) + 7) % 7];  // cor por posição da junta no braço (0..6)
+  const JointBlock = React.memo(function JointBlock({ tele, frame, dims, subNames, base, showCmd }) {
+    const cref = useRef(null);
+    const pref = useRef(null); pref.current = { tele, frame, dims, subNames, base, showCmd };
+    useEffect(() => {
+      const cv = cref.current, ctx = cv.getContext('2d');
+      const DPR = Math.min(2, window.devicePixelRatio || 1);
+      let W = 0, H = 0;
+      function resize() { const r = cv.getBoundingClientRect(); W = r.width; H = r.height; cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); }
+      resize(); const ro = new ResizeObserver(resize); ro.observe(cv);
+      let raf;
+      function draw() {
+        const P = pref.current, tl = P.tele;
+        ctx.save(); ctx.scale(DPR, DPR); ctx.clearRect(0, 0, W, H);
+        if (!tl || !tl.state.length) { ctx.restore(); return; }
+        const F = tl.state.length;
+        const padL = 10, padR = 50, padT = 22, padB = 16;
+        const plotW = W - padL - padR, plotH = H - padT - padB;
+        let mn = 1e9, mx = -1e9;
+        const series = [['exec', tl.state]]; if (P.showCmd) series.push(['cmd', tl.action]);
+        for (const [, arr] of series) for (const d of P.dims) for (let f = 0; f < F; f++) { const v = arr[f][d]; if (v < mn) mn = v; if (v > mx) mx = v; }
+        if (mn === mx) { mn -= 0.1; mx += 0.1; } const pd = (mx - mn) * 0.14 || 0.05; mn -= pd; mx += pd;
+        const X = f => padL + (F < 2 ? 0 : (f / (F - 1)) * plotW), Y = v => padT + plotH - ((v - mn) / (mx - mn)) * plotH;
+        // zero line
+        if (mn < 0 && mx > 0) { ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(padL, Y(0)); ctx.lineTo(padL + plotW, Y(0)); ctx.stroke(); }
+        // each joint
+        P.dims.forEach((d, j) => {
+          const col = colOf(d, P.base);
+          if (P.showCmd) { ctx.strokeStyle = col; ctx.globalAlpha = .4; ctx.lineWidth = 1; ctx.setLineDash([3, 3]); ctx.beginPath(); for (let f = 0; f < F; f++) { const x = X(f), y = Y(tl.action[f][d]); f ? ctx.lineTo(x, y) : ctx.moveTo(x, y); } ctx.stroke(); ctx.globalAlpha = 1; ctx.setLineDash([]); }
+          ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); for (let f = 0; f < F; f++) { const x = X(f), y = Y(tl.state[f][d]); f ? ctx.lineTo(x, y) : ctx.moveTo(x, y); } ctx.stroke();
+          // valor atual (à direita)
+          ctx.fillStyle = col; ctx.textAlign = 'right'; ctx.font = '10px JetBrains Mono, monospace';
+          ctx.fillText(tl.state[F - 1][d].toFixed(2), W - 5, padT + 11 + j * 13);
+        });
+        // legenda (topo) — identifica por junta + dim, cor única
+        ctx.textAlign = 'left'; ctx.font = '10px JetBrains Mono, monospace'; let lx = padL + 1;
+        P.dims.forEach((d, j) => { const col = colOf(d, P.base); ctx.fillStyle = col; ctx.fillRect(lx, 5, 10, 3); ctx.fillStyle = '#9fb2d4'; const nm = P.subNames[j] + ' d' + d; ctx.fillText(nm, lx + 14, 9); lx += 14 + ctx.measureText(nm).width + 13; });
+        // playhead
+        const fr = Math.max(0, Math.min(F - 1, Math.round(P.frame)));
+        ctx.strokeStyle = '#38bdf8'; ctx.globalAlpha = .65; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X(fr), padT); ctx.lineTo(X(fr), padT + plotH); ctx.stroke(); ctx.globalAlpha = 1;
+        // eixo de tempo
+        const fps = tl.fps || 30, winSec = (F - 1) / fps, step = winSec > 20 ? 5 : (winSec > 8 ? 2 : 1);
+        ctx.fillStyle = '#48566a'; ctx.font = '9px JetBrains Mono, monospace'; ctx.textAlign = 'center';
+        for (let s = 0; s <= winSec + 1e-3; s += step) { const f = (F - 1) - s * fps; if (f < 0) break; ctx.fillText(s === 0 ? 'agora' : ('-' + s + 's'), X(f), H - 4); }
+        ctx.restore();
+      }
+      function loop() { draw(); raf = requestAnimationFrame(loop); } raf = requestAnimationFrame(loop);
+      return () => { cancelAnimationFrame(raf); ro.disconnect(); };
+    }, []);
+    return <canvas ref={cref} className="ramps-canvas" />;
+  });
+  function ArmBlockPanel({ label, sideLabel, tele, frame, dims, subNames, base, showCmd }) {
     return (
-      <div className="pnl amber" style={{ gridColumn: '3', gridRow: '2' }}>
-        <div className="phead">
-          <span className="ptag"><i />Comando</span>
-          <div className="rcontrols">
-            {['rightArm', 'rightHand'].map(g => <button key={g} className={'rtab' + (group === g ? ' on' : '')}
-              onClick={() => setGroup(g)}>{OV.LAYOUT[g].label}</button>)}
-          </div>
-        </div>
-        <div className="phead" style={{ borderTop: 'none', paddingTop: 5, paddingBottom: 5, background: 'none' }}>
-          <span className="pmeta">recebido / filtrado / executado</span>
-          <div className="rleg"><Toggle k="cmd" c="#22d3ee" l="recebido" /><Toggle k="filt" c="#f59e0b" l="filtrado" /><Toggle k="exec" c="#34d399" l="executado" /></div>
-        </div>
+      <div className="pnl amber">
+        <div className="phead"><span className="ptag"><i />{label}</span><span className="pmeta">{sideLabel} · rad</span></div>
         <div className="pbody" style={{ background: '#05080d', display: 'block' }}>
-          {tele ? <Ramps tele={tele} frame={frame} group={group} jointNames={names} signals={sig} onScrub={() => {}} accent={ACCENT} />
+          {tele ? <JointBlock tele={tele} frame={frame} dims={dims} subNames={subNames} base={base} showCmd={showCmd} />
                 : <span className="wait" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>aguardando telemetria</span>}
         </div>
-        <div className="rfoot">scroll = comprime/expande o tempo · "filtrado" derivado ao vivo · "executado" = pós-clamp</div>
       </div>
     );
   }
@@ -193,8 +234,10 @@
   // ───────── App ─────────
   function App() {
     const { histRef, graspRef, graspHistRef, imgRef, metaRef, lastTeleRef, phaseRef, conn } = useLiveData();
-    const [group, setGroup] = useState('rightArm');
-    const [sig, setSig] = useState({ cmd: false, filt: true, exec: true });
+    const [showCmd, setShowCmd] = useState(false); // mostra o "recebido" (ação da VLA) tracejado além do executado
+    const [armSide, setArmSide] = useState('right'); // 'right' (dims 7-13, controlado) | 'left' (dims 0-6, limp/medido)
+    const base = armSide === 'right' ? 7 : 0;
+    const sideLabel = armSide === 'right' ? 'Braço dir' : 'Braço esq';
     const hzRef = useRef({ last: performance.now(), n: 0, hz: 0 });
     const hist = histRef.current, F = hist.length, img = imgRef.current, meta = metaRef.current;
     { const h = hzRef.current; h.n++; const now = performance.now(); if (now - h.last > 1000) { h.hz = h.n * 1000 / (now - h.last); h.n = 0; h.last = now; } }
@@ -222,6 +265,10 @@
             <span className="chip">{hzRef.current.hz.toFixed(0)} <b>Hz</b></span>
             <span className={'chip phase ' + ph[0]}><span className="pdot" />{ph[1]}</span>
           </div>
+          <div className="armsel">
+            {[['right', 'Braço Direito'], ['left', 'Braço Esquerdo']].map(([s, l]) =>
+              <button key={s} className={'armbtn' + (armSide === s ? ' on' : '')} onClick={() => setArmSide(s)}>{l}</button>)}
+          </div>
           <div className="spacer" />
           <div className="leds"><Led label="WS" state={conn} /><Led label="VLA" state={g1} /></div>
           <GraspGauge grasp={graspRef.current} hist={graspHistRef.current} />
@@ -231,9 +278,9 @@
           <div className="cell"><Rgb url={img.rgb} size={img.rgbSize} /></div>
           <div className="cell"><Depth url={img.depth} meta={img.depthMeta} /></div>
           <div className="cell"><Attn url={img.rgb} hm={img.attnHm} size={img.rgbSize} /></div>
-          <div className="cell"><SimCam tag="Robô · 3ª pessoa" path="/global.mjpg" badge="SIM" /></div>
-          <div className="cell"><SimCam tag="Robô · 1ª pessoa" path="/head.mjpg" badge="POV" /></div>
-          <div className="cell"><RampsPanel tele={tele} frame={F - 1} group={group} setGroup={setGroup} sig={sig} setSig={setSig} /></div>
+          <div className="cell"><ArmBlockPanel label="Shoulder" sideLabel={sideLabel} tele={tele} frame={F - 1} dims={[base, base + 1, base + 2]} subNames={['Pitch', 'Roll', 'Yaw']} base={base} showCmd={showCmd} /></div>
+          <div className="cell"><ArmBlockPanel label="Elbow" sideLabel={sideLabel} tele={tele} frame={F - 1} dims={[base + 3]} subNames={['Elbow']} base={base} showCmd={showCmd} /></div>
+          <div className="cell"><ArmBlockPanel label="Wrist" sideLabel={sideLabel} tele={tele} frame={F - 1} dims={[base + 4, base + 5, base + 6]} subNames={['Roll', 'Pitch', 'Yaw']} base={base} showCmd={showCmd} /></div>
         </div>
 
         <div className="foot">
@@ -241,7 +288,8 @@
           <span>{conn ? 'AO VIVO' : 'sem conexão'}</span>
           <span className="sp" />
           <span>buffer <b>{F}</b>/{MAXLEN}f</span>
-          <span>replay aberto · a VLA vê a imagem real · o robô do sim visualiza o comando</span>
+          <span>braço dir · linha cheia = executado (robô)</span>
+          <button className={'sig' + (showCmd ? ' on' : '')} onClick={() => setShowCmd(s => !s)} style={{ marginLeft: 8 }}><i style={{ borderColor: '#9fb2d4', background: showCmd ? '#9fb2d4' : 'transparent' }} />recebido (tracejado)</button>
         </div>
       </div>
     );

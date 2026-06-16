@@ -502,7 +502,7 @@ class UnitreeG1(Robot):
             # Deve coincidir com o fps do record_loop (30Hz). Ajuste aqui se mudar o fps.
             "arm_interp_hz": 30.0,
         }
-        path = os.environ.get("G1_TUNING", "g1_tuning.json")
+        path = os.environ.get("G1_TUNING", "lerobot-ext/config/g1_tuning.json")
         try:
             mt = os.path.getmtime(path)
             if mt != getattr(self, "_tuning_mtime", None):

@@ -48,3 +48,12 @@ lerobot-ext/g1_env.tar.gz
 
 # Notas internas do Claude (NUNCA subir) — handoff/docs de trabalho
 _claude_notes/
+
+# --- artefatos gerados (replays/relatorios/sprites) — regeneraveis pelos build_*.py ---
+docs/probs/*.html
+docs/probs/*.png
+docs/diagnostico_treino_grasp/**/*.html
+docs/treino_e_dataset/**/*.html
+docs/investigacao_deploy_robo/**/*.png
+docs/old/**/*.html
+runs/

@@ -611,12 +611,13 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
-                # loss_per_dim vem do forward como LISTA — o wrapper do wandb só
-                # loga escalares (ignorava com warning). Expande em loss_dim_XX.
+                # loss_per_dim vem do forward como LISTA. O per-dim vai pra uma seção
+                # SEPARADA "dim_train/" (continua logado, mas sem poluir "train/").
                 per_dim = wandb_log_dict.pop("loss_per_dim", None)
+                dim_train_dict = {}
                 if isinstance(per_dim, (list, tuple)):
                     for i, v in enumerate(per_dim):
-                        wandb_log_dict[f"loss_dim_{i:02d}"] = float(v)
+                        dim_train_dict[f"loss_dim_{i:02d}"] = float(v)
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
                     wandb_log_dict.update(
@@ -631,6 +632,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     wandb_log_dict["loss_std"] = train_tracker.metrics["loss"].std
 
                 wandb_logger.log_dict(wandb_log_dict, step)
+                # per-dim na seção separada dim_train/ (mantém logado, fora da principal)
+                if dim_train_dict and getattr(wandb_logger, "_wandb", None) is not None:
+                    wandb_logger._wandb.log({f"dim_train/{k}": v for k, v in dim_train_dict.items()}, step=step)
             train_tracker.reset_averages()
 
         # Validation Loop
@@ -716,7 +720,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
 
             if is_main_process:
                 logging.info(f"Validation Results: {val_loss_meter}")
-                val_log_dict = {
+                # eval/ = PRINCIPAL (só o que importa: val_action_mse + split braço/grasp).
+                # dim_eval/ = seção separada: per-dim + a flow-loss (val_loss, proxy frouxa),
+                # mantida logada mas fora da visão principal.
+                val_log_dict = {}
+                dim_eval_dict = {
                     "val_loss": val_loss_meter.avg,
                     "val_loss_std": val_loss_meter.std,
                 }
@@ -724,21 +732,29 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     logging.info(f"  {val_action_mse_meter}")
                     val_log_dict["val_action_mse"] = val_action_mse_meter.avg
                     val_log_dict["val_action_mse_std"] = val_action_mse_meter.std
-                # per-dim no wandb: val_action_mse_dim_XX e val_loss_dim_XX
                 mse_dim_avg = None
                 if val_mse_dim_n:
                     mse_dim_avg = val_mse_dim_sum / val_mse_dim_n
-                    for i, v in enumerate(mse_dim_avg.tolist()):
-                        val_log_dict[f"val_action_mse_dim_{i:02d}"] = v
+                    _md = mse_dim_avg.tolist()
+                    for i, v in enumerate(_md):
+                        dim_eval_dict[f"val_action_mse_dim_{i:02d}"] = v
+                    # split p/ eval/ principal: braço = dims 0-6, grasp = dims 7+ (squeeze/dedos)
+                    if len(_md) >= 8:
+                        val_log_dict["val_action_mse_arm"] = float(sum(_md[:7]) / 7)
+                        _grasp = _md[7:]
+                        val_log_dict["val_action_mse_grasp"] = float(sum(_grasp) / len(_grasp))
                 if val_lpd_n:
                     for i, v in enumerate((val_lpd_sum / val_lpd_n).tolist()):
-                        val_log_dict[f"val_loss_dim_{i:02d}"] = v
+                        dim_eval_dict[f"val_loss_dim_{i:02d}"] = v
                 for k, meter in val_metrics.items():
                     val_log_dict[f"val_{k}"] = meter.avg
                     logging.info(f"  {k}: {meter.avg:.3f}")
 
                 if wandb_logger:
                     wandb_logger.log_dict(val_log_dict, step, mode="eval")
+                    # per-dim + flow-loss na seção separada dim_eval/
+                    if getattr(wandb_logger, "_wandb", None) is not None:
+                        wandb_logger._wandb.log({f"dim_eval/{k}": v for k, v in dim_eval_dict.items()}, step=step)
 
                 # Critério do BEST (revisado com o usuário, 2026-06-10): SÓ
                 # val_action_mse (erro do chunk de ação gerado no held-out) — é o

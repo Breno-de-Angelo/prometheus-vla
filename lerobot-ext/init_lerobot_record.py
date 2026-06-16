@@ -5,10 +5,98 @@ Corrigindo validação de Tuplas e adicionando controle Hands-Free.
 """
 
 import sys
+import os
+
+# ---------------------------------------------------------------------------
+# 🔄 AUTO-ATIVAÇÃO DO ENV CONDA 'g1'
+# Se este script foi lançado FORA do env certo, re-executa com o Python do env
+# (sem precisar de `conda activate g1` antes). Tem que vir ANTES dos imports
+# pesados (numpy, robot, teleop), que só existem no env. Override: G1_CONDA_ENV.
+# A guarda _G1_REEXEC evita loop infinito caso a detecção falhe.
+# ---------------------------------------------------------------------------
+_TARGET_ENV = os.environ.get("G1_CONDA_ENV", "g1")
+_in_target = (os.environ.get("CONDA_DEFAULT_ENV") == _TARGET_ENV
+              or f"{os.sep}envs{os.sep}{_TARGET_ENV}{os.sep}" in sys.executable)
+if not _in_target and not os.environ.get("_G1_REEXEC"):
+    def _find_env_python(env):
+        cands = []
+        exe = os.environ.get("CONDA_EXE")          # .../bin/conda → base
+        if exe:
+            base = os.path.dirname(os.path.dirname(exe))
+            cands.append(os.path.join(base, "envs", env, "bin", "python"))
+        for root in ("~/miniconda3", "~/anaconda3", "~/miniforge3", "~/mambaforge"):
+            cands.append(os.path.expanduser(f"{root}/envs/{env}/bin/python"))
+        return next((c for c in cands if os.path.exists(c)), None)
+
+    _env_py = _find_env_python(_TARGET_ENV)
+    if _env_py:
+        _env_prefix = os.path.dirname(os.path.dirname(_env_py))   # .../envs/g1
+        os.environ["_G1_REEXEC"] = "1"
+        os.environ["CONDA_PREFIX"] = _env_prefix
+        os.environ["CONDA_DEFAULT_ENV"] = _TARGET_ENV
+        os.environ["PATH"] = os.path.dirname(_env_py) + os.pathsep + os.environ.get("PATH", "")
+        print(f"[ENV] 🔄 Ativando conda '{_TARGET_ENV}' automaticamente...", file=sys.stderr)
+        os.execv(_env_py, [_env_py] + sys.argv)
+    else:
+        print(f"[ENV] ⚠️ Não achei o Python do env conda '{_TARGET_ENV}'. "
+              f"Ative manualmente: conda activate {_TARGET_ENV}", file=sys.stderr)
+
+# Promove o editable finder (PEP 660) à frente do PathFinder: senão o
+# unitree_sdk2py do ~/.local (PyPI, sem crc.so) mascara o do env. Só reordena
+# meta_path, então o ~/.local segue valendo pro resto (ex.: orjson).
+try:
+    from importlib.machinery import PathFinder as _PathFinder
+    _ed = [f for f in sys.meta_path
+           if str(getattr(f, "__module__", "")).startswith("__editable__")
+           or getattr(f, "__name__", "") == "_EditableFinder"]
+    if _ed:
+        for f in _ed:
+            sys.meta_path.remove(f)
+        _i = next((i for i, f in enumerate(sys.meta_path) if f is _PathFinder), 0)
+        sys.meta_path[_i:_i] = _ed
+except Exception as _e:
+    print(f"[ENV] ⚠️ não consegui priorizar o editable finder: {_e}", file=sys.stderr)
+
+# Silencia o aviso cosmético do pkg_resources (vindo do pygame) — terminal limpo.
+import warnings as _warnings
+_warnings.filterwarnings("ignore", message=r"pkg_resources is deprecated.*")
+
 import logging
 import numpy as np
 import threading
 import time
+
+
+class _BootCapture:
+    """Acumula o stdout durante imports/patches (antes do run.log existir).
+    É despejado no run.log no __main__, mantendo o terminal limpo no boot.
+    (stderr NÃO é capturado — erros de import continuam visíveis.)"""
+
+    def __init__(self, real):
+        self._real = real
+        self._parts = []
+
+    def write(self, s):
+        self._parts.append(s)
+        return len(s)
+
+    def flush(self):
+        pass
+
+    def fileno(self):
+        return self._real.fileno()
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        return "".join(self._parts)
+
+
+_BOOT_CAP = _BootCapture(sys.stdout)
+sys.stdout = _BOOT_CAP
+
+print("[ENV] ⏳ Carregando bibliotecas (torch/lerobot/mujoco), ~10s...", file=sys.stderr)
 
 frame_count = 0
 
@@ -19,7 +107,7 @@ try:
     import robot.unitree_g1
     import teleop.unitree_g1
 except ImportError as e:
-    print(f"\n[IMPORT ERROR]: {e}")
+    print(f"\n[IMPORT ERROR]: {e}", file=sys.stderr)
     sys.exit(1)
 
 # =========================================================================
@@ -127,13 +215,14 @@ import lerobot.cameras.zmq.camera_zmq as _zmq_cam_mod
 import cv2 as _cv2_dep
 
 def _post_process_zmq_frame(self, frame):
-    """Pós-processa o frame cru do ZMQCamera: BGR→RGB no RGB, 1 canal na depth.
+    """Pós-processa o frame cru do ZMQCamera: RGB já vem da fonte; 1 canal na depth.
 
-    O servidor publica BGR (RealSense rs.format.bgr8) e o cv2.imdecode retorna BGR.
-    O LeRobot e as backbones das VLAs (ImageNet/SigLIP) esperam RGB → convertemos.
+    O realsense_server.py agora faz cvtColor(BGR2RGB) NA FONTE → o frame já chega RGB.
+    Portanto NÃO reconvertemos aqui (single source of truth). Só tratamos a depth.
+    (Antes a câmera mandava BGR e a conversão era feita aqui — virou redundante/dobrada.)
     """
     if "depth" not in getattr(self, "camera_name", ""):
-        return _cv2_dep.cvtColor(frame, _cv2_dep.COLOR_BGR2RGB)  # → RGB pro dataset
+        return frame  # já é RGB (convertido no realsense_server) — sem reconversão
     if frame.ndim == 2:
         frame = frame[:, :, None]  # (H,W) -> (H,W,1)
     elif frame.ndim == 3 and frame.shape[2] == 3:
@@ -988,15 +1077,283 @@ def _free_stale_ports(ports=(5555, 5558, 8012, 5557, 8765)):
                         pass
 
 
+# =========================================================================
+# 🚦 TERMINAL ENXUTO + PRÉ-FLIGHT
+# Concentra a experiência de terminal da gravação em poucas mensagens:
+# pré-flight de hardware, handshake do Quest e ações do operador (X/A/B/Y).
+# Todo o resto (logs verbosos, tracebacks, libs) é desviado pro run.log do dataset.
+# =========================================================================
+import re as _re_ui
+
+DEFAULT_QUEST_ADB_IP = "192.168.68.51"
+
+# Marcador interno: força o _TermRouter a ecoar a linha no terminal real.
+_UI = "\x00UI\x00"
+
+# As ações do operador chegam do xr_g1_arm.py já com a tag [CONTROLE VR]; aqui
+# reescrevemos pra versão curta exibida no terminal enxuto.
+_ACTION_REWRITE = [
+    (_re_ui.compile("DESTRAVADO"),  '▶️  DESTRAVOU o robô    (X)'),
+    (_re_ui.compile("CONGELADO"),   '🧊 TRAVOU o robô       (X)'),
+    (_re_ui.compile("SALVANDO"),    '💾 SALVOU episódio     (A)'),
+    (_re_ui.compile("DESCARTANDO"), '🗑️  DESCARTOU episódio  (B)'),
+    (_re_ui.compile("ENCERRANDO"),  '🛑 ENCERRANDO          (Y)'),
+]
+
+
+class _TermRouter:
+    """Substitui sys.stdout/stderr: grava TUDO no run.log e ecoa no terminal real
+    só (a) linhas marcadas com _UI (via ui()) e (b) ações do operador (CONTROLE VR)."""
+
+    def __init__(self, logfile, term):
+        self._log = logfile
+        self._term = term
+        self._buf = ""
+
+    def write(self, s):
+        try:
+            self._log.write(s.replace(_UI, ""))
+        except Exception:
+            pass
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._echo(line)
+        return len(s)
+
+    def _echo(self, line):
+        if _UI in line:
+            self._term.write(line.replace(_UI, "") + "\n")
+            self._term.flush()
+            return
+        if "[CONTROLE VR]" in line:
+            for rx, rep in _ACTION_REWRITE:
+                if rx.search(line):
+                    self._term.write("   " + rep + "\n")
+                    self._term.flush()
+                    return
+
+    def flush(self):
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+
+def ui(msg=""):
+    """Imprime uma linha no terminal enxuto (e também grava no run.log)."""
+    print(_UI + str(msg), flush=True)
+
+
+def _port_open(host, port, timeout=2.0):
+    """True se dá pra abrir uma conexão TCP em host:port (serviço no ar)."""
+    import socket
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _probe_camera(host, timeout=5.0):
+    """Lê 1 frame do stream ZMQ :5555 e diz (rgb_ok, depth_ok)."""
+    import zmq, json
+    ctx = zmq.Context.instance()
+    s = ctx.socket(zmq.SUB)
+    s.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+    s.setsockopt(zmq.LINGER, 0)
+    s.setsockopt_string(zmq.SUBSCRIBE, "")
+    s.connect(f"tcp://{host}:5555")
+    try:
+        parts = s.recv_multipart()
+        data = json.loads(parts[0])
+        imgs = data.get("images", data)
+        return imgs.get("head_camera") is not None, imgs.get("head_camera_depth") is not None
+    except Exception:
+        return False, False
+    finally:
+        s.close(0)
+
+
+def _adb_usb_present():
+    """True se há um Quest conectado por USB (device em 'adb devices', sem :5555)."""
+    import subprocess
+    try:
+        out = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return False
+    for line in out.splitlines()[1:]:
+        toks = line.split()
+        if len(toks) >= 2 and toks[1] == "device" and ":5555" not in toks[0]:
+            return True
+    return False
+
+
+def _enable_wifi_debug(adb_ip):
+    """adb tcpip 5555 (precisa do USB) + adb connect <ip>:5555."""
+    import subprocess, time
+    try:
+        subprocess.run(["adb", "tcpip", "5555"], capture_output=True, text=True, timeout=8)
+        time.sleep(1.0)
+        r = subprocess.run(["adb", "connect", f"{adb_ip}:5555"],
+                           capture_output=True, text=True, timeout=8)
+        return "connected" in (r.stdout + r.stderr).lower()
+    except Exception:
+        return False
+
+
+def _disable_proximity(adb_ip):
+    """Desativa o sensor de proximidade do Quest (mantém a tela ligada o tempo todo)."""
+    import subprocess
+    try:
+        r = subprocess.run(["adb", "-s", f"{adb_ip}:5555", "shell", "am", "broadcast",
+                            "-a", "com.oculus.vrpowermanager.prox_close"],
+                           capture_output=True, text=True, timeout=8)
+        return "Broadcast completed" in r.stdout
+    except Exception:
+        return False
+
+
+def _quest_browser_connected():
+    """True se há conexão TCP estabelecida na :8012 (browser do Quest no Vuer)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ss", "-tnH", "state", "established", "( sport = :8012 )"],
+            capture_output=True, text=True, timeout=5).stdout
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def _robot_iface():
+    """Interface de rede com IP na subrede do robô (192.168.123.x)."""
+    import subprocess
+    try:
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "192.168.123." in line:
+                return line.split()[1]
+    except Exception:
+        pass
+    return None
+
+
+def _link_speed_mbps(iface):
+    """Velocidade negociada do link em Mbps (via /sys/class/net), ou None."""
+    if not iface:
+        return None
+    try:
+        with open(f"/sys/class/net/{iface}/speed") as f:
+            v = int(f.read().strip())
+            return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def _preflight_step(n, total, label, check, fix, wait=True, poll=2.0):
+    """Um passo do pré-flight. Se já estiver OK, marca ✅ e segue. Se falhar,
+    mostra a instrução de correção e (wait=True) BLOQUEIA re-checando até ficar
+    verde, então segue pro próximo. Retorna o estado final (True/False)."""
+    import time
+    if check():
+        ui(f"   ✅ {n}/{total}  {label}")
+        return True
+    ui(f"   ❌ {n}/{total}  {label}")
+    ui("")
+    for _l in fix.splitlines():
+        ui(f"      {_l}")
+    ui("")
+    if not wait:
+        return False
+    ui("      … aguardando você corrigir (Ctrl-C cancela)")
+    while not check():
+        time.sleep(poll)
+    ui(f"   ✅ {n}/{total}  {label}")
+    ui("")
+    return True
+
+
+def _stage_manager():
+    """Thread (roda junto do main()): handshake do Quest + banners de prontidão.
+
+    Bloqueia o banner 'aperte X' até o browser do Quest conectar no Vuer (:8012)
+    e o soft-start terminar. O X em si é botão do controle VR, então só funciona
+    com o Quest já conectado — isto aqui só cuida da APRESENTAÇÃO na ordem certa."""
+    import time
+    # passo 7/7 do pré-flight: espera o Vuer subir (dentro do main()) e o F5 no Quest.
+    while not _port_open("127.0.0.1", 8012, timeout=1.0):
+        time.sleep(0.5)
+    ui("   ⏳ 8/8  Dê F5 uma vez no óculos VR para conectar ao Vuer")
+    while not _quest_browser_connected():
+        time.sleep(0.5)
+    ui("   ✅ 8/8  Óculos VR conectado")
+    while not _softstart["done"]:
+        time.sleep(0.2)
+    ui(); ui(); ui(); ui()
+    ui("=" * 79)
+    ui('  Tudo pronto para Gravação/Teleoperação do robô. Aperte "X" para desbloquear.')
+    ui("=" * 79)
+    ui()
+
+
+_watchdog_stop = threading.Event()
+_watchdog_paused = False  # True = watchdog está segurando o pause (não o usuário)
+
+
+def _watchdog(robot_ip: str):
+    """Thread: monitora câmera, Quest WiFi e robô durante a run.
+
+    Começa a checar após o soft-start (sistema operacional). Se qualquer
+    conexão cair: congela o robô e avisa. Quando volta: destrava e avisa."""
+    import time
+    global robot_paused, _watchdog_paused
+
+    while not _softstart["done"] and not _watchdog_stop.is_set():
+        time.sleep(0.5)
+
+    INTERVAL = 3.0
+    while not _watchdog_stop.is_set():
+        robot_ok = _port_open(robot_ip, 6000, timeout=2.0)
+        cam_ok   = _port_open(robot_ip, 5555, timeout=2.0)
+        quest_ok = _quest_browser_connected()
+
+        lost = []
+        if not robot_ok:
+            lost.append("Robô (:6000)")
+        if not cam_ok:
+            lost.append("Câmera (:5555)")
+        if not quest_ok:
+            lost.append("Quest VR")
+
+        if lost and not _watchdog_paused:
+            _watchdog_paused = True
+            robot_paused = True
+            ui(f"[WATCHDOG] ⚠️  Perdido: {', '.join(lost)} — Robô CONGELADO 🧊")
+        elif not lost and _watchdog_paused:
+            _watchdog_paused = False
+            robot_paused = False
+            ui("[WATCHDOG] ✅  Conexões restauradas — Robô DESTRAVADO ▶️")
+
+        time.sleep(INTERVAL)
+
+
 if __name__ == "__main__":
     import os
     from datetime import datetime
     from pathlib import Path
 
+    if os.environ.get("_G1_REEXEC"):
+        print("[ENV] ✅ G1 Ativado", file=sys.stderr)
+
     cli_args = sys.argv[:]
 
     if "--config_path" not in str(cli_args):
-        print("\n[ERRO]: O argumento '--config_path' é obrigatório.")
+        print("\n[ERRO]: O argumento '--config_path' é obrigatório.", file=sys.stderr)
         sys.exit(1)
 
     # Extrai --quest-ip (IP do servidor Vuer = ESTE notebook, p/ o browser do Quest abrir)
@@ -1069,6 +1426,124 @@ if __name__ == "__main__":
         Path(timestamped_root).parent.mkdir(parents=True, exist_ok=True)
         sys.argv.append(f"--dataset.root={timestamped_root}")
         print(f"\n[AUTO-DATASET] 📁 Salvando em: {timestamped_root}")
+
+    # =====================================================================
+    # 🚦 TERMINAL ENXUTO + PRÉ-FLIGHT
+    # =====================================================================
+    # --dry-preflight: só roda as checagens e sai (sem gravar) — pra testar setup.
+    _dry_preflight = "--dry-preflight" in sys.argv
+    if _dry_preflight:
+        sys.argv.remove("--dry-preflight")
+
+    # run.log fica junto do dataset desta run — todo log verboso é desviado pra lá.
+    if has_root_arg:
+        _ds_root = next(a.split("=", 1)[1] for a in sys.argv
+                        if a.startswith("--dataset.root="))
+    else:
+        _ds_root = timestamped_root
+    # run.log começa fora de _ds_root (o LeRobot exige criar essa pasta vazio) e é
+    # movido pra dentro no fim — ver _finalize_run_log.
+    _ds_root_p = Path(_ds_root)
+    _ds_root_p.parent.mkdir(parents=True, exist_ok=True)
+    _run_log_tmp = _ds_root_p.parent / f".{_ds_root_p.name}.run.log"
+    _run_log_final = _ds_root_p / "run.log"
+    _run_log_path = str(_run_log_tmp)
+
+    _LOGFILE = open(_run_log_path, "a", buffering=1)
+    try:
+        _TERM = open("/dev/tty", "w")
+    except OSError:
+        _TERM = os.fdopen(os.dup(1), "w")   # cópia do stdout original (sobrevive ao redirect dos fds abaixo)
+    sys.stdout = _TermRouter(_LOGFILE, _TERM)
+    sys.stderr = sys.stdout
+    # despeja no run.log tudo que os imports/patches imprimiram durante o boot
+    try:
+        _LOGFILE.write(_BOOT_CAP.getvalue())
+        _LOGFILE.flush()
+    except Exception:
+        pass
+    # ao final, move o run.log pra dentro do dataset (que o LeRobot já criou).
+    import atexit as _atexit_runlog
+    def _finalize_run_log():
+        try:
+            _LOGFILE.flush()
+            if _ds_root_p.exists() and _run_log_tmp.exists():
+                import shutil
+                shutil.move(str(_run_log_tmp), str(_run_log_final))
+        except Exception:
+            pass
+    _atexit_runlog.register(_finalize_run_log)
+
+    # Redireciona os fds 1/2 do SO pro run.log: captura saída de código C (libx264/
+    # ffmpeg via PyAV) e de subprocessos que escrevem direto no fd, fora do
+    # sys.stdout/stderr do Python. O terminal enxuto segue pelo _TERM (fd separado).
+    try:
+        os.dup2(_LOGFILE.fileno(), 1)
+        os.dup2(_LOGFILE.fileno(), 2)
+    except Exception:
+        pass
+    # logging verboso -> run.log (tira os StreamHandlers que sujariam o terminal)
+    _root_lg = logging.getLogger()
+    for _h in list(_root_lg.handlers):
+        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+            _root_lg.removeHandler(_h)
+    _fh = logging.FileHandler(_run_log_path)
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    _root_lg.addHandler(_fh)
+    _root_lg.setLevel(logging.INFO)
+    ui(f"📁 Dataset: {_ds_root}")
+    ui(f"📝 Log completo desta run: {_run_log_final}")
+
+    # ---- PRÉ-FLIGHT (só no robô real) ----
+    # Cada passo orienta a correção e espera ficar verde antes de ir pro próximo.
+    # (--dry-preflight não bloqueia: só reporta o estado e sai.)
+    _PREFLIGHT_ROBOT_IP = "192.168.123.164"
+    _adb_ip = quest_adb_ip or DEFAULT_QUEST_ADB_IP
+    _all_ok = True
+    if not force_sim:
+        ui()
+        ui("🚦 PRÉ-FLIGHT — verificando hardware")
+        _wait = not _dry_preflight
+        _steps = [
+            (f"Robô (./start_robot.sh @ {_PREFLIGHT_ROBOT_IP}:6000-6003)",
+             lambda: _port_open(_PREFLIGHT_ROBOT_IP, 6000, timeout=3.0),
+             "Conecte o cabo de ethernet do Robô ao seu Notebook.\n"
+             "Entre na interface de rede do Prometheus."),
+            ("Rede Gigabit (link 1000 Mb/s)",
+             lambda: (_link_speed_mbps(_robot_iface()) or 0) >= 1000,
+             "Rede negociou abaixo de 1000 Mb/s → a câmera engasga (~10 Hz).\n"
+             "Reassente/troque o cabo ethernet (Cat5e/6) FIRME nos dois lados —\n"
+             "contato marginal derruba pra 100."),
+            ("Câmera RGB (head_camera @ :5555)",
+             lambda: _probe_camera(_PREFLIGHT_ROBOT_IP, timeout=4.0)[0],
+             "Suba os servidores no Robô (start_robot.sh) e confira a RealSense D435i conectada."),
+            ("Câmera Depth (head_camera_depth, uint16)",
+             lambda: _probe_camera(_PREFLIGHT_ROBOT_IP, timeout=4.0)[1],
+             "O depth vem do mesmo realsense_server do passo anterior.\n"
+             "Se só o depth faltou, reinicie o realsense_server no Robô."),
+            ("Quest via USB (adb devices)",
+             _adb_usb_present,
+             "Coloque o óculos no rosto e aperte o botão do lado direito para ligá-lo."),
+            (f"Depuração WiFi (adb tcpip 5555 → {_adb_ip})",
+             lambda: _enable_wifi_debug(_adb_ip),
+             "Mantenha o Quest no cabo USB e autorize este computador no headset."),
+            ("Sensor de proximidade off (óculos fica ligado)",
+             lambda: _disable_proximity(_adb_ip),
+             "Coloque/segure o Quest com a tela acesa e autorize este computador."),
+        ]
+        # 1-7 = hardware (aqui); 8 = "dê F5 no óculos VR" (no _stage_manager, após o
+        # Vuer subir dentro do main()).
+        _PREFLIGHT_TOTAL = 8
+        for _i, (_lbl, _chk, _fix) in enumerate(_steps, 1):
+            _ok = _preflight_step(_i, _PREFLIGHT_TOTAL, _lbl, _chk, _fix, wait=_wait)
+            _all_ok = _all_ok and _ok
+        if not _wait:
+            ui("   ⏭️  8/8  Dê F5 no óculos VR — verificado só na gravação (não no --dry-preflight)")
+            if not _all_ok:
+                ui("❌ PRÉ-FLIGHT: há itens pendentes acima.")
+
+    if _dry_preflight:
+        sys.exit(0 if (force_sim or _all_ok) else 1)
 
     logging.getLogger().addFilter(IgnoreFPSWarningFilter())
     logging.getLogger("lerobot").addFilter(IgnoreFPSWarningFilter())
@@ -1238,7 +1713,8 @@ if __name__ == "__main__":
             _viewer_proc = subprocess.Popen(
                 [sys.executable, viewer_script, "--host", cam_host,
                  "--cam-port", "5558", "--tele-port", "5557", "--http-port", "8765",
-                 "--quest-adb", _quest_adb, "--img-fps", "30", "--rgb-bytes", "--no-depth"]
+                 "--quest-adb", _quest_adb, "--img-fps", "30", "--rgb-bytes", "--no-depth"],
+                stdout=_LOGFILE, stderr=_LOGFILE,
             )
             print("[OmniView LIVE] 🖥️  Dashboard web iniciado — RGB-only :5558, 30 FPS, depth OFF — abrindo http://127.0.0.1:8765/live.html")
             print("                (G1_OMNIVIEW_RGB_ONLY ligado; tire-o pra ver a depth via :5555)")
@@ -1246,24 +1722,16 @@ if __name__ == "__main__":
             _viewer_proc = subprocess.Popen(
                 [sys.executable, viewer_script, "--host", cam_host,
                  "--cam-port", "5555", "--tele-port", "5557", "--http-port", "8765",
-                 "--quest-adb", _quest_adb, "--img-fps", "30"]
+                 "--quest-adb", _quest_adb, "--img-fps", "30"],
+                stdout=_LOGFILE, stderr=_LOGFILE,
             )
             print("[OmniView LIVE] 🖥️  Dashboard web iniciado — RGB+Depth :5555, 30 FPS — abrindo http://127.0.0.1:8765/live.html")
             print("                (G1_OMNIVIEW_RGB_ONLY=1 = RGB-only sem depth; G1_VIEWER=cv2 volta à janela OpenCV antiga)")
     _atexit.register(lambda: _viewer_proc.poll() is None and _viewer_proc.terminate())
 
+    # ADB connect + sensor de proximidade já foram tratados no PRÉ-FLIGHT (itens 5 e 6).
+    # Aqui só abrimos o Vuer no browser do Quest (depende do --quest-ip).
     try:
-        # Garante conexão Wi-Fi ADB
-        _conn = subprocess.run(["adb", "connect", QUEST_ADB], capture_output=True, text=True, timeout=5)
-        print(f"[Quest] adb connect {QUEST_ADB}: {(_conn.stdout or _conn.stderr).strip()}")
-
-        result = _adb("shell", "am", "broadcast", "-a", "com.oculus.vrpowermanager.prox_close")
-        if "Broadcast completed" in result.stdout:
-            print("[Quest] ✅ Sensor de proximidade desativado — pode pendurar no pescoço.")
-        else:
-            print(f"[Quest] ⚠️ NÃO desativou (adb={QUEST_ADB}). out={result.stdout.strip()!r} err={result.stderr.strip()!r}")
-            print("[Quest]    Cheque: Wireless Debugging ON no Quest + autorizar este PC; IP/porta certos (adb tcpip 5555).")
-
         if quest_ip:
             vuer_url = f"https://{quest_ip}:8012/?grid=False&ws=wss://{quest_ip}:8012"
             # Fecha o browser completamente antes de abrir (limpa guias e experiência VR anterior)
@@ -1273,7 +1741,14 @@ if __name__ == "__main__":
             _adb("shell", f"am start -a android.intent.action.VIEW -d '{vuer_url}'")
             print(f"[Quest] 🌐 Browser aberto em {vuer_url}")
     except Exception:
-        print("[Quest] ⚠️ ADB não disponível — sensor de proximidade não foi desativado.")
+        print("[Quest] ⚠️ Não consegui abrir o browser no Quest via ADB.")
+
+    # Handshake do Quest + banners de prontidão + watchdog rodam em paralelo ao main().
+    if not force_sim:
+        _threading.Thread(target=_stage_manager, daemon=True).start()
+        _threading.Thread(
+            target=_watchdog, args=(_PREFLIGHT_ROBOT_IP,), daemon=True
+        ).start()
 
     import signal
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
@@ -1281,10 +1756,15 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\n[SYSTEM]: Gravação finalizada pelo usuário.")
+        _watchdog_stop.set()
+        ui("")
+        ui("🛑 Gravação finalizada pelo usuário.")
         sys.exit(0)
     except Exception as e:
+        _watchdog_stop.set()
         import traceback
-        print(f"\n[ERRO DE EXECUÇÃO]:")
-        traceback.print_exc()
+        traceback.print_exc()  # traceback completo vai pro run.log
+        ui("")
+        ui(f"❌ ERRO: {type(e).__name__}: {e}")
+        ui(f"   Detalhes em: {_run_log_final if _ds_root_p.exists() else _run_log_tmp}")
         sys.exit(1)

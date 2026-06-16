@@ -59,7 +59,7 @@ Depois de gravar um episódio, a feature de depth tem que estar como `image` (n�
 
 ```bash
 python -c "import json,glob; f=sorted(glob.glob('datasets/G1_Dex3_depth_tactil_dataset/*/meta/info.json'))[-1]; print(json.load(open(f))['features']['observation.images.head_camera_depth'])"
-# esperado: dtype 'image', shape [480, 640, 1]
+# esperado: dtype 'image', shape [480, 848, 1]
 ```
 
 Um PNG de depth aberto com PIL deve ter modo `I;16` (16-bit), e os valores são distâncias em mm.

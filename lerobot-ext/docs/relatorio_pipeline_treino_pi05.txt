@@ -1,0 +1,313 @@
+# Relatório Técnico — Pipeline de Treinamento π0.5 (prometheus-vla, branch Luiz-pi05d)
+
+Data: 2026-06-09
+Escopo: tudo verificado diretamente no código deste repo (branch Luiz-pi05d); onde a
+informação só existe na máquina de treino remota (Atena) ou não está implementada,
+isso está dito explicitamente.
+
+Destaques encontrados durante a verificação (detalhados nas seções 3 e 6):
+- `freeze_vision_encoder: false` NÃO tem efeito (o SigLIP está congelado, ao
+  contrário do que o README afirma);
+- os intrínsecos default da back-projection do depth não batem com a resolução
+  real da câmera (848x480 vs default 640x480).
+
+---
+
+## 1. Dataset e dados
+
+**Dataset:** `lewislf/G1_Dex3_right14_dataset`, snapshot `20260608_205432`, formato
+LeRobot (parquet + vídeo h264 + PNG), local em
+`lerobot-ext/datasets/G1_Dex3_right14_dataset/20260608_205432/`. É derivado do
+dataset de coleta de 28 dims (`G1_Dex3_depth_tactil_dataset`) pelo script
+`lerobot-ext/tools/slice_right_arm_only.py`, que fatia os índices [7–13, 21–27]
+(braço + mão direita), reescreve `meta/info.json`, `meta/stats.json` e
+`meta/episodes/`, e symlinka `videos/` para o dataset original
+(`lerobot-ext/docs/README_treino_pi05_right14.md:98-113`).
+
+**Volume:** 15 episódios, 3027 frames @ 30 FPS (~101 s no total). Episódios variam
+de 131 a 289 frames (4,4–9,6 s). Tarefa única: pegar o copo com o Unitree G1 +
+Dex3, posição fixa, uma cena (sanity check — fase 1 do roadmap em
+`README_treino_pi05_right14.md:273-287`).
+
+**Features:**
+
+| Feature | Shape | Formato | Usada no treino |
+|---|---|---|---|
+| observation.images.head_camera | 480x848x3 | vídeo h264 (RGB) | sim (todos os runs) |
+| observation.images.head_camera_depth | 480x848x1 | PNG uint16 em milímetros (dtype `image`, não `video`) | só no run depth |
+| observation.state | [14] float32 | posições de junta | sim |
+| action | [14] float32 | posições de junta alvo | sim (target) |
+| observation.left/right_hand_pressure | 108 sensores/mão | tátil | NÃO (presente no dataset, ignorada nestes runs) |
+
+O depth 16-bit vem do fluxo `realsense_server_depth16.py` (D435, z16 em mm, clip em
+32767 mm para evitar overflow do decode como int16 —
+`lerobot-ext/docs/README_depth16.md:73-74`). Nota: esse README valida shape esperado
+[480, 640, 1] (`README_depth16.md:62`), mas o dataset atual e as configs usam
+480x848 — a doc está desatualizada nesse ponto.
+
+**Espaço de ação:** 14 dims, **joint space, posições absolutas** (targets de junta,
+não deltas, não EEF). A teleop (`lerobot-ext/teleop/xr_g1_arm.py`) grava o alvo de
+junta resolvido pelo IK; ordem das juntas e ranges observados estão tabelados em
+`README_treino_pi05_right14.md:75-92`. Atenção: a dim 7 (`right_hand_thumb_0`) tem
+range **zero** no dataset atual (congelada na coleta).
+
+**Split treino/val:** **por episódio**, com listas explícitas na config: treino =
+eps 0–11 (2527 frames), val = eps 12–14 (500 frames)
+(`train_cup_pi05_right14_depth.yaml:52,63`). Dentro dos episódios listados a
+amostragem é frame a frame via `EpisodeAwareSampler` (val com `shuffle=False`,
+`lerobot-ext/train/run_train.py:410-429`). Os 3 episódios de val são da mesma
+cena/posição do treino — o split mede memorização da distribuição, não
+generalização.
+
+---
+
+## 2. Pré-processamento
+
+**RGB (treino):**
+1. Augmentations na resolução nativa 480x848, configuradas no YAML
+   (`train_cup_pi05_right14_depth.yaml:22-50`): até **2 de 3** transforms sorteados
+   por step, proporcionalmente aos pesos (`max_num_transforms: 2`,
+   `random_order: false`):
+   - ColorJitter (peso 1.0, ~40%): brightness x[0.8, 1.2], contrast x[0.8, 1.2],
+     saturation x[0.5, 1.5], hue ±0.05;
+   - RandomResizedCrop (peso 1.0, ~40%): crop de 75–100% da área, ratio [0.9, 1.1],
+     resize de volta para 480x848, antialias;
+   - RandomErasing (peso 0.5, ~20%): p=1.0 quando sorteado, apaga 2–10% da área com
+     preto.
+2. Dentro do modelo: `resize_with_pad` para 224x224, interpolação bilinear com
+   padding preto preservando aspect ratio
+   (`lerobot/src/lerobot/policies/pi05/modeling_pi05.py:1172-1173`, função em
+   :144-215); normalização de pixel `img*2 − 1` → [-1, 1] (estilo SigLIP,
+   `modeling_pi05.py:1175-1176`). `normalization_mapping.VISUAL: IDENTITY` —
+   nenhuma estatística de dataset aplicada a imagens.
+3. Na validação as augmentations são desativadas pelo LeRobot.
+
+**Depth (treino, run depth):**
+- Decodificado do PNG16 em milímetros; conversão mm→m via `depth_scale: 0.001`
+  aplicada na back-projection (`train_cup_pi05_right14_depth.yaml:138`;
+  `lerobot-ext/train/depth_encoder.py:48`).
+- **Clip de range:** apenas filtro de mínimo z > 0.05 m (descarta ruído de lente,
+  `depth_encoder.py:61`). **Não há clip de máximo no treino** — o teto efetivo é o
+  clip de 32,767 m feito na gravação. Pontos de fundo distante entram na nuvem.
+- **Buracos/zeros:** pixels com z ≤ 0.05 são simplesmente descartados da nuvem; se
+  sobrarem menos de 1024 pontos válidos, a nuvem é padded com zeros
+  (`depth_encoder.py:64-69`). Nenhum inpainting ou interpolação.
+- **Normalização:** **não há** — nem inverse depth, nem min-max, nem colormap. O
+  PointNet recebe coordenadas XYZ cruas em metros.
+- **Resize:** nenhum; o depth é usado em 480x848 e subamostrado para **1024 pontos
+  aleatórios** (`torch.randperm`) por frame — ~0,25% dos ~406k pixels
+  (`depth_encoder.py:25,64-66`).
+
+**Consistência RGB x depth:** **não são consistentes, por design.** Um monkey-patch
+em `lerobot-ext/train/run_train.py:51-69` remove as `image_transforms` do
+`__getitem__` e reaplica só nas keys `observation.images.*` que NÃO contêm "depth".
+Ou seja: o RandomResizedCrop muda a geometria do RGB sem mudar o depth. Como o
+depth não entra alinhado pixel a pixel (vira um token global de nuvem de pontos), o
+desalinhamento não quebra nada estruturalmente, mas o modelo vê pares RGB/depth
+geometricamente inconsistentes em ~40% dos steps.
+
+**Depth dropout / robustez a falha de sensor:** **não implementado.** Nenhuma
+estratégia de mascarar/zerar o depth durante o treino.
+
+**State e action:** QUANTILES (q01/q99): `y = 2·(x − q01)/(q99 − q01) − 1` →
+[-1, 1] (`lerobot/src/lerobot/processor/normalize_processor.py:362-377`). As
+estatísticas vêm de `meta/stats.json` do dataset (recalculadas pelo
+`slice_right_arm_only.py` por dim), carregadas via `dataset.meta.stats` no
+`NormalizerProcessorStep`
+(`lerobot/src/lerobot/policies/pi05/processor_pi05.py:138-142`) — não são
+recomputadas no treino. Padding 14→32 dims com zeros em
+`Pi05PrepareStateTokenizerProcessorStep` (`processor_pi05.py:71-72`). Risco
+latente: a dim 7 tem q01=q99 (range zero); a motivação declarada do slice 28→14
+foi justamente eliminar divisão por zero nas dims congeladas do lado esquerdo
+(`README_treino_pi05_right14.md:14-18`), mas essa dim congelada permaneceu.
+
+---
+
+## 3. Arquitetura e integração do depth
+
+**Base:** PI05 do LeRobot — PaliGemma (VLM Gemma 2B + vision tower SigLIP) + action
+expert Gemma 300M com flow matching, prevendo chunks de 50 ações.
+
+**Como o depth entra:** **token extra de prefixo**, não canal extra nem slot de
+câmera. A implementação (`lerobot-ext/train/pi05_depth_injector.py`) faz
+monkey-patch em runtime:
+- depth map → back-projection pinhole → nuvem de pontos → PointNetEncoder →
+  **1 token** de dimensão hidden_size do VLM (`pi05_depth_injector.py:119-123`);
+- o método `embed_prefix` do modelo é patcheado para concatenar esse token **após**
+  os tokens de imagem e linguagem: sequência final [IMG…, LANG…, DEPTH_TOK]
+  (`pi05_depth_injector.py:86-105`); o token recebe att_mask=0, ou seja, participa
+  do mesmo bloco bidirecional do prefixo;
+- a key de depth é removida de `config.input_features` durante o forward
+  (`pi05_depth_injector.py:145`), garantindo que o depth **nunca passa pelo
+  SigLIP** — o caminho RGB fica idêntico ao vanilla;
+- o token é injetado via atributo `model._extra_prefix_embs` setado antes de cada
+  forward/predict_action_chunk (`pi05_depth_injector.py:143-163`).
+
+**Encoder de depth** (`lerobot-ext/train/depth_encoder.py:5-23`): PointNet mínimo —
+Conv1d(3→64) → Conv1d(64→128) → Conv1d(128→1024) → max-pool global →
+Linear(1024→512) → Linear(512→hidden_size). Back-projection pinhole com
+intrínsecos {fx: 600, fy: 600, cx: 320, cy: 240} **hardcoded como default**
+(`pi05_depth_injector.py:74-79`) — a config não passa intrínsecos, então o default
+é usado. **Esses valores correspondem a um frame 640x480; o frame real é 848x480**
+(cx deveria ser ~424), o que distorce lateralmente a nuvem de pontos. Ver seção 6.
+
+**Modos de fusão** (`lerobot-ext/train/run_train.py:78-92`): `depth_only` (só token
+PointNet — usado no run atual) e `full` (`pi05_d_injector.py`: PointNet +
+pressure_proj Linear(216→256)→ReLU→Linear(256→hidden) para o tátil). Nenhum outro
+modo existe.
+
+**Inicialização dos pesos novos:** **default do PyTorch (Kaiming uniform)** — não
+há zero-init, não há gating. Um token aleatório não-treinado entra no prefixo do
+modelo pré-treinado desde o step 0. Há suporte a carregar pesos pointnet.* de um
+checkpoint anterior via `load_injected_from`
+(`pi05_depth_injector.py:35-44,165-168`), não usado nestes runs.
+
+**Congelado vs treinável** — aqui há uma **contradição entre config/README e o
+código**:
+- `train_expert_only: true` congela `self.paligemma.parameters()` **inteiro —
+  incluindo a vision tower SigLIP**
+  (`lerobot/src/lerobot/policies/pi05/modeling_pi05.py:417-420`);
+- portanto `freeze_vision_encoder: false` **não tem efeito** nesta configuração, e
+  a afirmação do `README_treino_pi05_right14.md:144-147` de que o SigLIP é
+  fine-tuned **está errada**;
+- treinável de fato: action expert (Gemma 300M) + projeções de state/action + (no
+  run depth) o PointNet, que é sempre treinável (nenhum freeze aplicado a ele).
+
+**LoRA:** **não usado.** Existe um hook genérico de PEFT no run_train.py, mas
+nenhuma config destes runs o ativa. O fine-tune do que está destravado é full.
+
+---
+
+## 4. Config de treino
+
+**Checkpoint base:** `lerobot/pi05_base` (~14 GB), `paligemma_variant: gemma_2b`,
+`action_expert_variant: gemma_300m`.
+
+**Hiperparâmetros (idênticos nos dois runs):**
+
+| Parâmetro | Valor |
+|---|---|
+| Optimizer | AdamW — lr 1e-4, betas (0.9, 0.95), eps 1e-8, weight decay 0.01, grad clip 1.0 (`configuration_pi05.py:142-149`) |
+| Scheduler | cosine decay com warmup linear — warmup 500, decay 4500, lr final 1e-5 (`lerobot/src/lerobot/optim/schedulers.py:80-132`) |
+| Steps | 5000 (sanity check; README recomenda 30k–50k para 300+ eps) |
+| Batch size | 32, num_workers: 8 |
+| dtype | bfloat16 (layer norms e embeddings da vision tower mantidos em fp32, `modeling_pi05.py:367-410`) |
+| Gradient checkpointing | true, nas 3 sub-redes (`modeling_pi05.py:586-600`) |
+| Checkpoints / eval | a cada 500 steps |
+
+**Action horizon:** `chunk_size: 50 = n_action_steps: 50`, `n_obs_steps: 1`. A 30
+FPS do dataset, o chunk cobre ~1,67 s; na inferência o chunk inteiro é executado
+open-loop antes da próxima observação (não há timestep explícito no modelo —
+assume-se 1/30 s uniforme).
+
+**Hardware e tempo:** treino na Atena (A100 80GB, CUDA_VISIBLE_DEVICES=1 por
+convenção, env conda ms3), disparado por SSH do laptop
+(`README_treino_pi05_right14.md:190-260`). **Tempo de treino: não registrado no
+repo.**
+
+**Diferenças entre o run RGB-only e o run RGB+depth** (comparação linha a linha de
+`train_cup_pi05_right14_rgb.yaml` vs `train_cup_pi05_right14_depth.yaml`):
+1. feature extra `observation.images.head_camera_depth: [1, 480, 848]` em
+   input_features (depth.yaml:106-108);
+2. bloco `depth_fusion: true / fusion_mode: depth_only / depth_key /
+   depth_scale: 0.001` (depth.yaml:135-138) vs `depth_fusion: false`
+   (rgb.yaml:127);
+3. output_dir/job_name/policy.repo_id (*_depth_lf vs *_rgb_lf);
+4. comentário de GPU alvo: depth → GPU 0, rgb → GPU 1 (só comentário, não config).
+
+Fora isso são **idênticos**: mesmo dataset/split, mesmas augmentations, mesmos
+hiperparâmetros, mesmo seed handling. A ablação é limpa no nível de config. (A
+config antiga `train_cup_pi05_right14.yaml` difere só em num_workers: 4 e nomes;
+foi a baseline original.)
+
+---
+
+## 5. Avaliação e estado atual
+
+**Mecanismo de validação:** a cada 500 steps, loop torch.no_grad() sobre o
+val_dataloader (eps 12–14, sem shuffle, sem augmentation), computando **val loss**
+(a mesma loss de flow matching do treino) com accelerator.gather, e opcionalmente
+val_action_mse via predict_action_chunk
+(`lerobot-ext/train/run_train.py:508-585`). Métricas logadas: val_loss,
+val_loss_std, val_action_mse (`run_train.py:616-630`).
+
+**Curvas de loss:** **não disponíveis neste repositório.** Não existe train_output/
+nem train/log/*.log no laptop — os artefatos de treino ficam na Atena
+(~/Prometheus/Luiz/prometheus-vla/train_output/cup_pi05_right14_{rgb,depth}_lf/) e
+no WandB (projeto prometheus_g1, entity prometheus-lcad, runs com sufixo _lf). Um
+relatório com valores concretos de loss precisa ser extraído de lá.
+
+**Rollout:** a avaliação comportamental é no **robô real**, via
+`inference_realtime_pi05d_right14.py` (raiz do repo, 353 linhas): carrega o
+checkpoint, auto-detecta pelas input_features se o modelo espera depth/pressão (e
+só então aplica o injector), conecta no G1 via ZMQ e roda o loop
+observação→chunk→ação com clamps de segurança separados para braço e mão
+(--max-delta) e ganho da mão configurável (--hand-kp). Não há harness de avaliação
+quantitativa (taxa de sucesso, métricas de rollout) — a avaliação é
+qualitativa/manual.
+
+**Resultados parciais RGB vs RGB+depth:** **não existem no repo.** Nenhum
+documento, JSON ou nota comparativa.
+
+**Sinais dos commits recentes** (indícios indiretos de que rollouts RGB já
+aconteceram): a mão direita não fechava o grip com kp default 0.8, motivando
+--hand-kp (commit 2c36dd4); foi preciso forçar movimento lento (--max-delta) e
+corrigir injeção indevida de depth/tátil no checkpoint RGB (commit 805ebe4). Isso
+sugere que pelo menos um checkpoint RGB foi testado no robô e que o gargalo atual é
+execução (ganho/velocidade), não o modelo em si — mas não há registro quantitativo.
+
+---
+
+## 6. Pontos de incerteza e decisões tomadas por conveniência
+
+1. **Intrínsecos da câmera errados para a resolução real (provável bug).** O
+   default {fx: 600, fy: 600, cx: 320, cy: 240}
+   (`pi05_depth_injector.py:74-79`) corresponde a um frame 640x480, mas o depth do
+   dataset é **848x480**. Com cx=320 em vez de ~424, a nuvem de pontos fica
+   deslocada/distorcida lateralmente. Como nada na config passa intrínsecos reais
+   da D435, o run depth atual treina com geometria sistematicamente errada. O
+   PointNet pode aprender a compensar (a distorção é consistente), mas qualquer
+   raciocínio métrico fica comprometido.
+2. **Escala do depth decodificado não verificada ponta a ponta.** O
+   `depth_scale: 0.001` assume que o tensor no batch carrega milímetros crus como
+   float. Isso depende de como o LeRobot decodifica o PNG I;16 (o README nota que o
+   ToTensor o lê como int16, daí o clip em 32767). Se em alguma versão o decode
+   normalizar por 255/65535, a escala fica errada silenciosamente. Vale um assert
+   no primeiro batch.
+3. **`freeze_vision_encoder: false` é inerte** (seção 3) — o SigLIP está congelado
+   pelo `train_expert_only: true`, contradizendo o README. Decisão efetiva: só o
+   action expert (+ PointNet) treina.
+4. **Default perigoso de depth_scale: 2.0** no CustomTrainPipelineConfig
+   (`run_train.py:92`) — herdado do hack antigo do cup3 ([0,1]→[0,2m]). Qualquer
+   config futura que esqueça de setar 0.001 treina com depth 2000x errado, sem
+   erro.
+5. **PointNet com init aleatória, sem zero-init/gating.** O token de depth entra no
+   prefixo do modelo pré-treinado como ruído nos primeiros steps. Alternativas
+   padrão (zero-init da última camada, gate escalar) não foram consideradas.
+6. **Sem clip de range máximo nem tratamento de fundo no depth.** Pontos até 32 m
+   entram na nuvem, e o sampling aleatório de 1024 pontos (~0,25% dos pixels) pode
+   ser dominado por fundo em vez da mesa/copo. Filtro de workspace (ex.: z < 1,5 m)
+   não implementado.
+7. **Sem depth dropout** — o modelo depth-fused não tem robustez treinada a falha
+   do sensor.
+8. **Dim 7 (right_hand_thumb_0) com range zero** sob normalização por quantis
+   (q01=q99) — exatamente o problema que o slice 28→14 visava eliminar, persistindo
+   numa dim.
+9. **Split de validação fraco**: 3 episódios da mesma cena/posição do treino; val
+   loss não mede generalização. Escolha consciente para o sanity check de 15 eps,
+   mas limita a comparação RGB vs depth.
+10. **Augmentations RGB-only inconsistentes com o depth** (crop muda o RGB, não a
+    nuvem) — aceito por design, mas é uma fonte de ruído na fusão.
+11. **Hiperparâmetros de augmentation e de treino escolhidos por heurística**
+    (pesos 1/1/0.5, 2 de 3 transforms, 5000 steps, 1024 pontos) sem busca ou
+    ablação registrada.
+12. **Doc desatualizada**: README_depth16.md valida shape 640x480 enquanto o
+    pipeline real é 848x480; README_treino afirma SigLIP treinável (incorreto,
+    item 3).
+
+---
+
+Os itens 1–4 são os que valem verificar antes de tirar qualquer conclusão da
+comparação RGB vs RGB+depth — em especial o item 1, que é um bug concreto e barato
+de corrigir (passar os intrínsecos reais da D435 para inject_pi05_depth, que já
+aceita camera_intrinsics).

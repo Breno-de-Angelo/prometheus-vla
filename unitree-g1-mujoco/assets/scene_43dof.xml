@@ -22,6 +22,18 @@
     <material name="toalha_mat" rgba="0.96 0.96 0.93 1" shininess="0.0" specular="0.0" reflectance="0.0"/>
     <mesh name="copo_visual" file="copo_visual.obj"/>
     <mesh name="copo_hull"   file="copo_hull.obj"/>
+
+    <!-- ArUcos da MESA (DICT_4X4_50, ids 0-3, 60mm) — os MESMOS impressos no real
+         (gerados por assets/aruco/generate_aruco.py). Texturas copiadas p/
+         assets/aruco_markers/. texuniform=false p/ a imagem aparecer 1x na face. -->
+    <texture type="2d" name="aruco_t0" file="aruco_markers/table_id00.png"/>
+    <texture type="2d" name="aruco_t1" file="aruco_markers/table_id01.png"/>
+    <texture type="2d" name="aruco_t2" file="aruco_markers/table_id02.png"/>
+    <texture type="2d" name="aruco_t3" file="aruco_markers/table_id03.png"/>
+    <material name="aruco_m0" texture="aruco_t0" texuniform="false" specular="0" shininess="0" reflectance="0"/>
+    <material name="aruco_m1" texture="aruco_t1" texuniform="false" specular="0" shininess="0" reflectance="0"/>
+    <material name="aruco_m2" texture="aruco_t2" texuniform="false" specular="0" shininess="0" reflectance="0"/>
+    <material name="aruco_m3" texture="aruco_t3" texuniform="false" specular="0" shininess="0" reflectance="0"/>
   </asset>
 
   <worldbody>
@@ -45,6 +57,14 @@
       <geom name="perna_2" type="box" size="0.015 0.015 0.36" pos=" 0.370 -0.875 0.36" rgba="0.65 0.50 0.35 1"/>
       <geom name="perna_3" type="box" size="0.015 0.015 0.36" pos="-0.370  0.875 0.36" rgba="0.65 0.50 0.35 1"/>
       <geom name="perna_4" type="box" size="0.015 0.015 0.36" pos="-0.370 -0.875 0.36" rgba="0.65 0.50 0.35 1"/>
+
+      <!-- ArUcos 60mm colados na toalha (topo em z_local~0.754). Placas finas,
+           visuais (sem colisão). Posições LOCAIS (mesa em world 0.45 0 0).
+           Ajuste depois pra casar EXATO com a colagem física no real. -->
+      <geom name="aruco0" type="box" size="0.03 0.03 0.0015" pos="-0.12  0.12 0.7555" material="aruco_m0" contype="0" conaffinity="0"/>
+      <geom name="aruco1" type="box" size="0.03 0.03 0.0015" pos=" 0.05  0.12 0.7555" material="aruco_m1" contype="0" conaffinity="0"/>
+      <geom name="aruco2" type="box" size="0.03 0.03 0.0015" pos="-0.12 -0.12 0.7555" material="aruco_m2" contype="0" conaffinity="0"/>
+      <geom name="aruco3" type="box" size="0.03 0.03 0.0015" pos=" 0.05 -0.12 0.7555" material="aruco_m3" contype="0" conaffinity="0"/>
     </body>
 
     <!-- Copo branco — mesh real do objeto do lab. Base em z=0 no mesh. -->

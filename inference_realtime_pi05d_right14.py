@@ -87,6 +87,12 @@ OPEN_HAND_POSE: dict[str, float] = {n: 0.0 for n in RIGHT14_FEATURES if "hand" i
 # Ordem = a dos dedos em RIGHT14_FEATURES (thumb_0..2, index_0..1, middle_0..1).
 RIGHT_TARGET: list[float] = [0.0, -0.920, -1.74, 1.57, 1.74, 1.57, 1.74]
 
+# Pose NEUTRA de homing do braço direito (7 juntas, ordem de RIGHT14_FEATURES[:7]):
+# home do operador no início do ep 0 do dataset (G1_Dex3_..._right8_1squeeze_armstate7)
+# — pose de repouso conhecida e in-distribution. Sobreponível por --home-arm-q.
+# Ordem: ShoulderPitch, ShoulderRoll, ShoulderYaw, Elbow, WristRoll, WristPitch, WristYaw.
+HOME_ARM_POSE: list[float] = [0.064, -0.049, -0.063, -0.095, -0.002, 0.132, -0.014]
+
 # Setado no main() após o load, lendo output_features do checkpoint:
 #   "right14" -> ação 14 dims (7 braço + 7 dedos diretos)
 #   "right8"  -> ação 8 dims  (7 braço + 1 squeeze; dedos via RIGHT_TARGET)
@@ -233,6 +239,15 @@ def action_tensor_to_robot_action(action_vec: torch.Tensor) -> dict:
     return {name: action[i] for i, name in enumerate(RIGHT14_FEATURES) if i < len(action)}
 
 
+def _rgb_from_obs(obs: dict):
+    """RGB (HWC uint8) da observação — mesma ordem de chaves do build_observation_batch."""
+    for _k in ("cam_rgb_high", "head_camera", "cam_rgb_low", "rgb"):
+        v = obs.get(_k)
+        if v is not None:
+            return v
+    return None
+
+
 class GracefulKiller:
     def __init__(self):
         self.kill = False
@@ -298,6 +313,20 @@ def main():
                         help="soft start: rampa a mão direita até a pose ABERTA em N segundos antes do "
                              "loop (episódios de treino começam de mão aberta; partir de mão fechada "
                              "joga o modelo no regime 'já agarrando'). 0 = desliga.")
+    parser.add_argument("--home-arm-s", type=float, default=2.0,
+                        help="PRE-HOMING do braço: rampa o braço direito até uma POSE NEUTRA FIXA "
+                             "(home do ep0 do dataset, ou --home-arm-q) em N s ANTES do loop, e roda 1 "
+                             "warm-up pra aquecer o CUDA. Pose definida/consistente em vez da chunk[0] "
+                             "variável do modelo. 0 = desliga.")
+    parser.add_argument("--home-arm-q", default="",
+                        help="Sobrescreve a pose neutra do homing: 7 ângulos (rad) separados por vírgula, "
+                             "ordem ShoulderPitch,ShoulderRoll,ShoulderYaw,Elbow,WristRoll,WristPitch,"
+                             "WristYaw. Vazio = HOME_ARM_POSE (home do ep0 do dataset).")
+    parser.add_argument("--record", action="store_true",
+                        help="Grava a run REAL pra replay/probes: cria train/log/run_<ts>/ com "
+                             "chunks.jsonl (chunk previsto + state + refs), frames.jsonl (ação "
+                             "executada), rgb/ depth/ attn/ e meta.json. Não-bloqueante (thread de "
+                             "escrita). Replay: offline_sim_host.py --replay-decisions.")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -435,16 +464,20 @@ def main():
     step_period = 1.0 / args.fps
     chunk_counter = 0
 
-    # --- OmniView live: telemetria + mapa de atenção da VLA (--live) ---
-    live_pub, attn_rec = None, None
+    # --- OmniView live (--live) + gravação da run (--record) ---
+    # attn_rec é necessário pros DOIS (dashboard E gravação do attention map).
+    live_pub, attn_rec, recorder = None, None, None
+    rec_depth_cam = depth_camera         # modelo de depth já tem uma; RGB abre uma só p/ gravar
+    _publish_attn = lambda: None         # no-op se não for --live (o loop chama incondicional)
+    if args.live or args.record:
+        from train.attn_recorder import AttnRecorder
+        attn_rec = AttnRecorder().install()
     if args.live:
         import base64
 
         from tools.live_bridge import TelemetryPublisher
-        from train.attn_recorder import AttnRecorder
 
         live_pub = TelemetryPublisher()
-        attn_rec = AttnRecorder().install()
         logger.info("OmniView live: telemetria em :5557 + atenção da VLA "
                     "(rode tools/live_omniview.py e abra :8013)")
 
@@ -466,6 +499,23 @@ def main():
                     })
             except Exception as e:
                 logger.debug("attn heatmap falhou: %s", e)
+
+    if args.record:
+        from tools.run_recorder import RunRecorder
+
+        rec_dir = REPO_ROOT / "train" / "log" / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+        recorder = RunRecorder(rec_dir, meta={**vars(args), "action_mode": ACTION_MODE, "state_dim": STATE_DIM})
+        if rec_depth_cam is None:            # modelo RGB: abre uma depth SÓ pra gravar (best-effort)
+            try:
+                rec_depth_cam = ZMQCamera(ZMQCameraConfig(
+                    server_address=args.robot_ip, port=5555,
+                    camera_name="head_camera_depth", width=848, height=480))
+                rec_depth_cam.connect()
+                logger.info("[record] câmera de depth (gravação) conectada")
+            except Exception as e:
+                logger.warning("[record] depth (gravação) indisponível: %s", e)
+                rec_depth_cam = None
+        logger.info("[record] gravando esta run em %s", rec_dir)
 
     # MOVIMENTO LENTO: seed do clamp com a posição MEDIDA atual da direita, pra
     # o 1º comando não saltar da pose atual pro alvo do modelo. A cada ciclo, cada
@@ -522,6 +572,52 @@ def main():
             logger.info("anti-stall: %d dedo(s) limitado(s) — ex.: %s alvo %.2f→%.2f (medido %.2f)",
                         len(hits), k.replace("right_hand_", "").replace("_joint.q", ""), v, nv, q)
         return out
+
+    # ── PRE-HOMING do braço: leva pra uma POSE NEUTRA FIXA conhecida ──
+    # Alvo = --home-arm-q (se dado) ou HOME_ARM_POSE (home do ep0 do dataset).
+    if args.home_arm_q.strip():
+        _hq = [float(x) for x in args.home_arm_q.split(",")]
+        if len(_hq) != 7:
+            raise ValueError(f"--home-arm-q precisa de 7 ângulos (recebi {len(_hq)}): {args.home_arm_q}")
+        home_arm_q = _hq
+    else:
+        home_arm_q = list(HOME_ARM_POSE)
+
+    def _home_arm_to_policy_start():
+        """Leva o braço direito a uma POSE NEUTRA FIXA conhecida (home do ep0 do dataset,
+        ou --home-arm-q) em --home-arm-s segundos, ANTES do loop — pose definida e
+        consistente (in-distribution), em vez da chunk[0] variável do modelo. Roda também
+        1 inferência de warm-up só pra aquecer o CUDA. dry-run: loga e alinha o clamp, sem enviar."""
+        if args.home_arm_s <= 0:
+            return
+        arm_tgt = dict(zip(RIGHT14_FEATURES[:7], home_arm_q))
+        try:  # warm-up só aquece o CUDA (não define o alvo)
+            wb, _ = build_observation_batch(
+                robot, args.task, device, wants_depth, wants_pressure, depth_camera)
+            wb = preprocessor(wb)
+            with torch.no_grad():
+                policy.predict_action_chunk(wb)
+        except Exception as e:
+            logger.warning("warm-up (aquece CUDA) falhou: %s", e)
+        obs = robot.get_observation()
+        start = {k: float(obs.get(k, 0.0)) for k in arm_tgt}
+        _sa = lambda d: {k.replace("kRight", "").replace(".q", ""): round(v, 3) for k, v in d.items()}  # noqa: E731
+        logger.info("homing braço -> NEUTRA FIXA: medido=%s -> neutra=%s (em %.1fs)",
+                    _sa(start), _sa(arm_tgt), args.home_arm_s)
+        if args.dry_run:
+            last_cmd.update(arm_tgt)
+            logger.info("(dry-run) homing NÃO enviado; clamp alinhado à neutra fixa.")
+            return
+        n = max(1, int(args.home_arm_s * args.fps))
+        for i in range(1, n + 1):
+            if killer.kill:
+                break
+            f = i / n
+            cmd = {k: (1.0 - f) * start[k] + f * arm_tgt[k] for k in arm_tgt}
+            robot.send_action(cmd)
+            last_cmd.update(cmd)
+            time.sleep(1.0 / args.fps)
+        logger.info("homing braço: concluído — braço na NEUTRA FIXA.")
 
     # ─────────────────── RTC: predição assíncrona + inpainting ───────────────────
     def _run_rtc_loop():
@@ -592,6 +688,17 @@ def main():
                     n += 1
                     if attn_rec is not None:
                         _publish_attn()   # depois do merge: não infla o dt/real_delay do RTC
+                    if recorder is not None:
+                        try:
+                            _dep = rec_depth_cam.async_read() if rec_depth_cam is not None else None
+                            _st = [float(raw_obs.get(nm, 0.0)) for nm in RIGHT14_FEATURES][:STATE_DIM]
+                            recorder.record_decision(
+                                n - 1, time.time(), _st, processed, action_mode=ACTION_MODE,
+                                rgb=_rgb_from_obs(raw_obs), depth=_dep,
+                                attn=attn_rec.heatmap() if attn_rec is not None else None,
+                                infer_ms=dt * 1000.0)
+                        except Exception as _re:
+                            logger.debug("[record] decisão falhou: %s", _re)
                 except Exception as e:
                     logger.error("RTC infer falhou: %s", e)
                     time.sleep(0.2)
@@ -615,6 +722,11 @@ def main():
                     live_pub.publish(latest_obs, act_dict,
                                      getattr(_ls, "pressure", None), getattr(_rs, "pressure", None),
                                      frame=frame, t=time.time(), robot_phase="unlocked")
+                if recorder is not None:
+                    try:
+                        recorder.record_frame(frame, time.time(), act_dict)
+                    except Exception:
+                        pass
                 if frame % 150 == 0:
                     arm = {k: round(v, 3) for k, v in act_dict.items() if "hand" not in k}
                     hand = {k: round(v, 3) for k, v in act_dict.items() if "hand" in k}
@@ -632,6 +744,8 @@ def main():
     if args.hand_stall_clamp > 0:
         logger.info("anti-stall dedos ATIVO: alvo preso a MEDIDO±%.2f rad (protege a Dex3 de stall)",
                     args.hand_stall_clamp)
+
+    _home_arm_to_policy_start()   # pré-posiciona o braço na pose de início do modelo (handover sem salto)
 
     try:
         if args.rtc and not args.dry_run:
@@ -653,6 +767,21 @@ def main():
             t_inf = time.perf_counter() - t_obs_start
             logger.info("chunk %d: previsto em %.0fms (shape %s)",
                         chunk_counter, t_inf * 1000, tuple(action_chunk.shape))
+
+            # gravação (--record): 1 decisão/chunk com a imagem + atenção que a gerou.
+            # No caminho RTC isto já é feito no _infer_loop; aqui (síncrono) faltava.
+            if recorder is not None:
+                try:
+                    _dep = rec_depth_cam.async_read() if rec_depth_cam is not None else None
+                    _st = [float(raw_obs.get(nm, 0.0)) for nm in RIGHT14_FEATURES][:STATE_DIM]
+                    recorder.record_decision(
+                        chunk_counter, time.time(), _st, action_chunk.squeeze(0),
+                        action_mode=ACTION_MODE,
+                        rgb=_rgb_from_obs(raw_obs), depth=_dep,
+                        attn=attn_rec.heatmap() if attn_rec is not None else None,
+                        infer_ms=t_inf * 1000.0)
+                except Exception as _re:
+                    logger.warning("[record] decisão falhou: %s", _re)
 
             steps_to_run = min(args.actions_per_chunk, action_chunk.shape[1])
             for i in range(steps_to_run):
@@ -690,6 +819,16 @@ def main():
             chunk_counter += 1
     finally:
         logger.info("desconectando")
+        if recorder is not None:
+            try:
+                recorder.close()
+            except Exception:
+                pass
+        if rec_depth_cam is not None and rec_depth_cam is not depth_camera:
+            try:
+                rec_depth_cam.disconnect()
+            except Exception:
+                pass
         if live_pub is not None:
             try:
                 live_pub.close()

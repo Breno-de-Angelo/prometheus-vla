@@ -40,7 +40,9 @@ def start_realsense_zmq():
             if not color_frame or not depth_frame:
                 continue
 
-            rgb = np.asanyarray(color_frame.get_data())
+            bgr = np.asanyarray(color_frame.get_data())          # RealSense rs.format.bgr8 → BGR
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)           # FONTE DA VERDADE: o robô já manda RGB.
+            #   Consumidores (record/deploy) NÃO reconvertem. Dataset/treino = RGB. (ver init_lerobot_record)
             depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 (unidades do sensor)
 
             # Depth em mm como uint16 (1 canal), enviado como PNG no multipart ZMQ.

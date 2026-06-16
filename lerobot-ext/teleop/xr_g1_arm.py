@@ -59,6 +59,12 @@ class XRG1Arm(Teleoperator):
         
         self.body_joints = {f"{motor.name}.q": 0.0 for motor in G1_29_JointIndex}
         self.hand_joints = {f"{name}.q": 0.0 for name in self._left_hand_names + self._right_hand_names}
+        # Sinais de grasp do controle gravados como dims próprias (NÃO são juntas; ficam no
+        # hand_joints só pra propagar a todos os returns e ao action_features). squeeze =
+        # fechamento total da mão; trigger = pinça fina. Atualizados no get_action.
+        for _gk in ("left_grasp_squeeze.q", "right_grasp_squeeze.q",
+                    "left_grasp_trigger.q", "right_grasp_trigger.q"):
+            self.hand_joints[_gk] = 0.0
 
         # Filtro EMA para squeeze e trigger do Quest (que são quasi-binários 0/1).
         # Sem filtro, cada frame onde o squeeze muda de 0→1 vira um step de ±1.5 rad
@@ -563,6 +569,13 @@ class XRG1Arm(Teleoperator):
                 right_trigger = 0.0 if self._tr_r < 0.05 else self._tr_r
                 left_squeeze  = self._sq_l
                 right_squeeze = self._sq_r
+
+                # Grava os 4 sinais de grasp brutos do controle como dims do dataset
+                # (0-1, filtrados por EMA). Não vão pra motor — só registro.
+                self.hand_joints["left_grasp_squeeze.q"]  = float(left_squeeze)
+                self.hand_joints["right_grasp_squeeze.q"] = float(right_squeeze)
+                self.hand_joints["left_grasp_trigger.q"]  = float(left_trigger)
+                self.hand_joints["right_grasp_trigger.q"] = float(right_trigger)
 
                 # =========================
                 # LÓGICA DE MOVIMENTO

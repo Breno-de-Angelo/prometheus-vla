@@ -114,6 +114,19 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
     ema_decay: float = 0.999
     ema_warmup: bool = True   # decay efetivo cresce com o step no começo
     ema_start_step: int = 0   # só começa a atualizar a EMA a partir deste step
+    # Run 4a — regularização do `state` (texto) contra causal confusion / atalho
+    # proprioceptivo (o braço ficou open-loop nas 3 runs do A/B: braço→imagem ~0.07).
+    # SÓ no treino: o forward de validação e o processor salvo p/ deploy ficam intactos
+    # (state completo). Default 0/0 = no-op estrito (nem toca o processor). Ver
+    # train/state_regularizer.py.
+    #   state_dropout_prob: com prob p, monta o prompt SEM "State: …" → força a imagem.
+    #   state_noise_bins:   perturba os bins discretizados do state real ±k (clip 0..255).
+    state_dropout_prob: float = 0.0
+    state_noise_bins: int = 0
+    # Validação (valfix): explícitos na dataclass p/ o YAML poder setá-los sem quebrar o
+    # parse do draccus (antes eram só getattr com default).
+    val_action_mse_batches: int = 16   # nº de batches no val_action_mse (best menos ruidoso)
+    val_flow_samples: int = 1          # K amostras de flow (t/ruído) por batch no val_loss (robustez)
 
 QUANTILE_MIN_RANGE = 1e-3  # rad; abaixo disso a dim é considerada congelada
 
@@ -159,7 +172,8 @@ from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import MetricsTracker
 from lerobot.utils.logging_utils import AverageMeter
-from train.utils import VarianceMeter 
+from train.utils import VarianceMeter
+from train.state_regularizer import install_state_regularizer, state_regularizer_active
 
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
@@ -518,6 +532,26 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         **postprocessor_kwargs,
     )
 
+    # Run 4a — state-dropout/ruído (treino-only). No-op se ambas as flags forem 0.
+    # Lê o nº de dims reais do state (sem padding) p/ mirar só elas com o ruído.
+    _state_dim = None
+    try:
+        _sf = (cfg.policy.input_features or {}).get("observation.state")
+        _state_dim = int(_sf.shape[0]) if _sf is not None else None
+    except Exception:
+        _state_dim = None
+    state_reg = install_state_regularizer(
+        dropout_prob=cfg.state_dropout_prob,
+        noise_bins=cfg.state_noise_bins,
+        state_dim=_state_dim,
+        seed=cfg.seed,
+    )
+    if state_reg is not None and is_main_process:
+        logging.info(
+            f"[state-reg] ATIVO (treino-only): dropout_prob={cfg.state_dropout_prob} "
+            f"noise_bins={cfg.state_noise_bins} state_dim={_state_dim}"
+        )
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -692,7 +726,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        batch = preprocessor(batch)
+        # state-dropout/ruído só aqui (forward de TREINO); val e deploy ficam com state completo.
+        with state_regularizer_active(state_reg):
+            batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -765,6 +801,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             policy_for_predict = accelerator.unwrap_model(policy)
 
             _EVAL_SEED = 1234   # ruído e timestep fixos no eval: val_loss comparável entre checkpoints
+            _val_flow_k = max(1, int(cfg.val_flow_samples))  # K amostras de flow no val_loss (robustez; revisão do prof)
             # fork_rng no device atual (antes era hardcoded devices=[0]). O index pode
             # vir None quando o device é só "cuda" (single-GPU mascarada) → cai pro
             # torch.cuda.current_device(), que é sempre um inteiro válido.
@@ -792,11 +829,18 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     for val_batch in val_dataloader:
                         val_batch = preprocessor(val_batch)
                         vb_idx += 1
-                        # ruído e timestep do flow-matching fixos por batch (fork_rng isola o rng do treino)
+                        # K amostras de flow (t/ruído distintos) por batch -> val_loss menos ruidoso
+                        # (revisão do prof). _EVAL_SEED mantém comparabilidade entre checkpoints; K=1 = de sempre.
                         with torch.random.fork_rng(devices=_dev):
-                            torch.manual_seed(_EVAL_SEED + vb_idx)
-                            with accelerator.autocast():
-                                val_loss, val_output_dict = policy.forward(val_batch)
+                            _vl_acc, val_output_dict = None, None
+                            for _ks in range(_val_flow_k):
+                                torch.manual_seed(_EVAL_SEED + vb_idx + _ks * 7919)
+                                with accelerator.autocast():
+                                    _vl, _vod = policy.forward(val_batch)
+                                _vl_acc = _vl if _vl_acc is None else _vl_acc + _vl
+                                if val_output_dict is None:
+                                    val_output_dict = _vod
+                            val_loss = _vl_acc / _val_flow_k
 
                         if action_mse_batches_done < _max_action_mse_batches:
                             try:
@@ -886,6 +930,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                 # dim_eval/ = seção separada: per-dim + a flow-loss (val_loss, proxy frouxa),
                 # mantida logada mas fora da visão principal.
                 val_log_dict = {}
+                ema_log_dict = {}   # seção ema/ no wandb (métricas dos pesos EMA, separadas de eval/)
                 dim_eval_dict = {
                     "val_loss": val_loss_meter.avg,
                     "val_loss_std": val_loss_meter.std,
@@ -933,27 +978,28 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
                     raw_loss = val_loss_meter.avg
                     ema_loss = ema_res["val_loss_meter"].avg
 
+                    # raw continua em eval/; EMA vai pra seção própria ema/ (pedido do user)
                     if raw_mse is not None:
                         val_log_dict["val_action_mse_raw"] = raw_mse
                     if cur_mse_ema is not None:
-                        val_log_dict["val_action_mse_ema"] = cur_mse_ema
+                        ema_log_dict["val_action_mse"] = cur_mse_ema
                     if raw_mse is not None and cur_mse_ema is not None:
-                        val_log_dict["val_action_mse_ema_minus_raw"] = cur_mse_ema - raw_mse
+                        ema_log_dict["val_action_mse_minus_raw"] = cur_mse_ema - raw_mse
                     if raw_arm is not None:
                         val_log_dict["val_action_mse_arm_raw"] = raw_arm
                     if ema_arm is not None:
-                        val_log_dict["val_action_mse_arm_ema"] = ema_arm
+                        ema_log_dict["val_action_mse_arm"] = ema_arm
                     if raw_arm is not None and ema_arm is not None:
-                        val_log_dict["val_action_mse_arm_ema_minus_raw"] = ema_arm - raw_arm
+                        ema_log_dict["val_action_mse_arm_minus_raw"] = ema_arm - raw_arm
                     if raw_grasp is not None:
                         val_log_dict["val_action_mse_grasp_raw"] = raw_grasp
                     if ema_grasp is not None:
-                        val_log_dict["val_action_mse_grasp_ema"] = ema_grasp
+                        ema_log_dict["val_action_mse_grasp"] = ema_grasp
                     if raw_grasp is not None and ema_grasp is not None:
-                        val_log_dict["val_action_mse_grasp_ema_minus_raw"] = ema_grasp - raw_grasp
+                        ema_log_dict["val_action_mse_grasp_minus_raw"] = ema_grasp - raw_grasp
                     val_log_dict["val_loss_raw"] = raw_loss
-                    val_log_dict["val_loss_ema"] = ema_loss
-                    val_log_dict["val_loss_ema_minus_raw"] = ema_loss - raw_loss
+                    ema_log_dict["val_loss"] = ema_loss
+                    ema_log_dict["val_loss_minus_raw"] = ema_loss - raw_loss
                     logging.info(
                         f"  [EMA] val_action_mse raw={raw_mse} ema={cur_mse_ema} "
                         f"val_loss raw={raw_loss:.4f} ema={ema_loss:.4f}"
@@ -961,9 +1007,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
 
                 if wandb_logger:
                     wandb_logger.log_dict(val_log_dict, step, mode="eval")
-                    # per-dim + flow-loss na seção separada dim_eval/
                     if getattr(wandb_logger, "_wandb", None) is not None:
+                        # per-dim + flow-loss na seção dim_eval/; métricas dos pesos EMA na seção ema/
                         wandb_logger._wandb.log({f"dim_eval/{k}": v for k, v in dim_eval_dict.items()}, step=step)
+                        if ema_log_dict:
+                            wandb_logger._wandb.log({f"ema/{k}": v for k, v in ema_log_dict.items()}, step=step)
 
                 # Critério do BEST: SÓ val_action_mse (erro do chunk de ação
                 # gerado no held-out) — é o

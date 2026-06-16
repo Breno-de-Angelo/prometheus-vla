@@ -143,10 +143,14 @@ Saída:
 
 **O que é treinado:**
 - Action Expert (Gemma 300M) — aprende o mapeamento visão+estado → ação
-- Vision encoder (SigLIP) — fine-tuned (`freeze_vision_encoder: false`)
+- (no run depth) PointNet do token de profundidade
 
 **O que é congelado:**
-- VLM (Gemma 2B) — `train_expert_only: true` — evita catastrofic forgetting com poucos dados
+- VLM (Gemma 2B) **incluindo o vision encoder SigLIP** — `train_expert_only: true`
+  congela `paligemma.parameters()` inteiro (`modeling_pi05.py:417-420`), o que
+  inclui a vision tower. ⚠️ `freeze_vision_encoder: false` é **inerte** nesta
+  config (só teria efeito com `train_expert_only: false`). Evita catastrophic
+  forgetting com poucos dados.
 
 **Pesos base:** `lerobot/pi05_base` — 14GB, já disponível em `~/.cache/huggingface/hub/` na Atena.
 
@@ -181,6 +185,12 @@ sorteados proporcionalmente ao peso:
 | Scheduler | Cosine decay | Cosine decay |
 | Chunk size | 50 ações | 50 ações |
 | Horizonte | ~1.67s | ~1.67s |
+
+> **Execução open-loop do chunk:** com `n_action_steps = chunk_size = 50`, a
+> inferência executa o chunk INTEIRO (~1.67 s @ 30 Hz) antes de observar de novo —
+> qualquer mudança na cena nesse intervalo é ignorada. Recomendação: replanejar
+> após ~25 ações (`--actions-per-chunk 25` na inferência), mantendo o treino igual.
+> (Apenas documentado; a mudança na inferência fica fora do escopo desta rodada.)
 | Checkpoints | a cada 500 steps | a cada 2000 steps |
 | dtype | bfloat16 | bfloat16 |
 | Gradient checkpointing | true | true |

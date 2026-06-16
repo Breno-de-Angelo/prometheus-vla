@@ -1,0 +1,13 @@
+{
+  "fx": 601.712890625,
+  "fy": 601.3858642578125,
+  "cx": 431.7940979003906,
+  "cy": 251.49661254882812,
+  "width": 848,
+  "height": 480,
+  "model": "distortion.inverse_brown_conrady",
+  "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "serial": "327122071538",
+  "device": "Intel RealSense D435I",
+  "stream": "color"
+}
