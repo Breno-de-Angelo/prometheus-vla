@@ -43,7 +43,7 @@ USO
 WORKFLOW TÍPICO
 ---------------
     # 1. Gravar episódios (gera dataset 28-dim em G1_Dex3_depth_tactil_dataset)
-    python lerobot-ext/tools/init_lerobot_record_v2.py ...
+    python lerobot-ext/init_lerobot_record.py --config_path config/record/record_televuer.yaml
 
     # 2. Fatiar para 14-dim (gera dataset em G1_Dex3_right14_dataset)
     python lerobot-ext/tools/slice_right_arm_only.py \\
