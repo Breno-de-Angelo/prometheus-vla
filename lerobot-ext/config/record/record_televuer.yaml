@@ -5,15 +5,24 @@ robot:
 teleop:
   type: xr_g1_arm
   zmq: true
-  input_mode: "hand"
-  display_mode: "ego"
+  input_mode: "controller"   # "hand" = hand tracking | "controller" = controles físicos do Quest
+  display_mode: "pass-through"
   ee_type: "dex3"
 
 dataset:
-  repo_id: Mrwlker/push_cup
-  root: "meu_dataset/push_cup"
-  push_to_hub: true
-  single_task: "push the cup"
+  repo_id: lewislf/G1_Dex3_depth_tactil_dataset
+  root: "datasets/G1_Dex3_depth_tactil_dataset"
+  push_to_hub: false
+  single_task: "Pick up the white cup"
   vcodec: "h264"
+  episode_time_s: 3600  # sem auto-reset: salva/descarta manualmente com A/B
+  reset_time_s: 0  # sem período de espera entre episódios — descarta e re-grava imediatamente
+  # ⚠️ DEVE SER 1. video_encoding_batch_size > 1 está BUGADO nesta versão do LeRobot:
+  # o encode em lote no fim sai INVERTIDO/TRUNCADO (verificado em 2026-06-06 no run
+  # 20260605_173343, gravado com batch=50 → file-000.mp4 reverso e com 2090/16453 frames).
+  # O patch do KeyError só evitou o crash, NÃO conserta o vídeo corrompido.
+  # batch=1 encoda o vídeo POR EPISÓDIO no save (frame-exato, alinhado ao parquet) — é o
+  # único modo confiável pra treino. Custo: ~13s de pausa por save (encode síncrono).
+  video_encoding_batch_size: 1
 
 play_sounds: false

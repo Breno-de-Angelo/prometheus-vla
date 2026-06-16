@@ -1,6 +1,7 @@
 """Standalone sensor utilities for camera image publishing via ZMQ"""
 import base64
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -77,6 +78,45 @@ class SensorServer:
                 f"[Sensor server] Message sent: {self.message_sent}, message dropped: {self.message_dropped}"
             )
 
+    def send_images(self, images: Dict[str, np.ndarray], timestamps: Dict[str, float] | None = None):
+        """Send compressed image bytes as ZMQ multipart: metadata JSON + image bytes."""
+        timestamps = timestamps or {name: time.time() for name in images}
+        metadata = {"protocol": "zmq.compressed.v1", "timestamps": timestamps, "images": {}}
+        parts = [b""]
+
+        for name, image in images.items():
+            frame = np.ascontiguousarray(image)
+            if frame.dtype == np.uint16 or frame.ndim == 2 or (frame.ndim == 3 and frame.shape[2] == 1):
+                encoding = "png"
+                ok, buffer = cv2.imencode(".png", frame)
+            else:
+                encoding = "jpeg"
+                ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                raise RuntimeError(f"Failed to encode image '{name}'")
+
+            metadata["images"][name] = {
+                "encoding": encoding,
+                "dtype": str(frame.dtype),
+                "shape": list(frame.shape),
+                "part": len(parts),
+            }
+            parts.append(memoryview(buffer))
+
+        parts[0] = json.dumps(metadata).encode("utf-8")
+
+        try:
+            self.socket.send_multipart(parts, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            self.message_dropped += 1
+            print(f"[Warning] message dropped: {self.message_dropped}")
+        self.message_sent += 1
+
+        if self.message_sent % 100 == 0:
+            print(
+                f"[Sensor server] Message sent: {self.message_sent}, message dropped: {self.message_dropped}"
+            )
+
 
 class SensorClient:
     """ZMQ-based sensor client for subscribing to camera images"""
@@ -126,4 +166,3 @@ class ImageUtils:
         depth_data = base64.b64decode(image)
         depth_array = np.frombuffer(depth_data, dtype=np.uint8)
         return cv2.imdecode(depth_array, cv2.IMREAD_UNCHANGED)
-
