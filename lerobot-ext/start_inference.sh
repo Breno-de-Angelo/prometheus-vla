@@ -20,10 +20,11 @@ REPO="${REPO:-$(dirname "$SCRIPT_DIR")}"          # lerobot-ext/start_inference.
 ENV_NAME="${ENV_NAME:-ms3}"
 
 # --- parametros (override por env var) ---
-CKPT="${CKPT:-$REPO/train_output/cup_pi05_right8_armstate7_run4a_lf/checkpoints/best/pretrained_model_ema}"
+CKPT="${CKPT:-$REPO/train_output/_frozen/run4b_fullvlm_DEPLOYTESTED_step9500_valema0.0604/pretrained_model_ema}"
 ROBOT_IP="${ROBOT_IP:-10.9.8.73}"
 TASK="${TASK:-Pick up the white cup}"
 GPU="${GPU:-0}"                                   # GPU0 (treino fica na 2)
+RTC="${RTC:-1}"   # default ON (fluido); RTC=0 = modo sincrono fallback
 HTTP_PORT="${HTTP_PORT:-8013}"
 HTTP_HOST="${HTTP_HOST:-0.0.0.0}"                 # 0.0.0.0 = acessivel na rede do lab (http://<atena>:8013). 127.0.0.1 = so local (precisa tunel SSH)
 RECORD="${RECORD:-1}"                             # 1 = grava RGB+atencao+depth em train/log/run_<ts>/ (p/ replay HTML). 0 = so o log de texto (poupa disco)
@@ -100,6 +101,8 @@ else
   sleep 4
 fi
 
+RTC_FLAG=""
+if [ "$RTC" = "1" ]; then RTC_FLAG="--rtc"; echo "[*] RTC ON: predicao assincrona (sem degraus/platos)"; fi
 REC_FLAG=""
 if [ "$RECORD" = "1" ]; then
   REC_FLAG="--record"
@@ -112,4 +115,4 @@ CUDA_VISIBLE_DEVICES="$GPU" python -u "$VLA" \
   --checkpoint "$CKPT" \
   --robot-ip "$ROBOT_IP" \
   --task "$TASK" \
-  --live $DRY_FLAG $REC_FLAG "$@"
+  --live $DRY_FLAG $REC_FLAG $RTC_FLAG "$@"

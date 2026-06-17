@@ -82,9 +82,19 @@ body{
 
 /* ───────── grid ───────── */
 .grid{flex:1;min-height:0;display:grid;gap:12px;
-  grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1.08fr}
+  grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1.08fr 1.15fr}
 .cell{min-width:0;min-height:0;opacity:0;transform:translateY(10px);animation:rise .5s cubic-bezier(.2,.7,.3,1) forwards}
 .cell.cmd-wide{grid-column:1 / -1}
+.cell.traj-wide{grid-column:1 / -1}
+/* ── trajetória 3D (painel do efetuador) ── */
+.traj-panel .traj-wrap{flex:1;min-height:0}
+.traj-wrap{position:relative;width:100%;height:100%}
+.traj-canvas{width:100%;height:100%;display:block;touch-action:none}
+.traj-legend{position:absolute;top:9px;left:11px;display:flex;flex-direction:column;gap:3px;font-family:var(--mono);font-size:9.5px;color:var(--ink2)}
+.traj-legend span{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.traj-legend i{width:14px;height:2.5px;border-radius:2px;flex:none}
+.traj-legend i.dash{background:none!important;border-top:2px dashed #f59e0b;height:0}
+.traj-hint{position:absolute;bottom:8px;right:10px;font-family:var(--mono);font-size:9px;color:var(--ink4)}
 .armsel{display:flex;gap:4px;margin-left:10px}
 .armbtn{font:600 11px/1 ui-sans-serif,system-ui;letter-spacing:.3px;color:var(--ink3);background:var(--bg2);
   border:1px solid var(--line);border-radius:7px;padding:6px 11px;cursor:pointer;transition:.12s}
@@ -92,6 +102,7 @@ body{
 .armbtn.on{color:#08121c;background:var(--cyan);border-color:var(--cyan);box-shadow:0 0 10px rgba(34,211,238,.35)}
 .cell:nth-child(1){animation-delay:.04s}.cell:nth-child(2){animation-delay:.10s}.cell:nth-child(3){animation-delay:.16s}
 .cell:nth-child(4){animation-delay:.22s}.cell:nth-child(5){animation-delay:.28s}.cell:nth-child(6){animation-delay:.34s}
+.cell:nth-child(7){animation-delay:.40s}
 @keyframes rise{to{opacity:1;transform:none}}
 
 /* ───────── panel ───────── */
@@ -163,6 +174,7 @@ body{
 <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
 <script type="text/babel" src="ov_data.jsx?v=3"></script>
 <script type="text/babel" src="ov_ramps.jsx?v=3"></script>
-<script type="text/babel" src="inference_app.jsx?v=2"></script>
+<script type="text/babel" src="ov_traj.jsx?v=1"></script>
+<script type="text/babel" src="inference_app.jsx?v=3"></script>
 </body>
 </html>

@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 TELEMETRY_PORT = 5557
 
+# --- Inferencia right8: deriva o squeeze (0..1) dos dedos reconstruidos ---
+# A inferencia right8 NAO publica *_grasp_squeeze.q (chave do teleop); reconstroi os
+# dedos via hand_q = squeeze x RIGHT_TARGET. Sem isso o medidor de grasp do OmniView
+# fica cravado em 0%. Aqui derivamos o squeeze de volta dos dedos (junta/alvo, media; clip 0..1).
+_RIGHT_GRASP_JOINTS = [("right_hand_index_1_joint.q", 1.74),
+                       ("right_hand_thumb_2_joint.q", -1.74),
+                       ("right_hand_middle_1_joint.q", 1.74)]
+_LEFT_GRASP_JOINTS = [("left_hand_index_1_joint.q", 1.74),
+                      ("left_hand_thumb_2_joint.q", -1.74),
+                      ("left_hand_middle_1_joint.q", 1.74)]
+
 # ---- ordem das juntas (espelha o packing do OmniView: braço esq / dir / mão esq / dir) ----
 # Braços: chaves de obs/action usam o NOME DO ENUM (G1_29_JointArmIndex), ex. "kRightElbow.q".
 # Mãos: chaves usam o NOME URDF (RIGHT_HAND_JOINT_NAMES), ex. "right_hand_thumb_0_joint.q".
@@ -59,6 +70,27 @@ def _get(src, key: str) -> float:
     except Exception:
         return 0.0
 
+
+
+def _derive_squeeze(d, joints):
+    vals = []
+    for k, tgt in joints:
+        present = (k in d) if hasattr(d, "__contains__") else True
+        if present and abs(tgt) > 1e-6:
+            vals.append(_get(d, k) / tgt)
+    if not vals:
+        return 0.0
+    return max(0.0, min(1.0, sum(vals) / len(vals)))
+
+
+def _grasp_signal(d, squeeze_key, derive_joints):
+    """teleop publica *_grasp_squeeze.q; inferencia right8 nao -> deriva dos dedos."""
+    try:
+        if squeeze_key in d:
+            return _get(d, squeeze_key)
+    except TypeError:
+        pass
+    return _derive_squeeze(d, derive_joints)
 
 def _group(src, keys) -> list:
     return [_get(src, k) for k in keys]
@@ -154,8 +186,8 @@ class TelemetryPublisher:
                 # sinais de grasp do controle (0=solto, 1=fechado). squeeze=fecha a mão
                 # toda (grasp); trigger=pinça fina do dedo.
                 "grasp": {
-                    "left": _get(action, "left_grasp_squeeze.q"),
-                    "right": _get(action, "right_grasp_squeeze.q"),
+                    "left": _grasp_signal(action, "left_grasp_squeeze.q", _LEFT_GRASP_JOINTS),
+                    "right": _grasp_signal(action, "right_grasp_squeeze.q", _RIGHT_GRASP_JOINTS),
                     "leftTrigger": _get(action, "left_grasp_trigger.q"),
                     "rightTrigger": _get(action, "right_grasp_trigger.q"),
                 },

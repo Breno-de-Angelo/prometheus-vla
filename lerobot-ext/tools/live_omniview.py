@@ -232,13 +232,16 @@ def _tele_thread(port: int, stop: threading.Event):
             # pequeno, que o navegador compõe por cima do RGB ao vivo.
             attn = pkt.pop("attn_jpg", None)
             attn_hm = pkt.pop("attn_hm", None)
-            if attn or attn_hm:
+            chunk = pkt.pop("chunk", None)   # chunk de ação previsto (FK 3D no navegador)
+            if attn or attn_hm or chunk:
                 if not LATEST.get("img"):
                     LATEST["img"] = {}
                 if attn:
                     LATEST["img"]["attn"] = attn
                 if attn_hm:
                     LATEST["img"]["attn_hm"] = attn_hm
+                if chunk:
+                    LATEST["img"]["chunk"] = chunk
                 LATEST["attn_ts"] = time.time()
                 LATEST["img_seq"] += 1
                 if not pkt or set(pkt) <= {"type"}:
@@ -334,10 +337,11 @@ async def _broadcast(app: web.Application):
             # atenção parada (inferência off há >5s): tira do pacote pra não reenviar
             # heatmap fóssil 30x/s pela rede.
             img = LATEST["img"]
-            if img and ("attn" in img or "attn_hm" in img) \
+            if img and ("attn" in img or "attn_hm" in img or "chunk" in img) \
                     and time.time() - LATEST.get("attn_ts", 0.0) > 5.0:
                 img.pop("attn", None)
                 img.pop("attn_hm", None)
+                img.pop("chunk", None)
             if send_img and LATEST["img_seq"] != sent_img and LATEST["img"] is not None:
                 sent_img = LATEST["img_seq"]
                 last_img_tick = tick

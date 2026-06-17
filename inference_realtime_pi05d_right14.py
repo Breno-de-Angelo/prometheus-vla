@@ -468,7 +468,7 @@ def main():
     # attn_rec é necessário pros DOIS (dashboard E gravação do attention map).
     live_pub, attn_rec, recorder = None, None, None
     rec_depth_cam = depth_camera         # modelo de depth já tem uma; RGB abre uma só p/ gravar
-    _publish_attn = lambda: None         # no-op se não for --live (o loop chama incondicional)
+    _publish_attn = lambda *a, **k: None  # no-op se não for --live (o loop chama incondicional)
     if args.live or args.record:
         from train.attn_recorder import AttnRecorder
         attn_rec = AttnRecorder().install()
@@ -481,24 +481,28 @@ def main():
         logger.info("OmniView live: telemetria em :5557 + atenção da VLA "
                     "(rode tools/live_omniview.py e abra :8013)")
 
-        def _publish_attn():
-            # Publica SÓ o heatmap (JET 128×128, ~4KB); o navegador compõe por cima
-            # do RGB AO VIVO — o overlay pronto congelava o frame que a política viu.
-            heat = attn_rec.heatmap()
-            if heat is None:
-                return
+        def _publish_attn(chunk_arm=None):
+            # Publica o heatmap de atenção (JET 128×128, ~4KB) E o chunk de ação previsto
+            # (juntas do braço × N passos) no MESMO pacote extra — publish_extra tem slot
+            # único, então combinar evita que um clobbere o outro. O navegador compõe o
+            # heatmap por cima do RGB ao vivo e roda FK no chunk p/ a trajetória 3D prevista.
+            pkt = {}
+            if chunk_arm is not None:
+                pkt["chunk"] = chunk_arm
             try:
-                import cv2 as _cv2
-                hm = _cv2.resize((heat * 255).astype(np.uint8), (128, 128),
-                                 interpolation=_cv2.INTER_CUBIC)
-                hm = _cv2.applyColorMap(hm, _cv2.COLORMAP_JET)
-                ok, buf = _cv2.imencode(".jpg", hm, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-                if ok:
-                    live_pub.publish_extra({
-                        "attn_hm": "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
-                    })
+                heat = attn_rec.heatmap() if attn_rec is not None else None
+                if heat is not None:
+                    import cv2 as _cv2
+                    hm = _cv2.resize((heat * 255).astype(np.uint8), (128, 128),
+                                     interpolation=_cv2.INTER_CUBIC)
+                    hm = _cv2.applyColorMap(hm, _cv2.COLORMAP_JET)
+                    ok, buf = _cv2.imencode(".jpg", hm, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
+                    if ok:
+                        pkt["attn_hm"] = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
             except Exception as e:
                 logger.debug("attn heatmap falhou: %s", e)
+            if pkt:
+                live_pub.publish_extra(pkt)
 
     if args.record:
         from tools.run_recorder import RunRecorder
@@ -686,8 +690,14 @@ def main():
                     queue.merge(original, processed, math.ceil(dt / time_per_step), idx_before)
                     logger.info("RTC chunk %d: %.0fms delay=%d fila=%d", n, dt * 1000, delay, queue.qsize())
                     n += 1
-                    if attn_rec is not None:
-                        _publish_attn()   # depois do merge: não infla o dt/real_delay do RTC
+                    # publica atenção (se houver) + o chunk previsto (7 juntas do braço × N
+                    # passos, em rad físico) p/ a trajetória 3D do dashboard. Depois do merge:
+                    # não infla o dt/real_delay do RTC.
+                    try:
+                        _chunk_arm = processed[:, :7].detach().cpu().numpy().round(4).tolist()
+                    except Exception:
+                        _chunk_arm = None
+                    _publish_attn(_chunk_arm)
                     if recorder is not None:
                         try:
                             _dep = rec_depth_cam.async_read() if rec_depth_cam is not None else None

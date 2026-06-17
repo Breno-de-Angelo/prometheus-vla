@@ -34,6 +34,11 @@
     const histRef = useRef([]), graspRef = useRef({ right: 0, rightTrigger: 0, left: 0 });
     const graspHistRef = useRef([]), imgRef = useRef({}), metaRef = useRef({ episode: 0, frame: 0 });
     const lastTeleRef = useRef(0), phaseRef = useRef('unlocked');
+    // taxas: cmd = comandos enviados ao robô (msgs 'tele', ~loop de controle);
+    // attn = atualização do mapa de atenção (= taxa de inferência da VLA, msgs com attn_hm).
+    const cmdHzRef = useRef({ last: performance.now(), n: 0, hz: 0 });
+    const attnHzRef = useRef({ last: performance.now(), n: 0, hz: 0 });
+    const chunkRef = useRef(null);   // último chunk previsto (N×7 juntas do braço, rad físico)
     const [, setTick] = useState(0); const [conn, setConn] = useState(false); const dirty = useRef(false);
     useEffect(() => {
       let ws, retry, alive = true;
@@ -49,10 +54,12 @@
             const n = { rgb: p.rgb, depth: p.depth, attnHm: p.attnHm, rgbSize: m.rgbSize || p.rgbSize, depthMeta: m.depthMeta || p.depthMeta };
             if (m.rgb)     { n.rgb = dataUrlToBlobUrl(m.rgb);       if (p.rgb)    URL.revokeObjectURL(p.rgb); }
             if (m.depth)   { n.depth = dataUrlToBlobUrl(m.depth);   if (p.depth)  URL.revokeObjectURL(p.depth); }
-            if (m.attn_hm) { n.attnHm = dataUrlToBlobUrl(m.attn_hm);if (p.attnHm) URL.revokeObjectURL(p.attnHm); }
+            if (m.attn_hm) { n.attnHm = dataUrlToBlobUrl(m.attn_hm);if (p.attnHm) URL.revokeObjectURL(p.attnHm); attnHzRef.current.n++; }
+            if (m.chunk) { chunkRef.current = m.chunk; }
             imgRef.current = n; dirty.current = true;
           } else if (m.type === 'tele') {
             lastTeleRef.current = performance.now();
+            cmdHzRef.current.n++;
             if (m.robot && m.robot.phase) phaseRef.current = m.robot.phase;
             const h = histRef.current;
             h.push({ s28: flat28(m.state || {}), a28: flat28(m.action || {}) });
@@ -68,11 +75,16 @@
       }
       connect();
       let raf, lastT = 0;
-      function loop(ts) { if (dirty.current && (ts - lastT) >= 33) { dirty.current = false; lastT = ts; setTick(t => t + 1); } raf = requestAnimationFrame(loop); }
+      function tickHz(r, now) { if (now - r.last >= 1000) { r.hz = r.n * 1000 / (now - r.last); r.n = 0; r.last = now; } }
+      function loop(ts) {
+        const now = performance.now(); tickHz(cmdHzRef.current, now); tickHz(attnHzRef.current, now);
+        if (dirty.current && (ts - lastT) >= 33) { dirty.current = false; lastT = ts; setTick(t => t + 1); }
+        raf = requestAnimationFrame(loop);
+      }
       raf = requestAnimationFrame(loop);
       return () => { alive = false; clearTimeout(retry); cancelAnimationFrame(raf); try { ws.close(); } catch (e) {} };
     }, []);
-    return { histRef, graspRef, graspHistRef, imgRef, metaRef, lastTeleRef, phaseRef, conn };
+    return { histRef, graspRef, graspHistRef, imgRef, metaRef, lastTeleRef, phaseRef, conn, cmdHzRef, attnHzRef, chunkRef };
   }
 
   // ───────── header pieces ─────────
@@ -231,22 +243,50 @@
     );
   }
 
+  // ───────── trajetória 3D (efetuador) ─────────
+  // executado = FK do state medido (traço com gradiente de tempo); chunk previsto = FK
+  // do chunk da VLA (traço fantasma tracejado). Reusa window.Trajectory3D (ov_traj.jsx).
+  function TrajPanel({ traj, frame }) {
+    return (
+      <div className="pnl traj-panel">
+        <div className="phead"><span className="ptag"><i />Trajetória 3D · efetuador dir.</span>
+          <span className="pmeta">cheia = executado (robô) · tracejado = chunk previsto (VLA)</span></div>
+        <div className="pbody" style={{ background: '#05080d', display: 'block' }}>
+          {traj
+            ? React.createElement(window.Trajectory3D, { kin: traj.kin, kinTarget: traj.kinChunk, frame, bbox: traj.bbox, accent: '#34d399' })
+            : <span className="wait" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>aguardando telemetria</span>}
+        </div>
+      </div>
+    );
+  }
+
   // ───────── App ─────────
   function App() {
-    const { histRef, graspRef, graspHistRef, imgRef, metaRef, lastTeleRef, phaseRef, conn } = useLiveData();
+    const { histRef, graspRef, graspHistRef, imgRef, metaRef, lastTeleRef, phaseRef, conn, cmdHzRef, attnHzRef, chunkRef } = useLiveData();
     const [showCmd, setShowCmd] = useState(false); // mostra o "recebido" (ação da VLA) tracejado além do executado
     const [armSide, setArmSide] = useState('right'); // 'right' (dims 7-13, controlado) | 'left' (dims 0-6, limp/medido)
     const base = armSide === 'right' ? 7 : 0;
     const sideLabel = armSide === 'right' ? 'Braço dir' : 'Braço esq';
-    const hzRef = useRef({ last: performance.now(), n: 0, hz: 0 });
     const hist = histRef.current, F = hist.length, img = imgRef.current, meta = metaRef.current;
-    { const h = hzRef.current; h.n++; const now = performance.now(); if (now - h.last > 1000) { h.hz = h.n * 1000 / (now - h.last); h.n = 0; h.last = now; } }
 
     const ready = F >= 2;
     const tele = useMemo(() => {
       if (!ready) return null;
       const action = hist.map(s => s.a28), state = hist.map(s => s.s28);
       return { action, state, filtered: OV.deriveFiltered(action, FPS), fps: FPS };
+    }, [meta.frame, F, conn]); // eslint-disable-line
+
+    // trajetória 3D: executado = FK do state medido; chunk = FK do chunk previsto (N×7).
+    const traj = useMemo(() => {
+      if (!ready) return null;
+      const kin = OV.buildKinematics(hist.map(s => s.s28));
+      let kinChunk = null;
+      const ch = chunkRef.current;
+      if (ch && ch.length && ch[0] && ch[0].length >= 7) {
+        kinChunk = { ee: ch.map(q => OV.fkArm(q).ee), skel: ch.map(q => OV.fkArm(q)) };
+      }
+      const pts = kin.ee.concat(kinChunk ? kinChunk.ee : []);
+      return { kin, kinChunk, bbox: OV.bbox(pts) };
     }, [meta.frame, F, conn]); // eslint-disable-line
 
     const ph = PHASE[phaseRef.current] || PHASE.unlocked;
@@ -262,7 +302,8 @@
           <div className="chips">
             <span className="chip">π0.5 · <b>armstate7-8k</b></span>
             <span className="chip" title="passo cumulativo da VLA (não reseta); o buffer do gráfico é capado em ~30s">ep <b>{String(meta.episode).padStart(2, '0')}</b> · step <b>{meta.frame}</b></span>
-            <span className="chip">{hzRef.current.hz.toFixed(0)} <b>Hz</b></span>
+            <span className="chip" title="comandos enviados ao robô (loop de controle)">cmd <b>{cmdHzRef.current.hz.toFixed(0)}</b> Hz</span>
+            <span className="chip" title="atualização do mapa de atenção (= taxa de inferência da VLA)">atn <b>{attnHzRef.current.hz.toFixed(1)}</b> Hz</span>
             <span className={'chip phase ' + ph[0]}><span className="pdot" />{ph[1]}</span>
           </div>
           <div className="armsel">
@@ -281,6 +322,7 @@
           <div className="cell"><ArmBlockPanel label="Shoulder" sideLabel={sideLabel} tele={tele} frame={F - 1} dims={[base, base + 1, base + 2]} subNames={['Pitch', 'Roll', 'Yaw']} base={base} showCmd={showCmd} /></div>
           <div className="cell"><ArmBlockPanel label="Elbow" sideLabel={sideLabel} tele={tele} frame={F - 1} dims={[base + 3]} subNames={['Elbow']} base={base} showCmd={showCmd} /></div>
           <div className="cell"><ArmBlockPanel label="Wrist" sideLabel={sideLabel} tele={tele} frame={F - 1} dims={[base + 4, base + 5, base + 6]} subNames={['Roll', 'Pitch', 'Yaw']} base={base} showCmd={showCmd} /></div>
+          <div className="cell traj-wide"><TrajPanel traj={traj} frame={F - 1} /></div>
         </div>
 
         <div className="foot">
