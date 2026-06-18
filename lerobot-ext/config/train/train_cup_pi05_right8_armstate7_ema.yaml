@@ -1,0 +1,155 @@
+# config do RUN 3 do A/B — val-fixes + EMA dos pesos treinaveis (TRX50 gpu1)
+# = a config do run 2 (valfix) + ema_enabled:true + seed explicito + nomes/output proprios.
+# Mesma seed/dataset/scheduler do run 2 -> A/B limpo: a unica variavel de modelo e a EMA.
+# ==========================================================
+# PI05 BASE — Treino braço DIREITO + squeeze (8 dims) — RGB ONLY
+# Dataset: G1_Dex3_pick_white_cup_right8_1squeeze_armstate7 (238 eps do v3_grasp)
+#   action[0:7] = braço direito | action[7] = right_grasp_squeeze (0→1)
+#   state 7 = braço direito (armstate7: sem os dedos medidos)
+#   Deploy: hand_q = squeeze × RIGHT_TARGET = [0,-0.92,-1.74,1.57,1.74,1.57,1.74]
+# GPU alvo: CUDA_VISIBLE_DEVICES=1 (TRX50, gpu0 ocupada pelo run 2)
+# ==========================================================
+
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
+# ==========================================================
+dataset:
+  repo_id: lewislf/G1_Dex3_pick_white_cup_right8_1squeeze_armstate7
+  root: datasets/_merged/G1_Dex3_pick_white_cup_right8_1squeeze_armstate7
+  revision: main
+  video_backend: pyav
+
+  image_transforms:
+    enable: true
+    max_num_transforms: 2
+    random_order: false
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+      RandomResizedCrop:
+        type: RandomResizedCrop
+        weight: 1.0
+        kwargs:
+          size: [480, 848]
+          scale: [0.75, 1.0]
+          ratio: [0.9, 1.1]
+          antialias: true
+      RandomErasing:
+        type: RandomErasing
+        weight: 0.5
+        kwargs:
+          p: 1.0
+          scale: [0.02, 0.10]
+          ratio: [0.3, 3.3]
+          value: 0
+
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213]
+
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO
+# ==========================================================
+val_dataset:
+  repo_id: lewislf/G1_Dex3_pick_white_cup_right8_1squeeze_armstate7
+  root: datasets/_merged/G1_Dex3_pick_white_cup_right8_1squeeze_armstate7
+  revision: main
+  video_backend: pyav
+  episodes: [214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237]
+
+
+# ==========================================================
+# 3. POLICY — PI05 BASE
+# ==========================================================
+policy:
+  type: pi05
+  repo_id: lewislf/G1_Dex3_right8_1squeeze_pi05_lf
+  push_to_hub: false
+
+  pretrained_path: /home/luiz/Prometheus/Luiz/prometheus-vla/models/pi05_base_0601
+
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  image_resolution: [224, 224]
+
+  max_state_dim: 32
+  max_action_dim: 32
+
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+  train_expert_only: true
+  freeze_vision_encoder: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+
+  optimizer_lr: 1.0e-4
+  scheduler_warmup_steps: 2000
+  scheduler_decay_steps: 18000
+  scheduler_decay_lr: 1.0e-5
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+    observation.state:
+      type: STATE
+      shape: [7]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [8]
+
+
+# ==========================================================
+# 4. TREINAMENTO
+# ==========================================================
+output_dir: train_output/cup_pi05_right8_armstate7_ema_lf
+job_name: cup_pi05_right8_armstate7_ema_lf
+
+seed: 1000          # mesma seed do run 2 (valfix) — A/B pareado
+
+steps: 20000
+batch_size: 32
+num_workers: 8
+log_freq: 100
+save_freq: 1000
+save_checkpoint: true
+
+eval_freq: 500
+
+depth_fusion: false
+
+# --- EMA (run 3) — a unica variavel de modelo do A/B ---
+# Mantem uma copia fp32 dos pesos treinaveis com media movel; eval roda raw e EMA
+# lado a lado, best por val_action_mse_ema, checkpoint guarda raw + ema_state.
+# Com ema_enabled:false o script e identico ao run 2 (no-op).
+ema_enabled: true
+ema_decay: 0.999
+ema_warmup: true
+ema_start_step: 0
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  entity: prometheus-lcad
+  disable_artifact: true   # checkpoints NAO sobem pro wandb (estouravam o storage do time)
+
+# --- Checkpoints ---
+# Mantem so best (copia real quando o val melhora) e last (rolling); sem acumular
+# numerados. Os pesos EMA vao no ema_state.safetensors do training_state e num
+# export pretrained_model_ema/ no best (pronto pro deploy).
+keep_only_best_and_last: true
