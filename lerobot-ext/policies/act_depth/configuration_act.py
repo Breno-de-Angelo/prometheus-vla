@@ -128,6 +128,44 @@ class ACTConfig(PreTrainedConfig):
     #   Reduzir para 128 se VRAM for limitada. Aumentar para 512 com GPUs potentes.
     point_transformer_dim: int = 256
 
+    # ── Pesos pré-treinados do encoder de profundidade ──────
+    #
+    # Formatos aceitos no YAML:
+    #
+    #   1. Sem pré-treino (padrão — inicia do zero):
+    #      depth_pretrained_weights: null
+    #
+    #   2. Arquivo local (checkpoint salvo do seu próprio treino):
+    #      depth_pretrained_weights: "/data/ckpts/pointnet_run1.pth"
+    #
+    #   3. HuggingFace Hub (baixa e cacheia automaticamente):
+    #      depth_pretrained_weights: "hf://danasone/dp3-pointnet/pointnet_encoder.pth"
+    #
+    #   4. URL direta:
+    #      depth_pretrained_weights: "https://example.com/encoder.pth"
+    #
+    # Comportamento: carrega com strict=False — só as chaves com nome E dimensão
+    # compatíveis são aproveitadas; o restante inicia do zero sem erro.
+    #
+    # Checkpoints testados / recomendados:
+    #   PointNet      → DP3 (Diffusion Policy 3D): layers conv1/conv2/conv3 compatíveis
+    #   PointTransf.  → Salve seu próprio encoder após treino com:
+    #                   save_pretrained_depth_encoder(policy.pointnet, "meu_encoder.pth")
+    #                   e reutilize em experimentos futuros.
+    depth_pretrained_weights: str | None = None
+
+    # Remapeamento de prefixos do checkpoint (opcional).
+    # Use quando o checkpoint foi salvo dentro de um wrapper com prefixo diferente.
+    # Exemplo: chaves "encoder.conv1.weight" → remove "encoder."
+    #   depth_pretrained_prefix_remap:
+    #     "encoder.": ""
+    #     "backbone.": ""
+    depth_pretrained_prefix_remap: dict | None = None
+
+    # Diretório de cache para downloads (HuggingFace / URL).
+    # Se null, usa ~/.cache/prometheus_depth
+    depth_pretrained_cache_dir: str | None = None
+
     # ── Tato (Pressão Dex3) ─────────────────────────────────
     use_pressure: bool = True
     pressure_feature_dim: int = 66   # 33 sensores esquerda + 33 direita

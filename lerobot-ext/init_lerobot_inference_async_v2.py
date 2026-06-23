@@ -573,10 +573,12 @@ class AttnMapWindow:
             # Normaliza APENAS dentro dos tokens de imagem (não contamina
             # com escalares de state/latente que são muito maiores).
             # ══════════════════════════════════════════════════════════
-            img_w = weights[:n_rgb_tokens].copy()
-            i_min, i_max = img_w.min(), img_w.max()
+            i_min = img_w.min()
+            # O pulo do gato: ignora os 2% patches mais brilhantes (os ralos)
+            i_max = np.percentile(img_w, 98) 
+            
             if i_max - i_min > 1e-8:
-                img_w = (img_w - i_min) / (i_max - i_min)
+                img_w = np.clip((img_w - i_min) / (i_max - i_min), 0.0, 1.0)
             else:
                 img_w = np.zeros_like(img_w)
 
@@ -775,6 +777,126 @@ class AttnMapWindow:
 
         except Exception as e:
             print(f"[AttnMapWindow] Erro: {e}")
+            import traceback; traceback.print_exc()
+
+    def update_from_data(self, data: dict):
+        """
+        Atualiza a janela diretamente com os dados recebidos do cliente ZMQ (PI05).
+        Lê o payload estruturado em vez de exigir o objeto `policy`.
+        """
+        attn_np = data.get("attn_np")
+        rgb_frame = data.get("rgb_frame")
+        action_chunk = data.get("action_chunk")
+        meta = data.get("meta", {})
+
+        if attn_np is None or rgb_frame is None:
+            return
+
+        try:
+            # Pega o máximo da atenção ao longo das queries do decoder
+            weights = attn_np[0].max(axis=0) if attn_np.ndim == 3 else attn_np.max(axis=0)
+
+            # PI05 envia a geometria correta via meta (ex: 256 para grid 16x16)
+            n_img_tokens = meta.get("n_img_tokens", [len(weights)])[0]
+            
+            grid_size = int(np.sqrt(n_img_tokens))
+            self._img_token_h = grid_size
+            self._img_token_w = grid_size
+
+            # Extrai os pesos da imagem
+            img_w = weights[:n_img_tokens].copy()
+            attn_rgb_mean = float(img_w.mean())
+            attn_rgb_max  = float(img_w.max())
+
+            # Para o PI05, o servidor já limpou o pacote. State e Depth ficam zerados.
+            attn_state = 0.0
+            attn_depth = 0.0
+
+            # Atualiza histórico
+            self._rgb_history.append(attn_rgb_max)
+            self._state_history.append(attn_state)
+            self._depth_history.append(attn_depth)
+            for lst in (self._rgb_history, self._state_history, self._depth_history):
+                if len(lst) > self._HISTORY_LEN:
+                    lst.pop(0)
+
+            # ══════════════════════════════════════════════════════════
+            # JANELA 1 — Heatmap RGB
+            # ══════════════════════════════════════════════════════════
+            i_min, i_max = img_w.min(), img_w.max()
+            if i_max - i_min > 1e-8:
+                img_w = (img_w - i_min) / (i_max - i_min)
+            else:
+                img_w = np.zeros_like(img_w)
+
+            attn_map = img_w.reshape(grid_size, grid_size)
+            H, W = rgb_frame.shape[:2]
+            attn_resized = cv2.resize(attn_map.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+            attn_uint8 = (attn_resized * 255).astype(np.uint8)
+            heat_bgr = cv2.applyColorMap(attn_uint8, cv2.COLORMAP_INFERNO)
+            heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+
+            blended = (0.55 * heat_rgb + 0.45 * rgb_frame).astype(np.uint8)
+
+            # Barra inferior simples
+            BAR_H = 65
+            new_H = H + BAR_H
+            canvas_rgb = np.zeros((new_H, W, 3), dtype=np.uint8)
+            canvas_rgb[:H, :W] = blended
+            cv2.rectangle(canvas_rgb, (0, H), (W, new_H), (20, 20, 20), -1)
+            cv2.line(canvas_rgb, (0, H), (W, H), (50, 50, 50), 1)
+
+            self._label(canvas_rgb, "Cross-Attention PI05 (tokens RGB)", 8, 22, 0.5, (255, 255, 255), bold=True)
+            self._label(canvas_rgb, f"RGB max: {attn_rgb_max:.5f} | mean: {attn_rgb_mean:.5f}", 8, 44, 0.38, (200, 200, 200))
+
+            blended = canvas_rgb
+
+            # ══════════════════════════════════════════════════════════
+            # JANELA 2 — Painel Analise
+            # ══════════════════════════════════════════════════════════
+            PW, PH = 1200, 900
+            panel = np.zeros((PH, PW, 3), dtype=np.uint8)
+            PAD = 15
+            INNER_W = PW - 2 * PAD
+            y = 0
+
+            # ── SEÇÃO 1: Barras 
+            sec1_h = PH * 25 // 100
+            cv2.rectangle(panel, (0, 0), (PW, sec1_h), (18, 18, 18), -1)
+            self._label(panel, "Atencao Visual - PI05", PAD, 25, 0.48, (220, 220, 220), bold=True)
+            bar_w = INNER_W // 2 - 40
+            h_max = max(self._rgb_history) if self._rgb_history else attn_rgb_max
+            fill_frac = attn_rgb_max / h_max if h_max > 1e-8 else 0.0
+            self._draw_bar(panel, PAD, 65, bar_w, fill_frac, "RGB (max patch)", attn_rgb_max, (60, 200, 60), 16)
+            y = sec1_h
+            self._hline(panel, y)
+
+            # ── SEÇÃO 2: Ação
+            sec2_h = PH * 50 // 100
+            cv2.rectangle(panel, (0, y), (PW, y + sec2_h), (15, 15, 15), -1)
+            chunk_t = len(action_chunk) if action_chunk is not None else 0
+            self._label(panel, f"Acao Predita ({chunk_t} steps)", PAD, y + 18, 0.42, (220, 220, 220), bold=True)
+            if action_chunk is not None and chunk_t >= 1:
+                n_groups = len(self._JOINT_GROUPS)
+                grp_w = (INNER_W - (n_groups - 1) * 6) // n_groups
+                for gi, (grp_label, jrange, gcol) in enumerate(self._JOINT_GROUPS):
+                    grp_x = PAD + gi * (grp_w + 6)
+                    self._draw_action_group(panel, action_chunk, jrange, grp_x, y + 26, grp_w, sec2_h - 30, gcol, grp_label)
+            y += sec2_h
+            self._hline(panel, y)
+
+            # ── SEÇÃO 3: Histórico
+            sec3_h = PH - y
+            cv2.rectangle(panel, (0, y), (PW, PH), (18, 18, 18), -1)
+            self._label(panel, "Historico RGB", PAD, y + 18, 0.45, (220, 220, 220), bold=True)
+            self._draw_history(panel, [(self._rgb_history, (60, 200, 60))], PAD, y + 24, INNER_W, sec3_h - 40)
+
+            with self._lock:
+                self._last_rgb_display = blended
+                self._last_panel_display = panel
+
+        except Exception as e:
+            print(f"[AttnMapWindow] Erro crítico em update_from_data: {e}")
             import traceback; traceback.print_exc()
 
     # ─────────────────────────────────────────────────────────────────

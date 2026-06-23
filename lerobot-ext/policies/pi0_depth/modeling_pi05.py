@@ -44,6 +44,38 @@ else:
     GemmaForCausalLM = None
     PaliGemmaForConditionalGeneration = None
 
+# ── Captura de attention weights (para --v-attn) ───────────────────────────
+# compute_layer_complete() é uma função standalone (não um método de classe),
+# chamada em loop por camada dentro de PaliGemmaWithExpertModel.forward().
+# Para evitar mudar a assinatura em todos os call-sites (forward de treino,
+# denoise_step, gradient checkpointing), usamos um flag + buffer a nível de
+# módulo. Custo zero quando desligado (_CAPTURE_ATTN["enabled"] = False),
+# porque eager_attention_forward já roda de qualquer forma — só evitamos o
+# .detach().cpu() quando não é necessário.
+_CAPTURE_ATTN = {
+    "enabled": False,      # liga/desliga sem mudar assinatura de função
+    "layer_idx": None,     # qual camada capturar (None = última)
+    "num_layers": None,    # setado pelo forward() antes do loop, para saber qual é "última"
+    "weights": None,       # [B, num_heads, seq_len, seq_len] — preenchido após a captura
+    "prefix_len": None,    # nº de tokens do prefix no forward capturado (img+lang+depth+pressure)
+    "suffix_len": None,    # nº de tokens do suffix (chunk_size, ações ruidosas)
+}
+
+
+def _maybe_capture_attn_hook(layer_idx, attn_weights):
+    """Chamado de dentro de compute_layer_complete() logo após eager_attention_forward."""
+    if not _CAPTURE_ATTN["enabled"] or attn_weights is None:
+        return
+    target = _CAPTURE_ATTN["layer_idx"]
+    num_layers = _CAPTURE_ATTN["num_layers"]
+    is_target = (target is None and num_layers is not None and layer_idx == num_layers - 1) or (
+        target is not None and layer_idx == target
+    )
+    if is_target:
+        # Guarda já destacado da graph — função roda sob torch.no_grad() em
+        # inferência (denoise_step/sample_actions), então isso é barato.
+        _CAPTURE_ATTN["weights"] = attn_weights.detach()
+
 from lerobot.configs.policies import PreTrainedConfig
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05DEPTHConfig
 from lerobot.policies.pretrained import PreTrainedPolicy, T
@@ -270,11 +302,16 @@ def compute_layer_complete(
     batch_size = query_states.shape[0]
     scaling = _get_lm(paligemma).layers[layer_idx].self_attn.scaling
 
-    att_output, _ = modeling_gemma.eager_attention_forward(
+    att_output, attn_weights = modeling_gemma.eager_attention_forward(
         _get_lm(paligemma).layers[layer_idx].self_attn,
         query_states, key_states, value_states,
         attention_mask, scaling,
     )
+    # attn_weights: [B, num_heads, seq_len_q, seq_len_k] — só populado pelo
+    # backend "eager" (que denoise_step já força via _attn_implementation).
+    # Custo zero quando --v-attn não foi pedido: _CAPTURE_ATTN["enabled"]
+    # é False por padrão, o hook retorna na primeira linha sem fazer nada.
+    _maybe_capture_attn_hook(layer_idx, attn_weights)
 
     head_dim = _get_lm(paligemma).layers[layer_idx].self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -437,6 +474,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         else:
             models = [_get_lm(self.paligemma), self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
+            _CAPTURE_ATTN["num_layers"] = num_layers  # para o hook saber qual é a última camada
 
             use_gradient_checkpointing = (
                 hasattr(self.gemma_expert.model, "gradient_checkpointing")
@@ -571,6 +609,7 @@ class PI05Pytorch(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        n_img_tokens_per_cam = []   # para --v-attn: geometria de tokens do prefix
 
         for img, img_mask in zip(images, img_masks, strict=True):
             img_emb = self._apply_checkpoint(self.paligemma_with_expert.embed_image, img)
@@ -578,6 +617,7 @@ class PI05Pytorch(nn.Module):
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
+            n_img_tokens_per_cam.append(num_img_embs)
 
         def lang_embed_func(tokens):
             lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
@@ -614,6 +654,19 @@ class PI05Pytorch(nn.Module):
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        # Geometria exata do prefix, na ordem real de concatenação:
+        # [img_tokens(s)... | lang_tokens | depth_token? | pressure_token?]
+        # Guardado para --v-attn fatiar o heatmap corretamente depois —
+        # PI05 não tem ordem fixa como o ACT (aqui state vira texto, não token).
+        _CAPTURE_ATTN["n_img_tokens"]   = list(n_img_tokens_per_cam)
+        _CAPTURE_ATTN["n_lang_tokens"]  = num_lang_embs
+        _CAPTURE_ATTN["has_depth_tok"]  = bool(
+            self.config.use_depth_3d and depth_images is not None and len(depth_images) > 0
+        )
+        _CAPTURE_ATTN["has_pressure_tok"] = bool(
+            self.config.use_pressure and pressure_tensor is not None
+        )
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -717,6 +770,7 @@ class PI05Pytorch(nn.Module):
         depth_images=None, pressure_tensor=None,
         noise=None, num_steps=None,
         n_samples_for_uncertainty: int = 1,
+        capture_attn: bool = False,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> tuple[Tensor, float]:
         if num_steps is None:
@@ -748,6 +802,11 @@ class PI05Pytorch(nn.Module):
                 time = 1.0 + step * dt
                 time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
+                # Captura attn só no ÚLTIMO step de denoising da PRIMEIRA run —
+                # é o forward mais próximo da ação final entregue, e evitamos
+                # pagar o custo de captura em todos os num_steps × n_runs forwards.
+                is_last_step = (run_idx == 0) and (step == num_steps - 1)
+
                 # ✅ FIX: Passe os prefix embs diretamente (sem cache)
                 v_t = self.denoise_step(
                     prefix_embs=prefix_embs,
@@ -755,6 +814,7 @@ class PI05Pytorch(nn.Module):
                     prefix_att_masks=prefix_att_masks,
                     x_t=x_t,
                     timestep=time_tensor,
+                    capture_attn=(capture_attn and is_last_step),
                 )
 
                 x_t = x_t + dt * v_t
@@ -772,9 +832,15 @@ class PI05Pytorch(nn.Module):
 
         return actions, uncertainty
 
-    def denoise_step(self, prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, timestep):
-        """Denoise sem cache — recomputa prefix cada vez (mais simples, mais seguro)."""
-        
+    def denoise_step(self, prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, timestep,
+                      capture_attn: bool = False):
+        """Denoise sem cache — recomputa prefix cada vez (mais simples, mais seguro).
+
+        capture_attn: se True, ativa a captura de attention weights da última
+        camada do transformer DURANTE este forward (usado para --v-attn).
+        Custo extra é zero quando False — eager_attention_forward já roda de
+        qualquer forma porque _attn_implementation é sempre "eager" aqui.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -791,15 +857,28 @@ class PI05Pytorch(nn.Module):
         _get_lm(self.paligemma_with_expert.paligemma).config._attn_implementation = "eager"
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
 
-        # ✅ Recomputa prefix + suffix em um só forward (sem cache)
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=None,  # ← SEM CACHE
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        if capture_attn:
+            _CAPTURE_ATTN["enabled"] = True
+            _CAPTURE_ATTN["layer_idx"] = 8  # None = última camada (mais semântica)
+
+        try:
+            # ✅ Recomputa prefix + suffix em um só forward (sem cache)
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,  # ← SEM CACHE
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+        finally:
+            if capture_attn:
+                _CAPTURE_ATTN["enabled"] = False
+                # Guarda também tamanhos de prefix/suffix — necessários para
+                # fatiar o mapa de atenção corretamente depois (PI05 não tem
+                # geometria de tokens fixa como o ACT).
+                _CAPTURE_ATTN["prefix_len"] = prefix_len
+                _CAPTURE_ATTN["suffix_len"] = suffix_len
 
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size:].to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
@@ -980,8 +1059,16 @@ class PI05DEPTHPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(
-        self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
+        self, batch: dict[str, Tensor], capture_attn: bool = False,
+        **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
+        """
+        capture_attn: se True, popula self.last_attn_weights e
+        self._last_attn_meta após a chamada — usado pelo servidor de
+        inferência quando o cliente pede --v-attn. Custo extra é
+        desprezível (~1 forward já calcula os pesos via eager attention;
+        só evitamos o .detach() quando não pedido).
+        """
         self.eval()
 
         images, img_masks, depth_images = self._preprocess_images(batch)
@@ -996,14 +1083,40 @@ class PI05DEPTHPolicy(PreTrainedPolicy):
         if threshold > 0 and n_samples <= 1:
             n_samples = 3
 
+        # Reseta captura anterior — evita expor pesos de uma chamada antiga
+        # caso este forward não rode até o fim por algum motivo.
+        if capture_attn:
+            _CAPTURE_ATTN["weights"] = None
+
         actions, uncertainty = self.model.sample_actions(
             images, img_masks, tokens, masks,
             depth_images=depth_images,
             pressure_tensor=pressure_tensor,
             n_samples_for_uncertainty=n_samples,
+            capture_attn=capture_attn,
             **kwargs,
         )
         self._last_uncertainty = uncertainty
+
+        # ── Expõe os pesos capturados na policy (padrão já usado pelo resto
+        # do pipeline: getattr(policy, "last_attn_weights", None)) ───────────
+        if capture_attn:
+            self.last_attn_weights = _CAPTURE_ATTN["weights"]
+            # Geometria do prefix — necessária para fatiar o heatmap depois,
+            # já que PI05 não tem a ordem fixa de tokens do ACT (img/depth/
+            # state/vae). Aqui a ordem real é:
+            # [img_tokens... | lang_tokens | depth_token? | pressure_token?]
+            self._last_attn_meta = {
+                "prefix_len":       _CAPTURE_ATTN["prefix_len"],
+                "suffix_len":       _CAPTURE_ATTN["suffix_len"],
+                "n_img_tokens":     _CAPTURE_ATTN.get("n_img_tokens"),
+                "n_lang_tokens":    _CAPTURE_ATTN.get("n_lang_tokens"),
+                "has_depth_tok":    _CAPTURE_ATTN.get("has_depth_tok", False),
+                "has_pressure_tok": _CAPTURE_ATTN.get("has_pressure_tok", False),
+            }
+        else:
+            self.last_attn_weights = None
+            self._last_attn_meta = None
 
         # ── Scene Uncertainty Gate ────────────────────────────────────────────
         if threshold > 0:
@@ -1011,10 +1124,12 @@ class PI05DEPTHPolicy(PreTrainedPolicy):
 
         # Unpad para a dimensão real da ação
         actions = actions[:, :, : self._original_action_dim]
+        self._last_action_chunk_np = actions[0].detach().cpu().numpy() if capture_attn else None
 
         return actions
 
     # ── Treinamento ───────────────────────────────────────────────────────────
+
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         images, img_masks, depth_images = self._preprocess_images(batch)

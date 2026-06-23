@@ -1,123 +1,230 @@
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+logger = logging.getLogger(__name__)
+
 
 # ══════════════════════════════════════════════════════════════
-# POINTNET ENCODER (arquitetura original)
+# UTILITÁRIO: carregamento de pesos pré-treinados
+# ══════════════════════════════════════════════════════════════
+
+def _load_pretrained_weights(
+    model: nn.Module,
+    source: str,
+    cache_dir: Optional[str] = None,
+    prefix_remap: Optional[dict] = None,
+) -> nn.Module:
+    """
+    Carrega pesos pré-treinados em `model` com strict=False.
+
+    `source` pode ser:
+      - Caminho local absoluto ou relativo:  "/data/ckpts/pointnet.pth"
+      - URL HuggingFace (hf://):             "hf://danasone/dp3-pointnet/pointnet.pth"
+      - URL direta (https://):               "https://example.com/model.pth"
+      - None / "none" / "":                  sem pré-treino (skip silencioso)
+
+    `prefix_remap` é um dicionário opcional para renomear prefixos de chaves
+    do checkpoint antes de tentar o match:
+        {"encoder.": ""}   →  remove o prefixo "encoder." de todas as chaves
+
+    Retorna o modelo (in-place) com as chaves compatíveis carregadas.
+    """
+    if not source or source.lower() in ("none", "false", ""):
+        logger.info("[PretrainedDepth] Nenhuma fonte configurada — iniciando do zero.")
+        return model
+
+    # ── Resolve o checkpoint ──────────────────────────────────
+    ckpt_path: Optional[str] = None
+
+    if source.startswith("hf://"):
+        # Formato: hf://repo_id/filename
+        # Ex:      hf://danasone/dp3-pointnet/pointnet_encoder.pth
+        rest = source[len("hf://"):]
+        parts = rest.split("/")
+        if len(parts) < 2:
+            raise ValueError(f"URL HuggingFace inválida: '{source}'. Formato: hf://repo_id/filename")
+        repo_id = "/".join(parts[:-1])
+        filename = parts[-1]
+        try:
+            from huggingface_hub import hf_hub_download
+            ckpt_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                cache_dir=cache_dir,
+            )
+            logger.info(f"[PretrainedDepth] Baixado de HuggingFace: {repo_id}/{filename}")
+        except ImportError:
+            raise ImportError(
+                "Instale huggingface_hub para usar fontes hf://: "
+                "pip install huggingface_hub"
+            )
+
+    elif source.startswith("https://") or source.startswith("http://"):
+        ckpt_path = _download_url(source, cache_dir)
+
+    else:
+        # Caminho local
+        ckpt_path = source
+        if not Path(ckpt_path).exists():
+            raise FileNotFoundError(
+                f"[PretrainedDepth] Arquivo não encontrado: '{ckpt_path}'"
+            )
+
+    # ── Carrega o state_dict ──────────────────────────────────
+    raw = torch.load(ckpt_path, map_location="cpu")
+
+    # Checkpoints podem ter o state_dict em sub-chaves comuns
+    if isinstance(raw, dict):
+        for key in ("state_dict", "model", "model_state_dict", "encoder"):
+            if key in raw:
+                raw = raw[key]
+                logger.info(f"[PretrainedDepth] Usando sub-chave '{key}' do checkpoint.")
+                break
+
+    # Aplica remapeamento de prefixos
+    if prefix_remap:
+        remapped = {}
+        for k, v in raw.items():
+            new_k = k
+            for old_prefix, new_prefix in prefix_remap.items():
+                if k.startswith(old_prefix):
+                    new_k = new_prefix + k[len(old_prefix):]
+                    break
+            remapped[new_k] = v
+        raw = remapped
+
+    # ── Carrega com strict=False (ignora chaves incompatíveis) ─
+    missing, unexpected = model.load_state_dict(raw, strict=False)
+
+    total_ckpt  = len(raw)
+    total_model = len(model.state_dict())
+    loaded      = total_model - len(missing)
+
+    logger.info(
+        f"[PretrainedDepth] Carregado: {loaded}/{total_model} tensors compatíveis "
+        f"| checkpoint tinha {total_ckpt} chaves "
+        f"| faltando {len(missing)} | inesperado {len(unexpected)}"
+    )
+    if missing:
+        logger.debug(f"[PretrainedDepth] Chaves faltando (iniciadas do zero): {missing[:5]}{'...' if len(missing)>5 else ''}")
+    if unexpected:
+        logger.debug(f"[PretrainedDepth] Chaves ignoradas do checkpoint: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
+
+    return model
+
+
+def _download_url(url: str, cache_dir: Optional[str]) -> str:
+    """Download simples via torch.hub com cache."""
+    import hashlib
+    fname = hashlib.md5(url.encode()).hexdigest() + "_" + url.split("/")[-1]
+    cache = Path(cache_dir or Path.home() / ".cache" / "prometheus_depth")
+    cache.mkdir(parents=True, exist_ok=True)
+    dest = cache / fname
+    if dest.exists():
+        logger.info(f"[PretrainedDepth] Usando cache: {dest}")
+        return str(dest)
+    logger.info(f"[PretrainedDepth] Baixando: {url}")
+    import urllib.request
+    urllib.request.urlretrieve(url, dest)
+    return str(dest)
+
+
+# ══════════════════════════════════════════════════════════════
+# POINTNET ENCODER
 # ══════════════════════════════════════════════════════════════
 class PointNetEncoder(nn.Module):
     """
     Codificador 3D clássico para nuvem de pontos.
-    
+
     Pontos fortes:
       - Leve e rápido (poucos parâmetros)
       - Bom para objetos com geometria simples
       - Treinamento estável, sem atenção
-    
+
     Limitações:
       - Max-pooling global perde estrutura local da cena
       - Sem modelagem de relações entre pontos vizinhos
       - Menos discriminativo para cenas complexas multi-objeto
+
+    Compatibilidade com pesos pré-treinados (strict=False):
+      - DP3 (Diffusion Policy 3D): layers conv1/conv2/conv3 carregam direto
+      - Pesos próprios salvos via save_pretrained_depth_encoder()
     """
-    def __init__(self, output_dim=512):
+    def __init__(self, output_dim: int = 512):
         super().__init__()
         self.conv1 = nn.Conv1d(3, 64, 1)
         self.conv2 = nn.Conv1d(64, 128, 1)
         self.conv3 = nn.Conv1d(128, 1024, 1)
-        self.fc1 = nn.Linear(1024, 512)
-        self.fc2 = nn.Linear(512, output_dim)
+        self.fc1   = nn.Linear(1024, 512)
+        self.fc2   = nn.Linear(512, output_dim)
 
-    def forward(self, x):
-        # x shape: [Batch, 3, Num_Points]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 3, N]
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = self.conv3(x)
-        # Max Pooling global (perde estrutura local — limitação do PointNet)
         x = torch.max(x, 2, keepdim=True)[0].view(-1, 1024)
         x = F.relu(self.fc1(x))
-        return self.fc2(x)  # [Batch, output_dim]
+        return self.fc2(x)  # [B, output_dim]
 
 
 # ══════════════════════════════════════════════════════════════
-# POINT TRANSFORMER ENCODER (nova arquitetura, mais robusta)
+# POINT TRANSFORMER ENCODER
 # ══════════════════════════════════════════════════════════════
 
 def _knn(x: torch.Tensor, k: int) -> torch.Tensor:
     """
-    Retorna os k vizinhos mais próximos para cada ponto.
-    
+    k vizinhos mais próximos — puro PyTorch, zero custom ops.
+
     Args:
         x: [B, 3, N]
         k: número de vizinhos
     Returns:
-        idx: [B, N, k] índices dos k-NNs
-    """
-    # Distância euclidiana ao quadrado via produto interno
-    # x^T x: [B, N, N]
-    x_t = x.permute(0, 2, 1)   # [B, N, 3]
-    inner = torch.bmm(x_t, x)  # [B, N, N]
-    sq = (x ** 2).sum(dim=1, keepdim=True).permute(0, 2, 1)  # [B, N, 1]
-    dist = sq + sq.permute(0, 2, 1) - 2 * inner              # [B, N, N]
-    # Retorna os k menores (excluindo o próprio ponto — idx 0)
-    idx = dist.topk(k=k + 1, dim=-1, largest=False)[1][:, :, 1:]  # [B, N, k]
-    return idx
-
-
-def _gather_local(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """
-    Coleta os k vizinhos de cada ponto.
-    
-    Args:
-        x:   [B, C, N]
         idx: [B, N, k]
-    Returns:
-        [B, C, N, k]
     """
-    B, C, N = x.shape
-    k = idx.shape[2]
-    # Expande idx para todos os canais
-    idx_expanded = idx.unsqueeze(1).expand(B, C, N, k)  # [B, C, N, k]
-    x_expanded = x.unsqueeze(-1).expand(B, C, N, k)     # [B, C, N, k]
-    # Coleta ao longo de N
-    x_exp2 = x.unsqueeze(2).expand(B, C, N, N)          # [B, C, N, N]
-    out = torch.gather(x_exp2, 3, idx_expanded)          # [B, C, N, k]
-    return out
+    x_t   = x.permute(0, 2, 1)                                         # [B, N, 3]
+    inner = torch.bmm(x_t, x)                                          # [B, N, N]
+    sq    = (x ** 2).sum(dim=1, keepdim=True).permute(0, 2, 1)         # [B, N, 1]
+    dist  = sq + sq.permute(0, 2, 1) - 2 * inner                       # [B, N, N]
+    idx   = dist.topk(k=k + 1, dim=-1, largest=False)[1][:, :, 1:]     # [B, N, k]
+    return idx
 
 
 class PointTransformerLayer(nn.Module):
     """
     Camada de atenção vetorial do Point Transformer (Zhao et al., 2021).
-    
-    Diferente do PointNet, calcula atenção entre cada ponto e seus k vizinhos,
-    capturando relações locais de forma explícita. Isso é análogo ao que o
-    ResNet faz com convoluções — mas invariante à permutação e à densidade.
 
     Para cada ponto p_i:
       1. Projeta features p_i e seus k-NNs {p_j} em Q, K, V
       2. Calcula position encoding relativo: delta(p_i - p_j)
       3. Attention weight: softmax( gamma( phi(p_i) - psi(p_j) + delta ) )
       4. Output: soma ponderada dos valores + encoding posicional
+
+    Compatibilidade com pesos externos (strict=False):
+      - Chaves phi/psi/alpha/delta/gamma/proj_out/norm carregam direto
+        se o checkpoint usar as mesmas dimensões.
     """
 
     def __init__(self, in_dim: int, out_dim: int, k: int = 16):
         super().__init__()
-        self.k = k
+        self.k       = k
         self.out_dim = out_dim
 
-        # Projeções Q, K, V
-        self.phi = nn.Linear(in_dim, out_dim)   # query
-        self.psi = nn.Linear(in_dim, out_dim)   # key
-        self.alpha = nn.Linear(in_dim, out_dim) # value
+        self.phi   = nn.Linear(in_dim, out_dim)   # query
+        self.psi   = nn.Linear(in_dim, out_dim)   # key
+        self.alpha = nn.Linear(in_dim, out_dim)   # value
 
-        # Position encoding relativo (coordenadas 3D → out_dim)
         self.delta = nn.Sequential(
             nn.Linear(3, out_dim),
             nn.ReLU(),
             nn.Linear(out_dim, out_dim),
         )
-
-        # MLP de atenção: mapeia diferença QK+pos para pesos de atenção
         self.gamma = nn.Sequential(
             nn.LayerNorm(out_dim),
             nn.Linear(out_dim, out_dim),
@@ -125,81 +232,64 @@ class PointTransformerLayer(nn.Module):
             nn.Linear(out_dim, out_dim),
         )
 
-        # Projeção de saída
         self.proj_out = nn.Linear(out_dim, out_dim)
-        self.norm = nn.LayerNorm(out_dim)
-
-        # Skip connection se dimensões diferem
-        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+        self.norm     = nn.LayerNorm(out_dim)
+        self.skip     = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:   [B, N, C]  features dos pontos
-            xyz: [B, N, 3]  coordenadas 3D dos pontos
+            x:   [B, N, C]
+            xyz: [B, N, 3]
         Returns:
             [B, N, out_dim]
         """
         B, N, C = x.shape
 
-        # 1. Acha os k vizinhos baseado em coordenadas xyz
-        idx = _knn(xyz.permute(0, 2, 1), self.k)  # [B, N, k]
+        idx     = _knn(xyz.permute(0, 2, 1), self.k)                    # [B, N, k]
+        idx_exp = idx.unsqueeze(-1).expand(B, N, self.k, C)
+        x_exp   = x.unsqueeze(2).expand(B, N, N, C)
+        x_nbr   = torch.gather(x_exp, 2, idx_exp)                       # [B, N, k, C]
 
-        # 2. Coleta features dos vizinhos: [B, N, k, C]
-        x_flat = x  # [B, N, C]
+        idx_xyz = idx.unsqueeze(-1).expand(B, N, self.k, 3)
+        xyz_exp = xyz.unsqueeze(2).expand(B, N, N, 3)
+        xyz_nbr = torch.gather(xyz_exp, 2, idx_xyz)                     # [B, N, k, 3]
 
-        # Gather neighbors para features e coordenadas
-        # idx: [B, N, k]
-        idx_exp = idx.unsqueeze(-1).expand(B, N, self.k, C)  # [B, N, k, C]
-        x_exp = x_flat.unsqueeze(2).expand(B, N, N, C)       # [B, N, N, C]
-        x_nbr = torch.gather(x_exp, 2, idx_exp)              # [B, N, k, C]
+        xyz_diff = xyz.unsqueeze(2) - xyz_nbr                           # [B, N, k, 3]
+        pos_enc  = self.delta(xyz_diff)                                  # [B, N, k, out_dim]
 
-        idx_xyz = idx.unsqueeze(-1).expand(B, N, self.k, 3)  # [B, N, k, 3]
-        xyz_exp = xyz.unsqueeze(2).expand(B, N, N, 3)        # [B, N, N, 3]
-        xyz_nbr = torch.gather(xyz_exp, 2, idx_xyz)          # [B, N, k, 3]
+        q      = self.phi(x).unsqueeze(2)                               # [B, N, 1, out_dim]
+        k_feat = self.psi(x_nbr)                                        # [B, N, k, out_dim]
+        v      = self.alpha(x_nbr) + pos_enc                            # [B, N, k, out_dim]
 
-        # 3. Diferença de posição relativa (position encoding)
-        xyz_diff = xyz.unsqueeze(2) - xyz_nbr  # [B, N, k, 3]
-        pos_enc = self.delta(xyz_diff)          # [B, N, k, out_dim]
+        attn = self.gamma(q - k_feat + pos_enc)                         # [B, N, k, out_dim]
+        attn = F.softmax(attn, dim=2)
 
-        # 4. Q, K, V
-        q = self.phi(x).unsqueeze(2)     # [B, N, 1, out_dim]
-        k_feat = self.psi(x_nbr)        # [B, N, k, out_dim]
-        v = self.alpha(x_nbr) + pos_enc # [B, N, k, out_dim]  (valor + pos)
-
-        # 5. Pesos de atenção vetorial
-        attn = self.gamma(q - k_feat + pos_enc)  # [B, N, k, out_dim]
-        attn = F.softmax(attn, dim=2)             # normaliza sobre vizinhos
-
-        # 6. Agrega com atenção
-        out = (attn * v).sum(dim=2)   # [B, N, out_dim]
+        out = (attn * v).sum(dim=2)                                     # [B, N, out_dim]
         out = self.proj_out(out)
-
-        # 7. Residual + LayerNorm
         out = self.norm(out + self.skip(x))
         return out
 
 
 class PointTransformerEncoder(nn.Module):
     """
-    Encoder Point Transformer para nuvem de pontos.
-    
+    Encoder Point Transformer para nuvem de pontos — puro PyTorch.
+
     Pontos fortes vs PointNet:
-      - Atenção LOCAL entre vizinhos k-NN (não só max-pooling global)
-      - Position encoding relativo: capta a geometria local explicitamente
-      - Muito mais discriminativo para cenas complexas com múltiplos objetos
-      - Performance comparável ao ResNet para imagens, mas para nuvens 3D
-    
-    Limitações vs PointNet:
-      - Mais lento e pesado (k-NN a cada forward, mais parâmetros)
-      - Requer mais dados para convergir bem
-      - Sensível ao valor de k e ao número de pontos amostrados
-    
+      - Atenção LOCAL entre vizinhos k-NN
+      - Position encoding relativo
+      - Mais discriminativo para cenas com múltiplos objetos
+
     Parâmetros recomendados (YAML):
-      pointnet_num_points: 512  # Reduzir de 1024 se VRAM apertada
-      point_transformer_k: 16  # Vizinhos (8-32, equilíbrio custo-qualidade)
-      point_transformer_layers: 3  # Profundidade (2-4)
-      point_transformer_dim: 256   # Dim interna (128-512)
+      point_transformer_k:      16    # vizinhos (8-32)
+      point_transformer_layers: 3     # profundidade (2-4)
+      point_transformer_dim:    256   # dim interna (128-512)
+
+    Compatibilidade com pesos externos (strict=False):
+      - Chaves input_embed / layers.N.{phi,psi,alpha,delta,gamma,proj_out,norm}
+        carregam direto se hidden_dim bater.
+      - global_attn e head geralmente não carregam (dims diferentes) →
+        inicializados do zero automaticamente.
     """
 
     def __init__(
@@ -212,28 +302,24 @@ class PointTransformerEncoder(nn.Module):
         super().__init__()
         self.k = k
 
-        # Embedding inicial: 3D coords → hidden_dim
         self.input_embed = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Pilha de camadas Point Transformer
-        dims = [hidden_dim] + [hidden_dim] * (num_layers - 1) + [hidden_dim]
+        dims = [hidden_dim] * (num_layers + 1)
         self.layers = nn.ModuleList([
             PointTransformerLayer(in_dim=dims[i], out_dim=dims[i + 1], k=k)
             for i in range(num_layers)
         ])
 
-        # Pooling: atenção global (mais expressivo que max-pooling do PointNet)
         self.global_attn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # Projeção final para output_dim (dim_model do ACT)
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -244,109 +330,155 @@ class PointTransformerEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, 3, N]  nuvem de pontos (saída de depth_to_pointcloud)
+            x: [B, 3, N]
         Returns:
             [B, output_dim]
         """
-        B, _, N = x.shape
+        xyz  = x.permute(0, 2, 1)           # [B, N, 3]
+        feat = self.input_embed(xyz)         # [B, N, hidden_dim]
 
-        # Transpõe: [B, N, 3]
-        xyz = x.permute(0, 2, 1)
-
-        # Embedding inicial usando coordenadas XYZ como features
-        feat = self.input_embed(xyz)  # [B, N, hidden_dim]
-
-        # Aplica as camadas PT com self-atenção local
         for layer in self.layers:
-            feat = layer(feat, xyz)   # [B, N, hidden_dim]
+            feat = layer(feat, xyz)
 
-        # Pooling global com atenção (substitui max-pooling do PointNet)
-        # Calcula score de importância para cada ponto
-        attn_scores = self.global_attn(feat)         # [B, N, 1]
-        attn_weights = F.softmax(attn_scores, dim=1) # [B, N, 1]
-        global_feat = (attn_weights * feat).sum(dim=1)  # [B, hidden_dim]
+        attn_scores  = self.global_attn(feat)          # [B, N, 1]
+        attn_weights = F.softmax(attn_scores, dim=1)
+        global_feat  = (attn_weights * feat).sum(dim=1) # [B, hidden_dim]
 
-        return self.head(global_feat)  # [B, output_dim]
+        return self.head(global_feat)                   # [B, output_dim]
 
 
 # ══════════════════════════════════════════════════════════════
-# FACTORY: escolhe o encoder baseado no config
+# UTILITÁRIO: salvar encoder treinado para reusar como pretrained
 # ══════════════════════════════════════════════════════════════
+
+def save_pretrained_depth_encoder(model: nn.Module, path: str) -> None:
+    """
+    Salva o state_dict do encoder para reusar em experimentos futuros.
+
+    Uso:
+        from depth_encoder import save_pretrained_depth_encoder
+        save_pretrained_depth_encoder(policy.pointnet, "checkpoints/pt_encoder_ep50.pth")
+
+    Para carregar no próximo treino, no YAML:
+        depth_pretrained_weights: "checkpoints/pt_encoder_ep50.pth"
+    """
+    torch.save({"state_dict": model.state_dict()}, path)
+    logger.info(f"[PretrainedDepth] Encoder salvo em: {path}")
+
+
+# ══════════════════════════════════════════════════════════════
+# FACTORY
+# ══════════════════════════════════════════════════════════════
+
 def build_depth_encoder(config) -> nn.Module:
     """
-    Cria o encoder de profundidade baseado em config.depth_encoder_type.
-    
-    Valor no YAML:
-        depth_encoder_type: "pointnet"             # Padrão: leve e rápido
-        depth_encoder_type: "point_transformer"    # Novo: mais robusto
-    
-    Args:
-        config: ACTConfig com os parâmetros de depth
-    Returns:
-        nn.Module com interface forward(x: [B,3,N]) → [B, dim_model]
-    """
-    encoder_type = getattr(config, "depth_encoder_type", "pointnet")
-    output_dim = config.dim_model
+    Cria o encoder de profundidade baseado em config.
 
+    Parâmetros relevantes no YAML
+    ─────────────────────────────
+    depth_encoder_type: "pointnet"          # ou "point_transformer"
+    point_transformer_k: 16
+    point_transformer_layers: 3
+    point_transformer_dim: 256
+
+    # Pesos pré-treinados — QUALQUER UM dos formatos abaixo:
+    #
+    # 1. Sem pré-treino (padrão — inicia do zero):
+    depth_pretrained_weights: null
+    #
+    # 2. Arquivo local (seu próprio checkpoint salvo):
+    depth_pretrained_weights: "/data/ckpts/pointnet_run1.pth"
+    #
+    # 3. HuggingFace (baixa automático com cache):
+    depth_pretrained_weights: "hf://danasone/dp3-pointnet/pointnet_encoder.pth"
+    #
+    # 4. URL direta:
+    depth_pretrained_weights: "https://example.com/encoder.pth"
+    #
+    # Remapeamento de prefixos do checkpoint (opcional):
+    # Útil quando o checkpoint foi salvo com um wrapper diferente.
+    # Ex: chaves "encoder.conv1.weight" → remove "encoder."
+    depth_pretrained_prefix_remap:
+      "encoder.": ""
+      "backbone.": ""
+    """
+    encoder_type  = getattr(config, "depth_encoder_type", "pointnet")
+    output_dim    = config.dim_model
+    pretrained    = getattr(config, "depth_pretrained_weights", None)
+    prefix_remap  = getattr(config, "depth_pretrained_prefix_remap", None)
+    cache_dir     = getattr(config, "depth_pretrained_cache_dir", None)
+
+    # ── Instancia ──────────────────────────────────────────────
     if encoder_type == "point_transformer":
-        k = getattr(config, "point_transformer_k", 16)
+        k          = getattr(config, "point_transformer_k", 16)
         num_layers = getattr(config, "point_transformer_layers", 3)
         hidden_dim = getattr(config, "point_transformer_dim", 256)
-        print(
+        logger.info(
             f"[ACT-D] Usando Point Transformer — "
             f"k={k}, layers={num_layers}, hidden_dim={hidden_dim}, output_dim={output_dim}"
         )
-        return PointTransformerEncoder(
+        model = PointTransformerEncoder(
             output_dim=output_dim,
             k=k,
             num_layers=num_layers,
             hidden_dim=hidden_dim,
         )
     else:
-        # Padrão: PointNet (compatibilidade com checkpoints existentes)
-        print(f"[ACT-D] Usando PointNet — output_dim={output_dim}")
-        return PointNetEncoder(output_dim=output_dim)
+        logger.info(f"[ACT-D] Usando PointNet — output_dim={output_dim}")
+        model = PointNetEncoder(output_dim=output_dim)
+
+    # ── Carrega pesos pré-treinados (se configurado) ───────────
+    if pretrained:
+        model = _load_pretrained_weights(
+            model,
+            source=pretrained,
+            cache_dir=cache_dir,
+            prefix_remap=prefix_remap,
+        )
+    else:
+        logger.info("[ACT-D] depth_pretrained_weights não configurado — iniciando do zero.")
+
+    return model
 
 
 # ══════════════════════════════════════════════════════════════
-# depth_to_pointcloud (inalterado — usado por ambos encoders)
+# depth_to_pointcloud (inalterado)
 # ══════════════════════════════════════════════════════════════
-def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024):
+
+def depth_to_pointcloud(
+    depth_tensor: torch.Tensor,
+    intrinsics: dict,
+    num_points: int = 1024,
+) -> torch.Tensor:
     """
     Projeta mapa de profundidade em nuvem de pontos 3D.
-    
+
     O tensor de profundidade chega normalizado em [0,1], onde 1.0 = 2 metros.
-    Aplica projeção pinhole inversa para recuperar coordenadas XYZ reais.
     """
     B, C, H, W = depth_tensor.shape
     device = depth_tensor.device
 
-    # Malha de pixels
     grid_y, grid_x = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
-        indexing='ij',
+        indexing="ij",
     )
     grid_x = grid_x.float().unsqueeze(0).expand(B, -1, -1)
     grid_y = grid_y.float().unsqueeze(0).expand(B, -1, -1)
 
-    # Recupera profundidade em metros (0→0m, 1→2m)
-    z = depth_tensor[:, 0, :, :] * 2.0
+    z  = depth_tensor[:, 0, :, :] * 2.0
+    fx, fy = intrinsics["fx"], intrinsics["fy"]
+    cx, cy = intrinsics["cx"], intrinsics["cy"]
+    x  = (grid_x - cx) * z / fx
+    y  = (grid_y - cy) * z / fy
 
-    # Projeção pinhole inversa
-    fx, fy = intrinsics['fx'], intrinsics['fy']
-    cx, cy = intrinsics['cx'], intrinsics['cy']
-    x = (grid_x - cx) * z / fx
-    y = (grid_y - cy) * z / fy
-
-    # Monta nuvem e amostra N pontos válidos
     point_cloud = torch.stack((x, y, z), dim=1).view(B, 3, -1)
 
     sampled_pcs = []
     for b in range(B):
-        pc = point_cloud[b]
-        valid_mask = pc[2, :] > 0.05  # descarta ruído < 5cm
-        valid_pc = pc[:, valid_mask]
+        pc         = point_cloud[b]
+        valid_mask = pc[2, :] > 0.05
+        valid_pc   = pc[:, valid_mask]
 
         if valid_pc.shape[1] >= num_points:
             indices = torch.randperm(valid_pc.shape[1], device=device)[:num_points]
