@@ -1,0 +1,24 @@
+robot:
+  type: unitree_g1_dex3
+  control_mode: "upper_body"
+
+# Teleoperação por câmera RealSense D435i + MediaPipe (sem Quest).
+# A D435i aponta PRA VOCÊ; o braço DIREITO do G1 segue sua mão direita.
+# Dedos e comandos de gravação são por TECLADO (ver realsense_mediapipe_arm.py):
+#   espaço=destrava  f=fecha  j=pinça  s=salva  d=descarta  q=encerra
+teleop:
+  type: realsense_mediapipe_arm
+  ee_type: "dex3"
+
+dataset:
+  repo_id: lewislf/G1_Dex3_depth_tactil_dataset
+  root: "datasets/G1_Dex3_mediapipe_dataset"
+  push_to_hub: false
+  single_task: "Pick up the white cup"
+  vcodec: "h264"
+  episode_time_s: 3600  # sem auto-reset: salva/descarta manualmente com s/d
+  reset_time_s: 0
+  # ⚠️ DEVE SER 1 (mesmo motivo do record_televuer.yaml: batch>1 sai invertido/truncado).
+  video_encoding_batch_size: 1
+
+play_sounds: false
