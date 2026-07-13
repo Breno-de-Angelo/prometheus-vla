@@ -1,3 +1,4 @@
+import argparse
 import pyrealsense2 as rs
 import numpy as np
 import cv2
@@ -9,60 +10,78 @@ sys.path.insert(0, str(Path(__file__).parent))
 from sim.sensor_utils import SensorServer, ImageUtils
 
 
-def start_realsense_zmq():
+def start_realsense_zmq(port: int, serial: str | None, fps: int, enable_depth: bool) -> None:
     pipeline = rs.pipeline()
     cfg = rs.config()
 
-    # RGB + Depth streams da D435i
-    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    if serial:
+        cfg.enable_device(serial)
+
+    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, fps)
+    if enable_depth:
+        cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, fps)
 
     try:
         profile = pipeline.start(cfg)
-        depth_sensor = profile.get_device().first_depth_sensor()
-        depth_scale = depth_sensor.get_depth_scale()  # m/unit (D435i: ~0.001)
-        print(f"[RealSense D435i] Camera iniciada. depth_scale={depth_scale}")
+        if enable_depth:
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale = depth_sensor.get_depth_scale()  # m/unit (D435i: ~0.001)
+            print(f"[RealSense D435i] Camera iniciada. depth_scale={depth_scale}")
+        else:
+            depth_scale = None
+            print("[RealSense D435i] Camera iniciada em RGB-only.")
     except Exception as e:
         print(f"[Erro] {e}")
         return
 
-    align = rs.align(rs.stream.color)
     server = SensorServer()
-    server.start_server(port=5555)
-    print("[ZMQ] Servidor ativo na porta 5555 (RGB + depth)")
+    server.start_server(port=port)
+    mode = "RGB + depth" if enable_depth else "RGB-only"
+    print(f"[ZMQ] Servidor ativo na porta {port} ({mode})")
 
     try:
         while True:
             frames = pipeline.wait_for_frames()
-            frames = align.process(frames)
             color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
-            if not color_frame or not depth_frame:
+            if not color_frame:
                 continue
 
             rgb = np.asanyarray(color_frame.get_data())
-            depth_raw = np.asanyarray(depth_frame.get_data())  # uint16, mm
+            if enable_depth:
+                frames = rs.align(rs.stream.color).process(frames)
+                depth_frame = frames.get_depth_frame()
+                if not depth_frame:
+                    continue
 
-            # Normaliza depth para [0, 1] = [0, 2 m] (convencao usada no ACT-D / pi05-D)
-            depth_m = depth_raw.astype(np.float32) * depth_scale  # metros
-            depth_norm = np.clip(depth_m / 2.0, 0.0, 1.0)         # [0, 1]
-            depth_u8 = (depth_norm * 255.0).astype(np.uint8)
-            depth_3ch = cv2.merge([depth_u8, depth_u8, depth_u8])  # 3 canais p/ encoder
+                depth_raw = np.asanyarray(depth_frame.get_data())  # uint16, mm
 
-            encoded_rgb = ImageUtils.encode_image(rgb)
-            encoded_depth = ImageUtils.encode_image(depth_3ch)
+                depth_m = depth_raw.astype(np.float32) * depth_scale  # metros
+                depth_norm = np.clip(depth_m / 2.0, 0.0, 1.0)         # [0, 1]
+                depth_u8 = (depth_norm * 255.0).astype(np.uint8)
+                depth_3ch = cv2.merge([depth_u8, depth_u8, depth_u8])  # 3 canais p/ encoder
+                encoded_depth = ImageUtils.encode_image(depth_3ch)
 
-            t = time.time()
-            server.send_message({
-                "images": {
-                    "head_camera": encoded_rgb,
-                    "head_camera_depth": encoded_depth,
-                },
-                "timestamps": {
-                    "head_camera": t,
-                    "head_camera_depth": t,
-                },
-            })
+                message = {
+                    "images": {
+                        "head_camera": ImageUtils.encode_image(rgb),
+                        "head_camera_depth": encoded_depth,
+                    },
+                    "timestamps": {
+                        "head_camera": time.time(),
+                        "head_camera_depth": time.time(),
+                    },
+                }
+            else:
+                message = {
+                    "images": {
+                        "head_camera": ImageUtils.encode_image(rgb)
+                    },
+                    "timestamps": {
+                        "head_camera": time.time()
+                    }
+                }
+
+            server.send_message(message)
 
     except KeyboardInterrupt:
         print("Encerrando...")
@@ -71,5 +90,15 @@ def start_realsense_zmq():
         server.stop_server()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Start RealSense ZMQ server for the Unitree G1 Prometheus camera.")
+    parser.add_argument("--port", type=int, default=5555, help="ZMQ server port")
+    parser.add_argument("--serial", default=None, help="Realsense serial number if multiple devices are connected")
+    parser.add_argument("--fps", type=int, default=30, help="Capture FPS")
+    parser.add_argument("--no-depth", action="store_true", help="Publish only RGB and disable depth.")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    start_realsense_zmq()
+    args = parse_args()
+    start_realsense_zmq(port=args.port, serial=args.serial, fps=args.fps, enable_depth=not args.no_depth)

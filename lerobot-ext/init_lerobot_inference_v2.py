@@ -98,6 +98,37 @@ def load_policy(checkpoint_dir: str, device: torch.device):
     return policy, policy_type
 
 
+def resolve_checkpoint_path(checkpoint_dir: str | None) -> str | None:
+    """Tenta resolver um checkpoint local válido se o usuário não informou um caminho real."""
+    candidates = [
+        "/home/breno/manipulation_policies/last/pretrained_model",
+        os.path.join(current_dir, "..", "train_output", "pick_up_the_cup_nodepth", "best_val_checkpoint", "pretrained_model"),
+        os.path.join(current_dir, "..", "train_output", "pick_up_the_cup_pi05_depth", "best_val_checkpoint", "pretrained_model"),
+        os.path.join(current_dir, "..", "train_output", "actdepth", "best_val_checkpoint", "pretrained_model"),
+        os.path.join(current_dir, "..", "train", "output", "pi05", "checkpoints", "best", "pretrained_model"),
+        os.path.join(current_dir, "..", "train", "output", "checkpoints", "last", "pretrained_model"),
+        os.path.expanduser("~/manipulation_policies/last/pretrained_model"),
+    ]
+
+    if checkpoint_dir:
+        if checkpoint_dir.startswith("/caminho") or "seu/checkpoint" in checkpoint_dir:
+            checkpoint_dir = None
+        elif os.path.exists(checkpoint_dir):
+            return os.path.abspath(checkpoint_dir)
+
+    env_checkpoint = os.getenv("PROMETHEUS_CHECKPOINT")
+    if env_checkpoint and os.path.exists(env_checkpoint):
+        print(f"🔎 Usando checkpoint de PROMETHEUS_CHECKPOINT: {env_checkpoint}")
+        return os.path.abspath(env_checkpoint)
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            print(f"🔎 Checkpoint encontrado automaticamente: {candidate}")
+            return os.path.abspath(candidate)
+
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 3. HELPERS DE IMAGEM
 # ─────────────────────────────────────────────────────────────────────
@@ -275,7 +306,8 @@ def get_camera_frames(obs, stream_client, fake_cap, fake_img_rgb):
         msg = stream_client.receive_message()
         if msg and "images" in msg:
             obs["head_camera"] = ImageUtils.decode_image(msg["images"]["head_camera"])
-            obs["head_camera_depth"] = ImageUtils.decode_image(msg["images"]["head_camera_depth"])
+            if "head_camera_depth" in msg["images"]:
+                obs["head_camera_depth"] = ImageUtils.decode_image(msg["images"]["head_camera_depth"])
 
     elif fake_cap is not None:
         ret, frame = fake_cap.read()
@@ -359,9 +391,16 @@ def main():
         elif arg.startswith("--remote-sim="):
             remote_sim_ip = arg.split("=", 1)[1]
 
+    checkpoint_dir = resolve_checkpoint_path(checkpoint_dir)
     if checkpoint_dir is None:
-        print("❌ ERRO: --checkpoint obrigatório.")
-        print("   Uso: python init_lerobot_inference_v3.py --checkpoint=<CAMINHO>")
+        print("❌ ERRO: não encontrei um checkpoint válido localmente.")
+        print("   Passe --checkpoint=<CAMINHO> para a pasta pretrained_model ou defina PROMETHEUS_CHECKPOINT.")
+        print("   Exemplos de caminhos buscados:")
+        print("     train_output/pick_up_the_cup_nodepth/best_val_checkpoint/pretrained_model")
+        print("     train_output/pick_up_the_cup_pi05_depth/best_val_checkpoint/pretrained_model")
+        print("     train_output/actdepth/best_val_checkpoint/pretrained_model")
+        print("     train/output/pi05/checkpoints/best/pretrained_model")
+        print("     ~/manipulation_policies/last/pretrained_model")
         sys.exit(1)
 
     # ── Dispositivo ───────────────────────────────────────────────────
@@ -398,10 +437,10 @@ def main():
 
     # ── Robô ─────────────────────────────────────────────────────────
     from robot.unitree_g1.unitree_g1_dex3 import UnitreeG1Dex3, UnitreeG1Dex3Config
-    print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim})...")
+    robot_ip = cam_robot_ip or "10.9.8.73"
+    print(f"⏳ Conectando ao Unitree G1 (Simulação: {is_sim}) em {robot_ip}...")
     g1_config = UnitreeG1Dex3Config(
-        robot_ip="10.9.8.73",
-        #robot_ip="192.168.123.164",
+        robot_ip=robot_ip,
         control_mode="upper_body",
         is_simulation=is_sim,
         remote_sim_ip=remote_sim_ip,
