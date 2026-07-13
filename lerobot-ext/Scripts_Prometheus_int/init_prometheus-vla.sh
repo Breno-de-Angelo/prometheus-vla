@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Caminho absoluto para a pasta do seu projeto
-PROJECT_DIR=~/Scripts_Prometheus_int
+PROJECT_DIR=~/prometheus-vla/lerobot-ext/Scripts_Prometheus_int
 
 # 1. Inicializa o Conda usando o ativador exato do seu terminal
 source ~/miniconda3/bin/activate
@@ -13,7 +13,7 @@ conda activate g1
 cleanup() {
     echo -e "\n\n🛑 [Ctrl+C] Pressionado! Encerrando os servidores..."
     # Mata os processos em segundo plano através dos PIDs
-    kill $PID_CAM $PID_DEX
+    kill $PID_CAM $PID_CAM_RIGHT $PID_DEX
     echo "✅ Servidores desligados. Robô liberado."
     exit 0
 }
@@ -26,9 +26,14 @@ echo "🤖 Iniciando infraestrutura do Prometheus VLA..."
 # 4. Inicia o Servidor da Câmera (RealSense) em background (&)
 python $PROJECT_DIR/full_realsenser_server.py &
 PID_CAM=$!
-echo "   [OK] Servidor RealSense ZMQ (PID: $PID_CAM)"
+echo "   [OK] Servidor RealSense ZMQ HEAD (PID: $PID_CAM)"
 
-# Dá um respiro de 1 segundo para a câmera inicializar sem gargalar a USB/CPU
+# 4b. Inicia o Servidor da Câmera do Pulso Direito em background (&)
+python $PROJECT_DIR/right_arm_realsense_server.py &
+PID_CAM_RIGHT=$!
+echo "   [OK] Servidor RealSense ZMQ RIGHT_WRIST (PID: $PID_CAM_RIGHT)"
+
+# Dá um respiro de 1 segundo para as câmeras inicializarem sem gargalar a USB/CPU
 sleep 1
 
 # 5. Inicia o Servidor da Mão (Dex3) em background (&)
