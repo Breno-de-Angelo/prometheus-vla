@@ -18,8 +18,8 @@
 #
 # Preparo (uma vez, na atena):
 #   source ~/miniconda3/bin/activate g1
-#   pip install 'timm>=1.0.0,<1.1.0' 'peft>=0.13.0'
-#   python -m policies.openvla_depth.backbone --inspect openvla/openvla-7b
+#   pip install --no-deps 'timm>=1.0.0,<1.1.0' 'peft>=0.13.0'   # --no-deps preserva os pins
+#   python -m policies.openvla_depth.backbone --inspect openvla/openvla-7b --compare
 #
 # Rodar — a GPU 0 é a única livre (a 1 está com vLLM, a 2 com ollama):
 #   cd ~/DEV/prometheus-vla/lerobot-ext

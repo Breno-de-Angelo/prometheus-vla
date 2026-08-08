@@ -246,11 +246,35 @@ política. As funções responsáveis são `_get_policy_cls_from_policy_name` e
 ### 5.1 Dependências adicionais
 
 ```bash
-pip install 'timm>=1.0.0,<1.1.0' 'peft>=0.13.0' safetensors huggingface_hub
+pip install --no-deps 'timm>=1.0.0,<1.1.0' 'peft>=0.13.0'
 ```
 
 - `timm` — as duas torres ViT (DINOv2 e SigLIP).
 - `peft` — LoRA. Sem ele, use `use_lora: false` + `train_new_modules_only: true`.
+
+**Use `--no-deps`.** Ambos declaram dependências amplas (`huggingface_hub`,
+`safetensors`, `torch`, `torchvision`, `accelerate`, `transformers`) que já estão
+instaladas e pinadas neste ambiente. Sem `--no-deps` o pip pode reinstalar
+qualquer uma delas numa versão que quebra o resto da stack — e o sintoma costuma
+aparecer longe da causa.
+
+Depois de instalar, confira que nada essencial se moveu:
+
+```bash
+python -c "
+import torch, transformers, accelerate, numpy, huggingface_hub, safetensors
+print(torch.__version__, transformers.__version__, accelerate.__version__,
+      numpy.__version__, huggingface_hub.__version__, safetensors.__version__)"
+```
+
+Referência do que estava na atena **antes** de instalar timm/peft, e que precisa
+continuar assim: `torch 2.10.0+cu128`, `transformers 5.6.1`, `accelerate 1.13.0`,
+`numpy 1.26.4`, `huggingface_hub 1.11.0`, `safetensors 0.7.0`, `datasets 4.1.0`.
+
+> O aviso `lerobot 0.4.4 requires huggingface-hub<0.36.0 but you have 1.11.0`
+> **já existia antes** de qualquer instalação nova. Não foi o timm/peft que
+> causou, e a stack funciona assim — não tente "consertar" fazendo downgrade do
+> `huggingface_hub`, isso sim quebraria o `datasets` e o LeRobot.
 
 ### 5.2 Por que não usamos `trust_remote_code`
 
@@ -274,16 +298,28 @@ reproduz isso. Usar a saída final desalinha as features em relação ao project
 pré-treinado e o modelo sai lixo **sem levantar erro nenhum** — o loss simplesmente
 não desce direito. Se você mexer nessa parte, é o primeiro lugar para olhar.
 
-### 5.4 Se o carregamento falhar
+### 5.4 Conferir o checkpoint antes de treinar
 
 ```bash
-python -m policies.openvla_depth.backbone --inspect openvla/openvla-7b
+python -m policies.openvla_depth.backbone --inspect openvla/openvla-7b --compare
 ```
 
-Imprime os prefixos de chave reais e as formas do checkpoint, sem carregar nada
-na GPU. Compare com os `PREFIX_*` no topo de `backbone.py`. O carregamento é
-**estrito de propósito** (`_load_strict`): uma chave faltando levanta exceção em
-vez de deixar um bloco com pesos aleatórios passar despercebido.
+Duas coisas, sem tocar na GPU:
+
+- **`--inspect`** imprime os prefixos de chave reais e as formas. Compare com os
+  `PREFIX_*` no topo de `backbone.py`.
+- **`--compare`** vai além: constrói localmente as torres timm, o projector e o
+  Llama (este em `meta device`, sem alocar os 7B) e faz o diff das chaves,
+  componente por componente. Sai com código 1 se algo diverge.
+
+Rode isso **antes do primeiro treino**. O motivo concreto: o `openvla-7b` foi
+salvo com `timm==0.9.10` e aqui roda `timm 1.0.28`. Se os nomes de parâmetro
+mudaram entre as versões, `--compare` mostra exatamente qual chave, em vez de
+você descobrir no meio da inicialização do treino.
+
+O carregamento é **estrito de propósito** (`_load_strict`): uma chave faltando
+levanta exceção em vez de deixar um bloco com pesos aleatórios passar
+despercebido — um erro que não daria erro nenhum, só um loss que não desce.
 
 ---
 
@@ -306,11 +342,11 @@ Config pronto: `train/config/openvla_depth_cup_atena.yaml`
 source ~/miniconda3/bin/activate g1
 cd ~/DEV/prometheus-vla/lerobot-ext
 
-# uma vez: as duas dependências que faltam no env g1
-pip install 'timm>=1.0.0,<1.1.0' 'peft>=0.13.0'
+# uma vez: as duas dependências que faltam no env g1 (--no-deps preserva os pins)
+pip install --no-deps 'timm>=1.0.0,<1.1.0' 'peft>=0.13.0'
 
-# confirme os prefixos do checkpoint ANTES de baixar 14 GB para o treino
-python -m policies.openvla_depth.backbone --inspect openvla/openvla-7b
+# confira o checkpoint ANTES de gastar horas de GPU (sai com código 1 se diverge)
+python -m policies.openvla_depth.backbone --inspect openvla/openvla-7b --compare
 
 # smoke test — meça o tempo por step antes do run longo
 CUDA_VISIBLE_DEVICES=0 python init_lerobot_train_v3.py \
