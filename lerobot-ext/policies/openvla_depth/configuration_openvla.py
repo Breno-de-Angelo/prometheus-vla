@@ -204,32 +204,12 @@ class OPENVLADEPTHConfig(PreTrainedConfig):
                 f"recebeu '{self.depth_encoder_type}'"
             )
 
-        # ── Consistência depth/pressure vs input_features ─────────────────────
-        # Mesma checagem do ACTConfig/PI05DEPTHConfig: pega YAML inconsistente
-        # antes de gastar horas de GPU.
-        has_depth = any("depth" in k.lower() for k in self.input_features)
-        if self.use_depth_3d and not has_depth:
-            raise ValueError(
-                "use_depth_3d=True mas nenhuma feature com 'depth' no nome está em "
-                "input_features. Adicione a câmera de profundidade ou use use_depth_3d=False."
-            )
-        if not self.use_depth_3d and has_depth:
-            import warnings
-
-            warnings.warn(
-                "use_depth_3d=False mas há uma feature de depth em input_features. "
-                "A câmera será carregada e ignorada — considere removê-la do YAML.",
-                stacklevel=2,
-            )
-
-        has_pressure = (
-            "observation.left_hand_pressure" in self.input_features
-            or "observation.right_hand_pressure" in self.input_features
-        )
-        if self.use_pressure and not has_pressure:
-            raise ValueError(
-                "use_pressure=True mas as features de pressão não estão em input_features."
-            )
+        # NOTA: a consistência entre use_depth_3d/use_pressure e as features do
+        # dataset é checada em `validate_features()`, não aqui. Quando o draccus
+        # constrói este config a partir do YAML, `input_features` ainda está
+        # VAZIO — quem preenche é o `make_policy`, a partir dos metadados do
+        # dataset, logo antes de instanciar a política. Validar no __post_init__
+        # rejeitaria qualquer YAML com use_depth_3d=true.
 
         if self.override_task is not None:
             import warnings
@@ -263,6 +243,46 @@ class OPENVLADEPTHConfig(PreTrainedConfig):
             self.output_features[ACTION] = PolicyFeature(
                 type=FeatureType.ACTION,
                 shape=(self.max_action_dim,),
+            )
+
+        self._validate_multimodal_features()
+
+    def _validate_multimodal_features(self) -> None:
+        """
+        Confere que o YAML e o dataset concordam sobre depth e tato.
+
+        Roda a partir de `validate_features()` — chamado pela política, depois de
+        o `make_policy` ter preenchido `input_features` com os metadados do
+        dataset. No `__post_init__` isso não funcionaria: naquele momento o
+        draccus acabou de ler o YAML e `input_features` ainda está vazio.
+
+        O objetivo é pegar YAML inconsistente na primeira dezena de segundos, em
+        vez de depois de carregar 15 GB de pesos.
+        """
+        import warnings
+
+        has_depth = any("depth" in k.lower() for k in self.input_features)
+        if self.use_depth_3d and not has_depth:
+            raise ValueError(
+                "use_depth_3d=True mas nenhuma feature com 'depth' no nome está em "
+                f"input_features. Presentes: {sorted(self.input_features)}. "
+                "Adicione a câmera de profundidade ao dataset ou use use_depth_3d=False."
+            )
+        if not self.use_depth_3d and has_depth:
+            warnings.warn(
+                "use_depth_3d=False mas há uma feature de depth em input_features. "
+                "A câmera será carregada e ignorada — considere removê-la do YAML.",
+                stacklevel=2,
+            )
+
+        has_pressure = (
+            "observation.left_hand_pressure" in self.input_features
+            or "observation.right_hand_pressure" in self.input_features
+        )
+        if self.use_pressure and not has_pressure:
+            raise ValueError(
+                "use_pressure=True mas as features de pressão não estão em input_features. "
+                f"Presentes: {sorted(self.input_features)}."
             )
 
     # ── Chaves RGB (tudo que é VISUAL e não é depth) ──────────────────────────
