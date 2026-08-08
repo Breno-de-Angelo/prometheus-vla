@@ -104,6 +104,37 @@ from lerobot.utils.utils import format_big_number, has_method, init_logging
 
 
 # ═════════════════════════════════════════════════════════════
+# DECODER DE VÍDEO: cada worker precisa dos seus próprios
+# ═════════════════════════════════════════════════════════════
+# O LeRobot mantém um cache global de decoders em
+# `lerobot/datasets/video_utils.py` (VideoDecoderCache), e cada entrada guarda
+# um FILE HANDLE aberto:
+#
+#     file_handle = fsspec.open(video_path).__enter__()
+#     decoder = VideoDecoder(file_handle, seek_mode="approximate")
+#
+# Quando o DataLoader forka os workers, os filhos herdam esse handle — e um
+# fork compartilha a *file description*, ou seja, o mesmo offset de arquivo
+# entre o pai e todos os workers. Quatro processos fazendo seek no mesmo offset
+# se atropelam, o decoder lê bytes da posição errada e estoura com
+# "Could not push packet to decoder: Invalid data found when processing input".
+#
+# O sintoma é intermitente (depende de qual índice cai em qual worker), some em
+# leitura sequencial e reaparece com shuffle — o que dificulta o diagnóstico.
+# Medido: com o cache populado no pai antes do fork, 3 de 3 tentativas falham
+# dentro de 41 batches; com este worker_init_fn, 3 de 3 passam.
+#
+# Vale para as três políticas (actdepth, pi05depth, openvladepth), porque todas
+# usam este mesmo loop de treino.
+from lerobot.datasets import video_utils
+
+
+def _reset_video_decoder_cache(_worker_id: int) -> None:
+    """Descarta os decoders herdados do pai; cada worker abre os seus."""
+    video_utils._default_decoder_cache.clear()
+
+
+# ═════════════════════════════════════════════════════════════
 # GRACEFUL SHUTDOWN: Ctrl+C salva o estado e encerra limpo
 # ═════════════════════════════════════════════════════════════
 _SHUTDOWN_REQUESTED = False
@@ -562,6 +593,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        worker_init_fn=_reset_video_decoder_cache,
     )
 
     val_dataloader = None
@@ -580,6 +612,7 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             sampler=val_sampler,
             pin_memory=device.type == "cuda",
             drop_last=False,
+            worker_init_fn=_reset_video_decoder_cache,
         )
         val_dataloader = accelerator.prepare(val_dataloader)
 

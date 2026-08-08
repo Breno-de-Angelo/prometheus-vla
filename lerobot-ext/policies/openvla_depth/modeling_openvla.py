@@ -295,7 +295,12 @@ class OpenVLADepthModel(nn.Module):
 
         n_img_tokens = []
         for pixel_values in rgb_images:
-            img_emb = self.backbone.embed_images(pixel_values).to(dtype)
+            # `dtype` vem do embedding de tokens, ou seja, é o dtype do backbone
+            # (bfloat16 em treino). As imagens chegam em float32 do preprocessor,
+            # e a torre visual é bf16 — sem este cast o timm reclama de
+            # "Input type (float) and bias type (c10::BFloat16) should be the same"
+            # já na primeira Conv2d do patch_embed.
+            img_emb = self.backbone.embed_images(pixel_values.to(dtype)).to(dtype)
             parts.append(img_emb)
             masks.append(ones_mask(img_emb.shape[1]))
             n_img_tokens.append(img_emb.shape[1])

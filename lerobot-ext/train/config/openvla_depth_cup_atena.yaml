@@ -140,6 +140,18 @@ policy:
 batch_size: 16
 steps: 12000
 
+# Curriculum de posição neutra DESLIGADO neste run.
+#
+# O motor imprime, ao ligar: "3 junta(s) com valor normalizado > 3σ", faixa
+# min=-5.865 / max=+4.442. Ou seja, a `default_positions` do UnitreeG1Config não
+# está no mesmo espaço de ação deste dataset — o alvo "neutro" cai muito fora da
+# distribuição dos dados. Com peso 0.3, esse termo puxaria o modelo para uma pose
+# que ele nunca viu, competindo com o objetivo real.
+#
+# Religue (0.3) só depois de calibrar a posição neutra para este dataset e
+# confirmar que o aviso de 3σ some.
+neutral_position_loss_weight: 0.0
+
 log_freq: 10
 eval_freq: 400          # ~a cada meia época
 save_freq: 2000
