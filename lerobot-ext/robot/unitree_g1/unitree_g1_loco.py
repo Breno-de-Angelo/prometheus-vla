@@ -28,7 +28,12 @@ import numpy as np
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.envs.factory import make_env
 from lerobot.processor import RobotAction, RobotObservation
-from .g1_utils import G1_29_JointIndex, G1_29_JointArmIndex
+from .g1_utils import (
+    G1_29_JointIndex,
+    G1_29_JointArmIndex,
+    G1_29_JointArmWaistIndex,
+    G1_WAIST_LOCKED_JOINTS,
+)
 
 from lerobot.robots.robot import Robot
 from .config_unitree_g1 import UnitreeG1Config
@@ -197,15 +202,30 @@ class UnitreeG1(Robot):
             sleep_time = max(0, (self.control_dt - all_t_elapsed))  # maintain constant control dt
             time.sleep(sleep_time)
 
+    @property
+    def body_joint_index(self):
+        """
+        Enum das juntas de corpo que entram no vetor de ação/estado.
+
+        Fonte única da verdade desta classe. ATENÇÃO: existe um `body_joint_index`
+        gêmeo em `unitree_g1.py` — as duas `UnitreeG1` são classes PARALELAS
+        (nenhuma herda da outra), e o `UnitreeG1Dex3` herda desta aqui. Mudança
+        numa precisa ser espelhada na outra.
+
+          full_body                     → 29 juntas (tudo)
+          upper_body/high_level         → 14 braços
+          upper_body/high_level + waist → 14 braços + yaw do tronco (dim 14)
+        """
+        if self.config.control_mode not in ("upper_body", "high_level"):
+            return G1_29_JointIndex
+        if getattr(self.config, "use_waist_yaw", False):
+            return G1_29_JointArmWaistIndex
+        return G1_29_JointArmIndex
+
     @cached_property
     def action_features(self) -> dict[str, type]:
-        """Define action space based on control mode."""
-        if self.config.control_mode in ("upper_body", "high_level"):
-            # Braços apenas (14 juntas) — tanto upper_body quanto high_level (Loco)
-            return {f"{G1_29_JointArmIndex(motor).name}.q": float for motor in G1_29_JointArmIndex}
-        else:
-            # Full body: todas as 29 juntas
-            return {f"{G1_29_JointIndex(motor).name}.q": float for motor in G1_29_JointIndex}
+        """Define action space based on control mode (ver `body_joint_index`)."""
+        return {f"{motor.name}.q": float for motor in self.body_joint_index}
 
     def calibrate(self) -> None:  # robot is already calibrated
         pass
@@ -341,11 +361,47 @@ class UnitreeG1(Robot):
         ARM_IDX_MIN = G1_29_JointArmIndex.kLeftShoulderPitch   # 15
         ARM_IDX_MAX = G1_29_JointArmIndex.kRightWristYaw        # 28
 
+        # ── Cintura no modo loco ──────────────────────────────────────────
+        # Ceder as juntas 12-14 ao WBC (mode=0/kp=0/kd=0) deixa a cintura MOLE:
+        # observado no robô real, o tronco balança sozinho enquanto o G1 anda,
+        # porque na prática nenhum controlador assume essas juntas.
+        #
+        # Com use_waist_yaw=True:
+        #   • roll (13) e pitch (14) → travados com ganho duro em posição neutra
+        #   • yaw (12)               → comandado como as juntas de braço
+        #
+        # As pernas (0-11) continuam integralmente com o WBC — ali ele de fato
+        # atua, e disputar seria brigar com o equilíbrio.
+        use_waist_yaw = getattr(self.config, "use_waist_yaw", False)
+        commanded = {m.value for m in self.body_joint_index}
+
         for id in G1_29_JointIndex:
             is_arm = ARM_IDX_MIN <= id.value <= ARM_IDX_MAX  # índices 15..28
 
+            if use_waist_yaw and id.value in G1_WAIST_LOCKED_JOINTS:
+                # Ganho vem da array `kp`/`kd` (grupo "waist_lock" em _GAINS),
+                # como todas as outras juntas. Um valor fixo mais fraco aqui foi
+                # a causa do tronco tombar para a frente.
+                self.msg.motor_cmd[id.value].mode = 1
+                self.msg.motor_cmd[id.value].kp = self.kp[id.value]
+                self.msg.motor_cmd[id.value].kd = self.kd[id.value]
+                self.msg.motor_cmd[id.value].q = 0.0
+                self.msg.motor_cmd[id.value].dq = 0.0
+                self.msg.motor_cmd[id.value].tau = 0.0
+                continue
+
+            if not is_arm and id.value in commanded:
+                # Yaw do tronco: comandado igual aos braços.
+                self.msg.motor_cmd[id.value].mode = 1
+                self.msg.motor_cmd[id.value].kp = self.kp[id.value]
+                self.msg.motor_cmd[id.value].kd = self.kd[id.value]
+                self.msg.motor_cmd[id.value].q = lowstate.motor_state[id.value].q
+                self.msg.motor_cmd[id.value].dq = 0.0
+                self.msg.motor_cmd[id.value].tau = 0.0
+                continue
+
             if not is_arm and self.config.control_mode in ("upper_body", "high_level"):
-                # Pernas + cintura: cede ao WBC completamente (mode=0 = sem torque daqui)
+                # Pernas: cede ao WBC completamente (mode=0 = sem torque daqui)
                 self.msg.motor_cmd[id.value].mode = 0
                 self.msg.motor_cmd[id.value].kp = 0.0
                 self.msg.motor_cmd[id.value].kd = 0.0
@@ -420,7 +476,7 @@ class UnitreeG1(Robot):
         obs = {}
 
         # Select joints based on control mode
-        joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
+        joint_index = self.body_joint_index
 
         # Motors - q, dq, tau for controlled joints
         for motor in joint_index:
@@ -480,11 +536,8 @@ class UnitreeG1(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
-        """Motor features based on control mode."""
-        if self.config.control_mode in ("upper_body", "high_level"):
-            return {f"{G1_29_JointArmIndex(motor).name}.q": float for motor in G1_29_JointArmIndex}
-        else:
-            return {f"{G1_29_JointIndex(motor).name}.q": float for motor in G1_29_JointIndex}
+        """Motor features based on control mode (ver `body_joint_index`)."""
+        return {f"{motor.name}.q": float for motor in self.body_joint_index}
 
     @property
     def cameras(self) -> dict:
@@ -503,15 +556,21 @@ class UnitreeG1(Robot):
         return {**self._motors_ft, **self._cameras_ft}
 
     def send_action(self, action: RobotAction) -> RobotAction:
-        # Select joints based on control mode
-        joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
+        # Inclui o yaw do tronco quando use_waist_yaw=True (ver body_joint_index)
+        joint_index = self.body_joint_index
 
         max_delta = 0.1  # Radianos por ciclo. (~5 rad/s a 250Hz). Ajuste conforme necessário.
+        waist_limit = getattr(self.config, "waist_yaw_limit", 1.0)
 
         for motor in joint_index:
             key = f"{motor.name}.q"
             if key in action:
                 target_q = action[key]
+
+                # Curso do tronco limitado: bater no fim de curso durante uma
+                # demonstração estraga o episódio e castiga o motor.
+                if motor.name == "kWaistYaw":
+                    target_q = float(np.clip(target_q, -waist_limit, waist_limit))
 
                 # Inicializa se for a primeira vez.
                 # Pega a posição ATUAL do robô para evitar um tranco no primeiro frame.
@@ -575,7 +634,7 @@ class UnitreeG1(Robot):
             default_positions = np.array(self.config.default_positions, dtype=np.float32)
 
         # SELECIONA OS MOTORES BASEADO NO MODO (Igual fizemos no send_action)
-        joint_index = G1_29_JointArmIndex if self.config.control_mode in ("upper_body", "high_level") else G1_29_JointIndex
+        joint_index = self.body_joint_index
 
         if self.config.is_simulation and self.sim_env is not None:
             self.sim_env.reset()

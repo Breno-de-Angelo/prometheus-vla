@@ -71,7 +71,12 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
     hand_control_dt: float = 0.005  # 100 Hz control loop
 
     use_loco: bool = False  # False = Low Level (Suporte), True = High Level (Andando)
-    
+
+    # Câmera no pulso direito. Muda o schema do dataset — ver docs/SCHEMA_G1_V2.md.
+    use_wrist_camera: bool = False
+    # Quadrada e do tamanho que a torre visual consome; ver comentário abaixo.
+    wrist_cam_size: int = 224
+
     def __post_init__(self):
 
         if self.use_loco:
@@ -113,6 +118,29 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
                     server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height, warmup_s=6
                 )
                 ,
+                # ── Câmera de pulso direito ────────────────────────────────
+                # 224×224 de propósito: é exatamente o que a torre visual do
+                # OpenVLA consome. Gravar maior só gasta disco, porque o
+                # `_preprocess_images` redimensiona tudo para 224×224 antes do
+                # modelo — e uma fonte 4:3 ainda seria deformada no reescalonamento
+                # para quadrado. Este é o menor tamanho que não perde nada.
+                #
+                # Publicada pelo `Scripts_Prometheus_int/right_arm_realsense_server.py`
+                # (robô real) ou pelo MuJoCo (`right_wrist_camera` no MJCF).
+                #
+                # ATENÇÃO: acrescentar esta câmera muda o schema do dataset.
+                # Datasets gravados com e sem ela não podem ser juntados.
+                **(
+                    {
+                        "right_wrist_camera": ZMQCameraConfig(
+                            server_address=self.robot_ip, port=5555,
+                            camera_name="right_wrist_camera",
+                            width=self.wrist_cam_size, height=self.wrist_cam_size,
+                            warmup_s=6,
+                        )
+                    }
+                    if self.use_wrist_camera else {}
+                ),
                 #"d435i_ir_left": ZMQCameraConfig(
                 #    server_address=self.robot_ip, port=5555, camera_name="d435i_ir_left", width=cam_width, height=cam_height
                 #),

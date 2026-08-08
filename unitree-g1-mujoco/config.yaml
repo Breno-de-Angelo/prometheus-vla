@@ -13,7 +13,15 @@ JOYSTICK_DEVICE: 0
 
 # Simulation Settings
 FREE_BASE: False
-enable_waist: False  # False = band on torso, True = band on pelvis
+# Onde a faixa elástica prende o robô.
+#   False → torso_link   True → pelvis
+#
+# TEM que ser True para o yaw do tronco funcionar. A ElasticBand aplica um PD de
+# ORIENTAÇÃO (kp_ang=1000) no corpo preso; com ela no torso_link o tronco fica
+# travado no mundo e quem gira é o pelvis, ao contrário. Medido: comando de 0.8 rad
+# produziu 1.925 rad na junta (240% do pedido) e 0.0° de rotação real do tronco.
+# Com a faixa no pelvis: 0.431 rad na junta e 23.2° de rotação real.
+enable_waist: True
 ENABLE_ELASTIC_BAND: True
 
 # Timing

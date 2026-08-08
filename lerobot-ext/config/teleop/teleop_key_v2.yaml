@@ -1,0 +1,47 @@
+# Teleoperação por TECLADO com o schema v2 (yaw do tronco + câmera de pulso).
+#
+# Para testar no simulador, tudo na mesma máquina:
+#
+#   # terminal 1 — MuJoCo com janela
+#   cd ../unitree-g1-mujoco && python run_sim.py
+#
+#   # terminal 2 — teleop por teclado
+#   cd lerobot-ext
+#   python init_lerobot_teleoparate_v2.py \
+#       --config_path=config/teleop/teleop_key_v2.yaml --sim
+#
+# A janela do pygame ("Controle G1 Arm") precisa estar EM FOCO para o teclado
+# funcionar — ela é quem captura as teclas, não o terminal.
+#
+#   TRONCO   ,  gira p/ esquerda    .  gira p/ direita
+#
+# Ver docs/SIM_REMOTO.md para rodar o simulador no seu PC e o modelo na atena.
+
+robot:
+  type: unitree_g1_dex3
+  control_mode: "upper_body"
+
+  # ── Schema v2 ─────────────────────────────────────────────────────────
+  # Yaw do tronco entra no vetor de ação (28 → 29 dims com as mãos).
+  # Roll e pitch da cintura ficam travados em posição neutra.
+  use_waist_yaw: true
+
+  # Câmera de pulso direito a 224×224. No MuJoCo vem da câmera
+  # `right_wrist_camera` do MJCF; no robô real, do
+  # Scripts_Prometheus_int/right_arm_realsense_server.py.
+  #
+  # Deixe `false` se ainda não estiver publicando essa câmera — senão o
+  # LeRobot fica esperando um stream que nunca chega.
+  use_wrist_camera: true
+
+  # Limite de curso do tronco. Comece conservador e só aumente depois de
+  # confirmar o curso real com o robô suspenso.
+  waist_yaw_limit: 1.0
+
+teleop:
+  type: keyboard_g1_arm
+  # Passo do tronco por frame. Menor que o dos braços de propósito: o tronco
+  # carrega os dois braços e a cabeça, e um passo grande vira solavanco que
+  # borra as câmeras.
+  waist_speed: 0.01
+  waist_yaw_limit: 1.0

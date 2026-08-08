@@ -1,0 +1,43 @@
+# Teleoperação por TECLADO no modo IK — cada mão é uma pose 6D.
+#
+# Em vez de mexer ângulo por ângulo, você move o PONTO no espaço onde a mão deve
+# estar, e a IK do Pinocchio resolve os 7 ângulos de cada braço. É como o VR
+# funciona — então demos gravadas aqui e no VR ficam parecidas, o que importa se
+# os dois conjuntos forem para o mesmo dataset.
+#
+#   python init_lerobot_teleoparate_v2.py \
+#       --config_path=config/teleop/teleop_key_ik.yaml --sim
+#
+# ┌─ TECLAS ─────────────────────────────────────────────────┐
+# │ MÃO ESQ   W S frente/trás   A D lados   R F cima/baixo   │
+# │ MÃO DIR   I K frente/trás   J L lados   Y H cima/baixo   │
+# │ SHIFT     mesmas teclas GIRAM em vez de transladar       │
+# │ MÃOS      Z fecha esquerda        M fecha direita        │
+# │ TRONCO    , esquerda              . direita              │
+# └──────────────────────────────────────────────────────────┘
+#
+# A janela do pygame precisa estar EM FOCO. Ela mostra o estado ao vivo: se
+# perder o foco aparece uma faixa vermelha, porque no Wayland sem foco o SDL não
+# entrega tecla nenhuma — e o sintoma é idêntico ao de um teleop quebrado.
+#
+# O tronco NÃO passa pela IK: ela trava as juntas de cintura, então o yaw
+# continua sendo comando direto, igual no modo junta.
+
+robot:
+  type: unitree_g1_dex3
+  control_mode: "upper_body"
+  use_waist_yaw: true
+  use_wrist_camera: true
+  waist_yaw_limit: 1.0
+
+teleop:
+  type: keyboard_g1_arm
+  mode: ik
+
+  # Passo por frame. A 60 fps, 0.005 m dá 30 cm/s com a tecla segurada —
+  # rápido o bastante para posicionar sem virar solavanco.
+  ik_lin_speed: 0.005
+  ik_ang_speed: 0.02
+
+  waist_speed: 0.01
+  waist_yaw_limit: 1.0

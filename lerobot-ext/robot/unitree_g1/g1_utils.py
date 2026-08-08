@@ -57,6 +57,48 @@ class G1_29_JointArmIndex(IntEnum):
     kRightWristYaw = 28
 
 
+class G1_29_JointArmWaistIndex(IntEnum):
+    """Braços + yaw do tronco — espaço de ação quando `use_waist_yaw=True`.
+
+    `kWaistYaw` é declarado POR ÚLTIMO de propósito. O IntEnum do Python itera na
+    ordem de DEFINIÇÃO (não de valor), e é essa iteração que monta o vetor de
+    ação/estado. Com o yaw no fim, as 14 dimensões de braço mantêm exatamente os
+    índices 0..13 que a documentação de `loss_per_dim` já usa; o yaw vira a
+    dimensão 14 do bloco do corpo, e as mãos passam a ocupar 15..28.
+
+    Roll e pitch da cintura NÃO entram: eles ficam travados em posição neutra
+    (ver `unitree_g1_loco.py`). Só o yaw é comandado — é o grau de liberdade que
+    o operador usa para girar o tronco e alcançar objetos fora do alcance frontal.
+    """
+
+    # Left arm
+    kLeftShoulderPitch = 15
+    kLeftShoulderRoll = 16
+    kLeftShoulderYaw = 17
+    kLeftElbow = 18
+    kLeftWristRoll = 19
+    kLeftWristPitch = 20
+    kLeftWristyaw = 21
+
+    # Right arm
+    kRightShoulderPitch = 22
+    kRightShoulderRoll = 23
+    kRightShoulderYaw = 24
+    kRightElbow = 25
+    kRightWristRoll = 26
+    kRightWristPitch = 27
+    kRightWristYaw = 28
+
+    # Tronco — último, para não deslocar os índices dos braços
+    kWaistYaw = 12
+
+
+# Juntas da cintura que ficam TRAVADAS em posição quando o yaw é liberado.
+# Sem isso a cintura fica mole: com mode=0/kp=0/kd=0 nenhum controlador assume o
+# roll e o pitch, e o tronco balança sozinho enquanto o robô anda.
+G1_WAIST_LOCKED_JOINTS = (13, 14)  # kWaistRoll, kWaistPitch
+
+
 class G1_29_JointIndex(IntEnum):
     # Left leg
     kLeftHipPitch = 0

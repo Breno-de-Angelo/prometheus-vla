@@ -2,6 +2,26 @@
 
 Extensões do LeRobot para o Unitree G1 + mãos Dex3 do projeto Prometheus-VLA.
 
+## Fluxo de trabalho
+
+Na ordem em que você vai precisar:
+
+| Doc | Sobre |
+|---|---|
+| [DATASETS_MULTITAREFA.md](DATASETS_MULTITAREFA.md) | Como gravar uma tarefa por dataset e juntar tudo num dataset multi-tarefa. Congelar o schema antes de gravar, string de `task`, balanceamento, merge, teste no MuJoCo. **Leia antes de gravar a primeira demo.** |
+| [TREINO_PASSO_A_PASSO.md](TREINO_PASSO_A_PASSO.md) | Roteiro linear: treinar a tarefa que já temos, e depois acrescentar a segunda. Orçamento de tempo medido, o que acompanhar no log, e por que fine-tune sequencial não produz multi-tarefa. |
+| [SCHEMA_G1_V2.md](SCHEMA_G1_V2.md) | Yaw do tronco (28→29 dims) e câmera de pulso. O que muda em cada arquivo, por que roll/pitch ficam travados, e a medição do ponto de suporte no MuJoCo. **Muda o schema — leia antes de gravar.** |
+| [SIM_REMOTO.md](SIM_REMOTO.md) | MuJoCo no seu PC, modelo de 7B na atena. Portas, IPs, e por que testar condicionamento por linguagem no simulador e não no robô. |
+| [INFERENCIA_COMANDO_TEXTO.md](INFERENCIA_COMANDO_TEXTO.md) | Rodar o robô mandando o comando em texto. `--task`, troca de comando em tempo de execução, e o teste que revela se o modelo está mesmo lendo o prompt. |
+
+## Ferramentas
+
+| Script | Para quê |
+|---|---|
+| [`../train/build_multitask_dataset.py`](../train/build_multitask_dataset.py) | Junta datasets de tarefa única num multi-tarefa. `--dry-run` valida o schema antes de copiar GB. |
+| [`../train/rename_dataset_task.py`](../train/rename_dataset_task.py) | Corrige a string de `task` de um dataset já gravado, sem tocar em vídeos ou dados. |
+| [`../Scripts_Prometheus_int/print_camera_intrinsics.py`](../Scripts_Prometheus_int/print_camera_intrinsics.py) | Lê os intrínsecos reais da RealSense, no formato do YAML. Rode no robô. |
+
 ## Políticas
 
 | Doc | Sobre |

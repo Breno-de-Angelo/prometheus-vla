@@ -1,13 +1,19 @@
 #!/usr/bin/env python
 """
 Inference Entry Point V3 — Universal
-Suporta: actdepth, pi05depth (e qualquer outro registrado em policies/)
+Suporta: actdepth, pi05depth, openvladepth
+
+Políticas condicionadas por linguagem (`pi05depth`, `openvladepth`) EXIGEM
+`--task`: é o texto desse argumento que vira o prompt e decide qual tarefa o
+robô executa. `actdepth` não usa linguagem e ignora o argumento.
 
 Uso:
   python init_lerobot_inference_v3.py --checkpoint=<CAMINHO> [OPÇÕES]
 
 Opções:
   --checkpoint=<PATH>    (obrigatório) Caminho para o pretrained_model
+  --task="<TEXTO>"       Comando em linguagem natural (obrigatório para VLAs)
+  --interactive          Permite trocar o comando digitando durante a execução
   --sim                  Modo simulação (sem robô real)
   --cam-robot=<IP>       Stream ZMQ de câmera externa
   --port-cam=<PORTA>     Porta do stream (padrão: 5555)
@@ -18,14 +24,22 @@ Opções:
   -h, --help             Mostra esta mensagem
 
 Exemplos:
-  # ACT-D sem vídeo:
+  # ACT-D (sem linguagem):
   python init_lerobot_inference_v3.py \
       --checkpoint=train_output/pick_up_the_cup_nodepth/best_val_checkpoint/pretrained_model
 
-  # PI05-Depth com câmera e janela de vídeo:
+  # OpenVLA-Depth por comando de texto:
   python init_lerobot_inference_v3.py \
-      --checkpoint=train_output/pick_up_the_cup_pi05_depth/best_val_checkpoint/pretrained_model \
+      --checkpoint=train/output/openvla_depth_cup_2026-06-09/best_val_checkpoint/pretrained_model \
+      --task="pick up the white mug and place it to the right" \
       --cam-robot=192.168.123.164 --v
+
+  # Trocando o comando durante a execução:
+  python init_lerobot_inference_v3.py --checkpoint=<PATH> \
+      --task="pick up the white mug and place it to the right" --interactive
+
+O texto precisa casar com o que foi gravado no campo `task` do dataset. Ver
+docs/INFERENCIA_COMANDO_TEXTO.md.
 """
 
 import os
@@ -65,8 +79,9 @@ def load_policy(checkpoint_dir: str, device: torch.device):
     import importlib
 
     _POLICY_CLASS_MAP = {
-        "actdepth":  ("policies.act_depth.modeling_act", "ACTPolicy"),
-        "pi05depth": ("policies.pi0_depth.modeling_pi05", "PI05DEPTHPolicy"),
+        "actdepth":     ("policies.act_depth.modeling_act", "ACTPolicy"),
+        "pi05depth":    ("policies.pi0_depth.modeling_pi05", "PI05DEPTHPolicy"),
+        "openvladepth": ("policies.openvla_depth.modeling_openvla", "OPENVLADEPTHPolicy"),
     }
 
     if policy_type in _POLICY_CLASS_MAP:
@@ -273,6 +288,8 @@ def main():
     uncertainty_threshold = 0.0
     remote_sim_ip = None
     fps = 30
+    task_cli = None
+    interactive = False
 
     for arg in sys.argv[1:]:
         if arg.startswith("--checkpoint="):
@@ -296,6 +313,10 @@ def main():
             remote_sim_ip = arg.split("=", 1)[1]
         elif arg.startswith("--fps="):
             fps = int(arg.split("=", 1)[1])
+        elif arg.startswith("--task="):
+            task_cli = arg.split("=", 1)[1]
+        elif arg == "--interactive":
+            interactive = True
 
     if checkpoint_dir is None:
         print("❌ ERRO: --checkpoint obrigatório.")
@@ -322,8 +343,48 @@ def main():
     # O preprocessor normaliza entradas; o postprocessor desnormaliza a saída.
     preprocessor, postprocessor = load_pre_post_processors(checkpoint_dir, policy)
 
-    # Task string: PI05 usa linguagem, ACT não
-    task_str = "pick up the cup" if policy_type == "pi05depth" else None
+    # ── Comando em texto ──────────────────────────────────────────────
+    # `pi05depth` e `openvladepth` são condicionados por linguagem: o texto aqui
+    # vira o prompt do modelo e é o que decide qual tarefa ele executa. `actdepth`
+    # não usa linguagem nenhuma e ignora isto.
+    #
+    # O comando fica numa lista de um elemento para poder ser trocado em tempo de
+    # execução pela thread de --interactive (ver command_listener).
+    LANGUAGE_POLICIES = {"pi05depth", "openvladepth"}
+    task_box = [None]
+
+    if policy_type in LANGUAGE_POLICIES:
+        if task_cli is None:
+            print(
+                f"\n❌ ERRO: a política '{policy_type}' é condicionada por linguagem e "
+                f"precisa de um comando.\n"
+                f'   Use: --task="pick up the white mug and place it to the right"\n'
+                f"   O texto deve casar com o que foi gravado no campo `task` do dataset.\n"
+            )
+            sys.exit(1)
+        task_box[0] = task_cli
+        print(f'🗣️  Comando: "{task_cli}"')
+    elif task_cli is not None:
+        print(f"⚠️  --task ignorado: '{policy_type}' não usa linguagem.")
+
+    # Troca de comando em tempo de execução: cada linha digitada vira o novo
+    # prompt. `policy.reset()` é essencial — sem ele o robô termina o chunk
+    # antigo (até 50 passos, ~1,7 s a 30 fps) antes de obedecer ao comando novo.
+    if interactive and policy_type in LANGUAGE_POLICIES:
+        import threading
+
+        def command_listener():
+            print("\n💬 Modo interativo: digite um comando e Enter para trocar a tarefa.")
+            print("   (Ctrl+C encerra a inferência)\n")
+            for line in sys.stdin:
+                novo = line.strip()
+                if not novo:
+                    continue
+                task_box[0] = novo
+                policy.reset()          # descarta o chunk em execução
+                print(f'🗣️  Comando trocado para: "{novo}"')
+
+        threading.Thread(target=command_listener, daemon=True, name="CommandListener").start()
 
     # ── Câmeras ───────────────────────────────────────────────────────
     stream_client, fake_cap, fake_img_rgb = setup_cameras(
@@ -405,7 +466,7 @@ def main():
                 joint_names=joint_names,
                 has_depth=has_depth,
                 has_pressure=has_pressure,
-                task=task_str,
+                task=task_box[0],   # lido a cada passo: --interactive pode ter trocado
             )
 
             # 5. Preprocessor: normaliza + batch dim + device

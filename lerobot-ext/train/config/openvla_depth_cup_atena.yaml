@@ -134,9 +134,20 @@ policy:
   scheduler_decay_steps: 11000
   scheduler_decay_lr: 5.0e-5
 
-# 12.861 frames de treino ÷ 16 ≈ 804 steps por época.
-# 12.000 steps ≈ 15 épocas. Meça o tempo por step no smoke test antes de soltar:
-# a 2 s/step isso dá ~6h40 na A100.
+# Orçamento medido na A100 80GB (GPU 0), batch 16, LoRA r=32 + grad ckpt:
+#
+#   updt_s = 2.08 s/step   (data_s = 0.24, o dataloader não é gargalo)
+#   12.861 frames ÷ 16 ≈ 804 steps/época  →  12.000 steps ≈ 15 épocas
+#
+#   treino      12.000 × 2.08 s  ≈  6h56
+#   validação   12 × ~2 min      ≈    24 min
+#   checkpoints  6 × ~30 s       ≈     3 min
+#   ────────────────────────────────────────
+#   total                        ≈  7h25   (run de uma noite)
+#
+# Para um resultado mais rápido, 8.000 steps (~10 épocas) dão ~4h40. Com
+# save_best_checkpoint ligado, dá também para acompanhar o val_loss e parar no
+# platô com Ctrl+C — o motor salva o estado antes de sair.
 batch_size: 16
 steps: 12000
 
@@ -153,7 +164,17 @@ steps: 12000
 neutral_position_loss_weight: 0.0
 
 log_freq: 10
-eval_freq: 400          # ~a cada meia época
+
+# eval_freq medido, não chutado.
+#
+# A validação são 2.674 frames; em batch 16 dá 167 batches, ~2 min por rodada.
+# Com eval_freq=400 seriam 30 validações = ~1h só validando, em cima das ~7h de
+# treino. Com 1000, são 12 pontos na curva — suficiente para ver o platô e o
+# overfitting, por ~24 min.
+#
+# Se quiser acompanhar de perto no começo, baixe para 250 e suba depois: o
+# Ctrl+C deste motor salva o estado e encerra limpo, então dá para ajustar.
+eval_freq: 1000
 save_freq: 2000
 save_best_checkpoint: true   # use best_val_checkpoint/ para deploy, não o último
 

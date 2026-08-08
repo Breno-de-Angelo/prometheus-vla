@@ -152,12 +152,61 @@ def display_help():
         print("  (Folder 'config/' not found)")
     print("="*70 + "\n")
 
+def preflight_porta_camera(porta: int = 5555) -> None:
+    """
+    Aborta cedo se a porta das câmeras já estiver ocupada.
+
+    Por que existe: quando um run anterior morre (erro, Ctrl+C mal dado), o
+    SUBPROCESSO de publicação de imagem sobrevive e continua segurando a 5555.
+    O run seguinte falha assim:
+
+        zmq.error.ZMQError: Address already in use (addr='tcp://*:5555')
+        ...
+        RuntimeError: Failed to connect to ZMQCamera(head_camera@127.0.0.1:5555):
+                      async_read timeout after 6000ms
+
+    A mensagem real (o ZMQError) sai no meio do log de um subprocesso e passa
+    despercebida; o que se vê no fim é o timeout da câmera, que parece problema
+    de rede ou de simulador. Já custou várias horas de diagnóstico — daí a
+    checagem explícita, 6 segundos antes.
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("", porta))
+    except OSError:
+        print(
+            f"\n[ERRO] A porta {porta} (câmeras) já está em uso.\n"
+            "\n"
+            "  Quase sempre é um processo zumbi de um run anterior que morreu:\n"
+            "  o subprocesso de publicação de imagem sobrevive ao pai.\n"
+            "\n"
+            "  Quem está segurando:\n"
+            f"      ss -tlnp | grep {porta}\n"
+            "\n"
+            "  Para limpar:\n"
+            "      pkill -9 -f init_lerobot_teleoparate_v2\n"
+            "      pkill -9 -f init_lerobot_record\n"
+            "      pkill -9 -f run_sim\n"
+        )
+        sys.exit(1)
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     cli_args = sys.argv[:]
-    
+
     if any(flag in cli_args for flag in ["-h", "--help", "-help"]):
         display_help()
         sys.exit(0)
+
+    # Só faz sentido em simulação local — no robô real quem publica é a máquina
+    # do robô, e a porta local estar livre não diz nada.
+    if any(a in cli_args for a in ["--sim", "--simulation=true"]):
+        preflight_porta_camera()
 
     if not any("--config_path" in arg for arg in cli_args):
         print("\n[CRITICAL ERROR]: Mandatory '--config_path' argument is missing.")

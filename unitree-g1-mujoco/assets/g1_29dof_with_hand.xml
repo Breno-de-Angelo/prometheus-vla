@@ -488,6 +488,12 @@
                             mesh="right_hand_palm_link" />
                           <geom pos="0.0415 -0.003 0" quat="1 0 0 0" type="mesh"
                             rgba="0.0 0.0 0.0 1" mesh="right_hand_palm_link" />
+                          <!-- Camera de pulso direito. Montada no dorso da mao, olhando
+                               na direcao da preensao, para enxergar o objeto quando ele
+                               sai do campo da camera da cabeca. fovy alto porque a
+                               distancia de trabalho e curta (dezenas de cm). -->
+                          <camera name="right_wrist_camera" pos="0.035 -0.03 0.03"
+                            euler="0 -1.2 -1.57" fovy="70" />
                           <body name="right_hand_thumb_0_link" pos="0.067 -0.003 0">
                               <inertial pos="-0.000884246 0.00863407 0.000944293"
                                 quat="0.643965 0.462991 -0.398986 0.460173" mass="0.0862366"
