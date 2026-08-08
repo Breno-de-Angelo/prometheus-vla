@@ -32,7 +32,10 @@ def display_help():
     print("="*70)
     print("USO:")
     print("  python init_lerobot_train_v3.py --config_path=<YAML>\n")
-    print("Tipos suportados: actdepth, pi05depth")
+    print("Tipos suportados:")
+    print("  actdepth      ACT + depth 3D + tato            (sem linguagem)")
+    print("  pi05depth     PI05 flow matching + depth       (multi-tarefa por texto)")
+    print("  openvladepth  OpenVLA 7B + depth, head OFT     (multi-tarefa por texto)")
     print("="*70 + "\n")
 
 if __name__ == "__main__":
@@ -61,6 +64,10 @@ if __name__ == "__main__":
     elif policy_type == "pi05depth":
         from policies.pi0_depth.run_train import main as run_train_main
         print("[INFO]: Usando motor PI05-Depth...")
+
+    elif policy_type == "openvladepth":
+        from policies.openvla_depth.run_train import main as run_train_main
+        print("[INFO]: Usando motor OpenVLA-Depth (head OFT paralelo)...")
 
     else:
         # Fallback: tenta o motor genérico do LeRobot diretamente

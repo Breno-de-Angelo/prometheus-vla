@@ -1,0 +1,102 @@
+# OpenVLA-Depth — treino MULTI-TAREFA.
+#
+# Este é o config que faz a política valer a pena: uma única rede, vários
+# comandos. O que separa uma tarefa da outra é apenas a string `task` gravada em
+# cada episódio do dataset — nada no modelo é por tarefa.
+#
+#   task = "pick up the cup"                       → preensão
+#   task = "place the cup on the coffee stand"     → colocação
+#   task = "hand the cup to the person"            → entrega
+#
+# ┌─ PRÉ-REQUISITO ────────────────────────────────────────────────────────────┐
+# │ O dataset PRECISA ter mais de uma string de `task`. Se todos os episódios  │
+# │ tiverem o mesmo texto, o modelo aprende a ignorar o prompt e a troca de    │
+# │ comando não muda nada na inferência. Com `require_multitask: true` abaixo, │
+# │ o treino aborta antes de gastar GPU nesse caso.                            │
+# │                                                                            │
+# │ Ao gravar com init_lerobot_record.py, passe o texto da tarefa em cada      │
+# │ sessão em vez de reaproveitar o mesmo rótulo para tudo.                    │
+# └────────────────────────────────────────────────────────────────────────────┘
+#
+#   python init_lerobot_train_v3.py --config_path=train/config/openvla_depth_multitask.yaml
+
+dataset:
+  # Troque pelo seu dataset multi-tarefa. Se as tarefas estiverem em datasets
+  # separados, junte antes com train/build_cotraining_dataset.py.
+  repo_id: "Mrwlker/g1_dex3_multitask"
+  image_transforms:
+    enable: true
+    max_num_transforms: 3
+    random_order: false
+
+val_dataset:
+  repo_id: "Mrwlker/g1_dex3_multitask"
+  # Deixe episódios de CADA tarefa na validação — senão o val_loss não mede
+  # generalização entre comandos, só dentro de um deles.
+  episodes: [4, 9, 14, 19, 24, 29]
+
+output_dir: "/home/hercules/prometheus-vla/train/output/openvla_depth_multitask"
+job_name: "openvla_depth_multitask"
+
+policy:
+  type: openvladepth
+  pretrained_backbone: openvla/openvla-7b
+  load_mode: native
+  dtype: bfloat16
+  push_to_hub: false
+
+  # Aborta se o dataset tiver uma única tarefa.
+  require_multitask: true
+  # override_task: NUNCA preencher aqui — anularia o condicionamento por texto.
+
+  chunk_size: 50
+  n_action_steps: 50
+
+  action_head_hidden_dim: 1024
+  action_head_n_layers: 3
+  bidirectional_action_attn: true
+  loss_type: l1
+
+  use_depth_3d: true
+  depth_encoder_type: point_transformer
+  pointnet_num_points: 1024
+  use_pressure: true
+  state_as_token: true
+
+  # ⚠️ Estes valores vieram dos configs de pi05depth/actdepth e assumem uma
+  # câmera de 640×480 (cx=320). Se o seu dataset foi gravado a 848×480 — como
+  # pick_up_the_cup_2026-06-09 — o cx real é ≈424, e usar 320 cisalha a nuvem de
+  # pontos. Meça com: python Scripts_Prometheus_int/print_camera_intrinsics.py
+  camera_intrinsics:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+
+  # Multi-tarefa exige mais capacidade de adaptação que tarefa única: r=64
+  # ajuda quando os comandos pedem trajetórias bem diferentes entre si.
+  use_lora: true
+  lora_r: 64
+  lora_alpha: 16
+  freeze_vision_encoder: true
+  gradient_checkpointing: true
+
+  optimizer_lr: 5.0e-4
+  optimizer_lr_new_modules: 1.0e-3
+  scheduler_warmup_steps: 500
+  scheduler_decay_steps: 18000
+  scheduler_decay_lr: 5.0e-5
+
+batch_size: 16
+# Com N tarefas, escale os steps: o modelo precisa ver cada comando o mesmo
+# número de vezes que veria numa corrida de tarefa única.
+steps: 20000
+
+log_freq: 10
+eval_freq: 500
+save_freq: 1000
+save_best_checkpoint: true
+
+wandb:
+  enable: true
+  project: prometheus_g1
