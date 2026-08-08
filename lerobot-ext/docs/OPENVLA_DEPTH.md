@@ -321,6 +321,35 @@ O carregamento é **estrito de propósito** (`_load_strict`): uma chave faltando
 levanta exceção em vez de deixar um bloco com pesos aleatórios passar
 despercebido — um erro que não daria erro nenhum, só um loss que não desce.
 
+### 5.5 O rename do LayerScale (já resolvido)
+
+O `--compare` no checkpoint real apontou uma divergência, e vale registrar porque
+é o tipo de coisa que reaparece a cada bump do timm:
+
+```
+─── DINOv2 — DIVERGE ───
+    módulo local: 343 chaves | checkpoint: 343 chaves
+    faltando  (48): ['blocks.0.ls1.gamma',        'blocks.0.ls2.gamma', ...]
+    sobrando  (48): ['blocks.0.ls1.scale_factor', 'blocks.0.ls2.scale_factor', ...]
+```
+
+Mesma contagem, mesmo sufixo, mesmas formas: é **rename puro** do parâmetro do
+`LayerScale`. O checkpoint usa `scale_factor` (o export para HF evita o nome
+`gamma`, que o `transformers` renomeia automaticamente); o timm 1.0.x usa `gamma`.
+
+Resolvido por `_KEY_ALIASES` em `backbone.py`, sem precisar de venv com timm
+antigo. O alias só é aplicado **se o destino existir no módulo local com a mesma
+forma** — sem essa checagem, um alias errado plugaria o tensor errado, e um
+modelo com pesos trocados não dá erro, só não converge.
+
+SigLIP, projector e language_model bateram exatos de primeira. O projector saiu
+`2176 → 8704 → 4096 → 4096`, e o `lm_head` (32064×4096) é ignorado de propósito:
+o head OFT lê hidden states, não logits de vocabulário.
+
+Se um bump futuro do timm trouxer outro rename 1:1, adicione o par em
+`_KEY_ALIASES`. Se as **formas** mudarem, aí sim é caso de reexportar os pesos
+num venv com `timm==0.9.10`.
+
 ---
 
 ## 6. Treinar

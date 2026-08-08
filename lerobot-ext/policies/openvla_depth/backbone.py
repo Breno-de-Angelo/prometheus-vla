@@ -100,6 +100,50 @@ def _split_by_prefix(state_dict: dict, prefix: str) -> dict:
     return {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
 
+# ── Renomes de parâmetro entre versões do timm ────────────────────────────────
+# O `openvla-7b` guarda o LayerScale do DINOv2 como `ls1.scale_factor`; o timm
+# 1.0.x chama o mesmo tensor de `ls1.gamma`. É rename puro — mesma forma, mesma
+# semântica. (O export para HF evita o nome `gamma` porque o `transformers`
+# renomeia automaticamente parâmetros terminados em `.gamma`/`.beta`.)
+#
+# Cada alias só é aplicado se o destino existir no módulo local COM A MESMA
+# FORMA. Sem essa checagem, um alias errado silenciosamente plugaria o tensor
+# errado — e um modelo com pesos trocados não dá erro, só não converge.
+_KEY_ALIASES: tuple[tuple[str, str], ...] = (
+    (".scale_factor", ".gamma"),
+    (".gamma", ".scale_factor"),
+)
+
+
+def _align_state_dict(sd: dict, module: nn.Module) -> tuple[dict, list[tuple[str, str]]]:
+    """Renomeia chaves do checkpoint para os nomes que o módulo local espera."""
+    expected = module.state_dict()
+    aligned: dict = {}
+    renamed: list[tuple[str, str]] = []
+
+    for key, value in sd.items():
+        if key in expected:
+            aligned[key] = value
+            continue
+
+        target = None
+        for old, new in _KEY_ALIASES:
+            if not key.endswith(old):
+                continue
+            candidate = key[: -len(old)] + new
+            if candidate in expected and expected[candidate].shape == value.shape:
+                target = candidate
+                break
+
+        if target is None:
+            aligned[key] = value  # deixa passar: _load_strict reporta como inesperada
+        else:
+            aligned[target] = value
+            renamed.append((key, target))
+
+    return aligned, renamed
+
+
 def inspect_checkpoint(repo_or_path: str, depth: int = 2) -> None:
     """Imprime os prefixos de chave e formas do checkpoint (ferramenta de diagnóstico)."""
     state_dict = load_openvla_state_dict(repo_or_path)
@@ -153,34 +197,43 @@ def compare_keys(
     local_dir = _resolve_local_dir(repo_or_path)
     ok = True
 
-    def _report(name: str, expected: set, found: set) -> bool:
+    def _report(name: str, module: nn.Module, sd: dict) -> bool:
+        """Aplica os aliases conhecidos e reporta o que sobra de divergência."""
+        aligned, renamed = _align_state_dict(sd, module)
+        expected = set(module.state_dict())
+        found = set(aligned)
+
         missing = sorted(k for k in expected - found if "rotary_emb.inv_freq" not in k)
         unexpected = sorted(found - expected)
-        status = "OK" if not missing and not unexpected else "DIVERGE"
+        resolved = not missing and not unexpected
+
+        status = "OK" if resolved and not renamed else "OK (com renomes)" if resolved else "DIVERGE"
         print(f"\n─── {name} — {status} ───")
-        print(f"    módulo local: {len(expected)} chaves | checkpoint: {len(found)} chaves")
+        print(f"    módulo local: {len(expected)} chaves | checkpoint: {len(sd)} chaves")
+        if renamed:
+            a, b = renamed[0]
+            print(f"    {len(renamed)} renomeadas automaticamente (ex: {a} → {b})")
         if missing:
             print(f"    faltando no checkpoint ({len(missing)}): {missing[:10]}")
         if unexpected:
             print(f"    sobrando no checkpoint ({len(unexpected)}): {unexpected[:10]}")
-        return not missing and not unexpected
+        return resolved
 
     vision = FusedVisionBackbone(dinov2_model, siglip_model, image_size=image_size)
     ok &= _report(
         f"DINOv2 ({dinov2_model})",
-        set(vision.featurizer.state_dict()),
-        set(_split_by_prefix(state_dict, PREFIX_DINOV2)),
+        vision.featurizer,
+        _split_by_prefix(state_dict, PREFIX_DINOV2),
     )
     ok &= _report(
         f"SigLIP ({siglip_model})",
-        set(vision.fused_featurizer.state_dict()),
-        set(_split_by_prefix(state_dict, PREFIX_SIGLIP)),
+        vision.fused_featurizer,
+        _split_by_prefix(state_dict, PREFIX_SIGLIP),
     )
 
     sd_proj = _split_by_prefix(state_dict, PREFIX_PROJECTOR)
     try:
-        projector = _build_projector_from_state_dict(sd_proj)
-        ok &= _report("projector", set(projector.state_dict()), set(sd_proj))
+        ok &= _report("projector", _build_projector_from_state_dict(sd_proj), sd_proj)
     except KeyError as e:
         print(f"\n─── projector — DIVERGE ───\n    {e}")
         ok = False
@@ -189,7 +242,7 @@ def compare_keys(
     try:
         with torch.device("meta"):
             llm = _build_llama(local_dir, sd_llm)
-        ok &= _report("language_model (Llama)", set(llm.state_dict()), set(sd_llm))
+        ok &= _report("language_model (Llama)", llm, sd_llm)
     except Exception as e:
         print(f"\n─── language_model — não foi possível construir ───\n    {e}")
         ok = False
@@ -199,10 +252,12 @@ def compare_keys(
         print("Todos os componentes batem — `load_mode: native` deve carregar sem erro.")
     else:
         print(
-            "Há divergências acima. Antes de mexer no código, confira a versão do timm:\n"
-            "  o checkpoint foi salvo com timm==0.9.10.\n"
-            "Se só a torre visual diverge, instalar `timm==0.9.10` num venv separado e\n"
-            "reexportar os pesos costuma ser mais simples que remapear as chaves."
+            "Há divergências acima que os aliases conhecidos não resolvem.\n"
+            "Se o padrão for um rename 1:1 (mesma contagem de chaves faltando e sobrando,\n"
+            "mesmo sufixo), adicione o par em `_KEY_ALIASES` no topo deste arquivo — o\n"
+            "remapeamento só é aplicado quando a forma do tensor confere.\n"
+            "Se as formas mudarem de verdade, aí sim vale reexportar os pesos num venv\n"
+            "com `timm==0.9.10`, que é a versão em que o checkpoint foi salvo."
         )
     print("=" * 78 + "\n")
     return ok
@@ -438,6 +493,14 @@ def build_openvla_backbone(config) -> OpenVLABackbone:
 
 def _load_strict(module: nn.Module, sd: dict, name: str) -> None:
     """Carrega pesos e falha alto se sobrar/faltar chave — silêncio aqui vira modelo aleatório."""
+    sd, renamed = _align_state_dict(sd, module)
+    if renamed:
+        sample = ", ".join(f"{a} → {b}" for a, b in renamed[:2])
+        logging.info(
+            f"[OpenVLA] '{name}': {len(renamed)} chaves renomeadas por diferença de versão "
+            f"do timm (ex: {sample})."
+        )
+
     missing, unexpected = module.load_state_dict(sd, strict=False)
     # `rotary_emb.inv_freq` é recomputado pelo transformers moderno e não vem no
     # checkpoint; qualquer outra chave faltando é erro real.
