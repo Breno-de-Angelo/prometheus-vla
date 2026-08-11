@@ -34,6 +34,23 @@ class XRG1ArmConfig(TeleoperatorConfig):
     is_simulation: bool = True
     input_mode: str = "hand"       # 'hand' ou 'controller'
     display_mode: str = "immersive" # 'immersive', 'ego', 'pass-through'
+
+    # Quadros por segundo ENVIADOS ao headset — não confundir com o FPS do laço
+    # de controle, que continua o mesmo. É só a taxa do vídeo que sai por
+    # websocket.
+    #
+    # O laço de render do televuer (main_image_*_zmq*) empurra um JPEG por
+    # iteração SEM CONTRAPRESSÃO: `session.upsert` só empilha na fila de uplink,
+    # sem olhar se o cliente está dando conta. Se o Quest não drenar na
+    # velocidade em que a gente enfileira, quem enche é o buffer de escrita do
+    # SSL no servidor e a sessão morre poucos segundos depois de conectar. No
+    # log isso aparece como `protocol.resume_writing() failed`, seguido do
+    # websocket caindo e de `AssertionError('Websocket session is missing.')`
+    # — essa asserção é CONSEQUÊNCIA da queda, não a causa.
+    #
+    # Baixar para 15 corta o tráfego pela metade e costuma resolver em Wi-Fi
+    # ruim, ao custo de vídeo mais picotado no headset.
+    display_fps: float = 30.0
     ee_type: str = "dex3"
     zmq: bool = True
     webrtc: bool = False
@@ -482,6 +499,7 @@ class XRG1Arm(Teleoperator):
             binocular=False,
             img_shape=(720, 1280),
             display_mode=self.config.display_mode,
+            display_fps=self.config.display_fps,
             zmq=self.config.zmq,
             webrtc=self.config.webrtc,
             webrtc_url=f"https://{self.config.img_server_ip}:60000/offer",

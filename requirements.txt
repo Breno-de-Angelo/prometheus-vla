@@ -8,3 +8,9 @@ git+https://github.com/unitreerobotics/unitree_sdk2_python.git
 flask
 vuer
 -e ./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi]
+# ATENÇÃO: o extra `televuer` acima NÃO instala o pacote televuer — só puxa
+# vuer/aiortc/opencv. O televuer que o teleop usa é NOSSO FORK, e tem que ser
+# editable: sem -e, `git pull` não atualiza o pacote instalado. Instalar o de
+# upstream (silencht) dá um pacote de mesma versão (4.0.0) com conteúdo
+# diferente e o teleop quebra com "unexpected keyword argument 'wrist_cam'".
+-e ./lerobot-ext/teleop/televuer
