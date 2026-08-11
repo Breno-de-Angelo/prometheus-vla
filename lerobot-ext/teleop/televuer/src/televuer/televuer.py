@@ -12,8 +12,12 @@ from typing import Literal
 
 class TeleVuer:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
-                       display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
-                       cert_file: str=None, key_file: str=None):
+                       display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None,
+                       cert_file: str=None, key_file: str=None,
+                       head_cam_size: float=None, head_cam_distance: float=None,
+                       wrist_cam: bool=False, wrist_cam_shape: tuple=(224, 224, 3),
+                       wrist_cam_side: Literal["left", "right"]="right",
+                       wrist_cam_size: float=0.10, wrist_cam_offset: tuple=(0.0, -0.14, 0.0)):
         """
         TeleVuer class for OpenXR-based XR teleoperate applications.
         This class handles the communication with the Vuer server and manages image and pose data.
@@ -30,13 +34,23 @@ class TeleVuer:
         :param cert_file: str, path to the SSL certificate file.
         :param key_file: str, path to the SSL key file.
 
+        :param head_cam_size: float, head panel height in meters. None keeps the per-mode default (1.0 immersive, 0.75 ego).
+        :param head_cam_distance: float, head panel distance in meters. None keeps the per-mode default (1.0 immersive, 2.0 ego).
+                                  Apparent size is size/distance — halve the size to halve how much of the FOV it eats.
+        :param wrist_cam: bool, show an extra image panel anchored to the operator's hand (wrist camera feed).
+        :param wrist_cam_shape: tuple, (height, width, channels) of that feed.
+        :param wrist_cam_side: str, which hand the panel follows, "left" or "right".
+        :param wrist_cam_size: float, panel height in meters.
+        :param wrist_cam_offset: tuple, (x, y, z) offset from the hand, in head frame — +y lifts the panel above the hand.
+
         Note:
 
         - display_mode controls what the VR headset displays:
             * "immersive": fully immersive mode; VR shows the robot's first-person view (zmq or webrtc must be enabled).
             * "pass-through": VR shows the real world through the VR headset cameras; no image from zmq or webrtc is displayed (even if enabled).
             * "ego": a small window in the center shows the robot's first-person view, while the surrounding area shows the real world.
-        
+
+        - The wrist_cam panel is fed by `render_wrist_to_xr()` and only works with zmq (webrtc render loops don't include it).
         - Only one image mode is active at a time.
         - Image transmission to VR occurs only if display_mode is "immersive" or "ego" and the corresponding zmq or webrtc option is enabled.
         - If zmq and webrtc simultaneously enabled, webrtc will be prioritized.
@@ -100,6 +114,18 @@ class TeleVuer:
         self.webrtc = webrtc
         self.webrtc_url = webrtc_url
 
+        # ── Geometria do painel da cabeça ─────────────────────────────────
+        # O que o operador enxerga é o ÂNGULO que o painel ocupa, ou seja
+        # size/distance — não o `size` sozinho. Os defaults por modo são os
+        # valores históricos: 1.0/1.0 no immersive (≈53° de altura, tela cheia)
+        # e 0.75/2.0 no ego (≈21°, janelinha flutuante).
+        if self.display_mode == "ego":
+            self.head_cam_size = 0.75 if head_cam_size is None else head_cam_size
+            self.head_cam_distance = 2.0 if head_cam_distance is None else head_cam_distance
+        else:
+            self.head_cam_size = 1.0 if head_cam_size is None else head_cam_size
+            self.head_cam_distance = 1.0 if head_cam_distance is None else head_cam_distance
+
         if self.display_mode == "immersive":
             if self.webrtc:
                 fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
@@ -133,6 +159,30 @@ class TeleVuer:
         else:
             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
         
+        # ── Painel extra da câmera de pulso, ancorado na mão do operador ──────
+        # Um segundo plano de imagem que NÃO fica preso à cabeça: a cada quadro
+        # ele é reposicionado na pose da mão (controle ou hand tracking), então
+        # olhar para a própria mão mostra o que a câmera do pulso do robô vê.
+        # A imagem chega por um canal próprio (outro servidor ZMQ, outra porta),
+        # por isso tem memória compartilhada e flag de "pronto" separados — sem a
+        # flag, o painel apareceria preto até o primeiro quadro chegar.
+        self.wrist_cam = wrist_cam and self.display_mode in ("immersive", "ego")
+        self.wrist_cam_side = wrist_cam_side
+        self.wrist_cam_size = wrist_cam_size
+        self.wrist_cam_offset = tuple(wrist_cam_offset)
+        if self.wrist_cam:
+            self.wrist_cam_shape = tuple(wrist_cam_shape)
+            self.wrist_cam_aspect = self.wrist_cam_shape[1] / self.wrist_cam_shape[0]
+            self.wrist_img_shm = shared_memory.SharedMemory(
+                create=True, size=int(np.prod(self.wrist_cam_shape)) * np.uint8().itemsize
+            )
+            self.wrist_img = np.ndarray(self.wrist_cam_shape, dtype=np.uint8, buffer=self.wrist_img_shm.buf)
+            self.wrist_img[:] = 0
+            self.wrist_img_ready = Value('b', False, lock=True)
+            # Visibilidade é Value compartilhado, não atributo comum: quem
+            # alterna é o processo do teleop, quem lê é o processo do Vuer.
+            self.wrist_cam_visible = Value('b', True, lock=True)
+
         self.vuer.spawn(start=False)(fn)
 
         self.head_pose_shared = Array('d', 16, lock=True)
@@ -205,6 +255,80 @@ class TeleVuer:
         self.latest_frame = image
         self.new_frame_event.set()
 
+    def render_wrist_to_xr(self, image):
+        """Publica um quadro da câmera de pulso no painel que segue a mão.
+
+        Espera a imagem em **RGB** (é o que o encoder de JPEG do Vuer, que é
+        PIL, assume). Diferente de `render_to_xr`, aqui não há conversão de
+        canal nem thread: é uma cópia de 224x224 direto na memória
+        compartilhada, barata o bastante para rodar no laço de recepção.
+        """
+        if not self.wrist_cam or image is None:
+            return
+        if image.shape != self.wrist_cam_shape:
+            image = cv2.resize(image, (self.wrist_cam_shape[1], self.wrist_cam_shape[0]))
+            if image.ndim == 2:
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        self.wrist_img[:] = image
+        with self.wrist_img_ready.get_lock():
+            self.wrist_img_ready.value = True
+
+    def set_wrist_cam_visible(self, visible: bool) -> bool:
+        """Liga/desliga o painel de pulso. Devolve o estado resultante."""
+        if not self.wrist_cam:
+            return False
+        with self.wrist_cam_visible.get_lock():
+            self.wrist_cam_visible.value = bool(visible)
+            return self.wrist_cam_visible.value
+
+    def _wrist_cam_children(self):
+        """Elementos do painel de pulso para o `upsert` do quadro atual.
+
+        Devolve lista vazia (nada a desenhar) enquanto o painel está desligado,
+        sem imagem, ou sem pose válida — e isso importa: as poses compartilhadas
+        nascem zeradas e uma matriz de zeros colocaria o painel colado na cara
+        do operador antes do primeiro evento de XR chegar.
+
+        A posição é passada no referencial da CÂMERA (cabeça) com
+        `distanceToCamera=0`, e não em coordenadas de mundo. É o que faz o
+        painel se comportar como um billboard: o Vuer põe o plano em
+        `posição_da_cabeça + R_cabeça · position` e o mantém sempre de frente
+        para o operador. Colocar em mundo (`fixed=True`) fixaria também a
+        orientação, e o painel viraria de lado assim que a cabeça girasse.
+        """
+        if not self.wrist_cam:
+            return []
+        with self.wrist_cam_visible.get_lock():
+            if not self.wrist_cam_visible.value:
+                return []
+        with self.wrist_img_ready.get_lock():
+            if not self.wrist_img_ready.value:
+                return []
+
+        head = np.array(self.head_pose_shared[:]).reshape(4, 4, order="F")
+        pose_shared = self.right_arm_pose_shared if self.wrist_cam_side == "right" else self.left_arm_pose_shared
+        hand = np.array(pose_shared[:]).reshape(4, 4, order="F")
+        if not np.any(head) or not np.any(hand):
+            return []
+
+        # Mão em coordenadas de mundo → coordenadas da cabeça.
+        rel = head[:3, :3].T @ (hand[:3, 3] - head[:3, 3])
+        pos = [float(rel[i] + self.wrist_cam_offset[i]) for i in range(3)]
+
+        return [
+            ImageBackground(
+                self.wrist_img,
+                aspect=self.wrist_cam_aspect,
+                height=self.wrist_cam_size,
+                distanceToCamera=0,
+                position=pos,
+                format="jpeg",
+                quality=80,
+                key="wrist-cam",
+                interpolate=True,
+            )
+        ]
+
     def close(self):
         self.process.terminate()
         self.process.join(timeout=0.5)
@@ -215,6 +339,12 @@ class TeleVuer:
             try:
                 self.img2display_shm.close()
                 self.img2display_shm.unlink()
+            except:
+                pass
+        if getattr(self, "wrist_cam", False):
+            try:
+                self.wrist_img_shm.close()
+                self.wrist_img_shm.unlink()
             except:
                 pass
 
@@ -339,8 +469,8 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display[:, :self.img_width],
                         aspect=self.aspect_ratio,
-                        height=1,
-                        distanceToCamera=1,
+                        height=self.head_cam_size,
+                        distanceToCamera=self.head_cam_distance,
                         # The underlying rendering engine supported a layer binary bitmask for both objects and the camera. 
                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
@@ -353,14 +483,16 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display[:, self.img_width:],
                         aspect=self.aspect_ratio,
-                        height=1,
-                        distanceToCamera=1,
+                        height=self.head_cam_size,
+                        distanceToCamera=self.head_cam_distance,
                         layers=2,
                         format="jpeg",
                         quality=80,
                         key="background-right",
                         interpolate=True,
                     ),
+                    # Painel da câmera de pulso, ancorado na mão do operador.
+                    *self._wrist_cam_children(),
                 ],
                 to="bgChildren",
             )
@@ -395,13 +527,15 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display,
                         aspect=self.aspect_ratio,
-                        height=1,
-                        distanceToCamera=1,
+                        height=self.head_cam_size,
+                        distanceToCamera=self.head_cam_distance,
                         format="jpeg",
                         quality=80,
                         key="background-mono",
                         interpolate=True,
                     ),
+                    # Painel da câmera de pulso, ancorado na mão do operador.
+                    *self._wrist_cam_children(),
                 ],
                 to="bgChildren",
             )
@@ -508,8 +642,8 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display[:, :self.img_width],
                         aspect=self.aspect_ratio,
-                        height=0.75,
-                        distanceToCamera=2,
+                        height=self.head_cam_size,
+                        distanceToCamera=self.head_cam_distance,
                         # The underlying rendering engine supported a layer binary bitmask for both objects and the camera. 
                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
@@ -522,14 +656,16 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display[:, self.img_width:],
                         aspect=self.aspect_ratio,
-                        height=0.75,
-                        distanceToCamera=2,
+                        height=self.head_cam_size,
+                        distanceToCamera=self.head_cam_distance,
                         layers=2,
                         format="jpeg",
                         quality=80,
                         key="background-right",
                         interpolate=True,
                     ),
+                    # Painel da câmera de pulso, ancorado na mão do operador.
+                    *self._wrist_cam_children(),
                 ],
                 to="bgChildren",
             )
@@ -564,13 +700,15 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display,
                         aspect=self.aspect_ratio,
-                        height=0.75,
-                        distanceToCamera=2,
+                        height=self.head_cam_size,
+                        distanceToCamera=self.head_cam_distance,
                         format="jpeg",
                         quality=80,
                         key="background-mono",
                         interpolate=True,
                     ),
+                    # Painel da câmera de pulso, ancorado na mão do operador.
+                    *self._wrist_cam_children(),
                 ],
                 to="bgChildren",
             )

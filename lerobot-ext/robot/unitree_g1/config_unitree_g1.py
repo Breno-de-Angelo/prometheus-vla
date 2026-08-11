@@ -33,8 +33,18 @@ _GAINS: dict[str, dict[str, list[float]]] = {
     # A ordem no vetor plano continua sendo yaw(12), roll(13), pitch(14).
     "waist_yaw": {"kp": [250], "kd": [5]},          # 12
     "waist_lock": {"kp": [250, 250], "kd": [5, 5]},  # 13 roll, 14 pitch
-    "left_arm": {"kp": [80, 80, 80, 80], "kd": [3, 3, 3, 0.3]},  # shoulder_pitch/roll/yaw, elbow
-    "left_wrist": {"kp": [40, 40, 40], "kd": [1.5, 1.5, 1.5]},  # roll, pitch, yaw
+    # ⚠️ TEMPORÁRIO — BRAÇO ESQUERDO DESLIGADO (defeito de hardware).
+    # kp=0 e kd=0 com mode=1: o motor recebe o alvo mas não gera torque nenhum,
+    # então o braço fica COMPLETAMENTE MOLE e cai por gravidade assim que o
+    # robô é energizado. Apoie ou amarre o braço esquerdo antes de ligar.
+    # O teleop continua calculando e GRAVANDO as 7 juntas esquerdas no dataset,
+    # só que elas não são executadas — episódios gravados assim têm a metade
+    # esquerda do vetor de ação inútil. Restaure os valores abaixo quando o
+    # braço voltar do conserto:
+    #   "left_arm":   {"kp": [80, 80, 80, 80], "kd": [3, 3, 3, 0.3]}
+    #   "left_wrist": {"kp": [40, 40, 40],     "kd": [1.5, 1.5, 1.5]}
+    "left_arm": {"kp": [0, 0, 0, 0], "kd": [0, 0, 0, 0]},  # shoulder_pitch/roll/yaw, elbow
+    "left_wrist": {"kp": [0, 0, 0], "kd": [0, 0, 0]},  # roll, pitch, yaw
     "right_arm": {"kp": [80, 80, 80, 80], "kd": [3, 3, 3, 0.3]},
     "right_wrist": {"kp": [40, 40, 40], "kd": [1.5, 1.5, 1.5]},
     "other": {"kp": [80, 80, 80, 80, 80, 80], "kd": [3, 3, 3, 3, 3, 3]},

@@ -195,7 +195,11 @@ class TeleData:
 class TeleVuerWrapper:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
-                       cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False):
+                       cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
+                       head_cam_size: float=None, head_cam_distance: float=None,
+                       wrist_cam: bool=False, wrist_cam_shape: tuple=(224, 224, 3),
+                       wrist_cam_side: Literal["left", "right"]="right",
+                       wrist_cam_size: float=0.10, wrist_cam_offset: tuple=(0.0, -0.14, 0.0)):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
@@ -236,9 +240,13 @@ class TeleVuerWrapper:
         self.use_hand_tracking = use_hand_tracking
         self.return_hand_rot_data = return_hand_rot_data
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
-                              display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
-                              cert_file=cert_file, key_file=key_file)
-        
+                              display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url,
+                              cert_file=cert_file, key_file=key_file,
+                              head_cam_size=head_cam_size, head_cam_distance=head_cam_distance,
+                              wrist_cam=wrist_cam, wrist_cam_shape=wrist_cam_shape, wrist_cam_side=wrist_cam_side,
+                              wrist_cam_size=wrist_cam_size, wrist_cam_offset=wrist_cam_offset)
+
+
     def get_tele_data(self):
         """
         Get processed motion state data from the TeleVuer instance.
@@ -433,6 +441,14 @@ class TeleVuerWrapper:
         
     def render_to_xr(self, img):
         self.tvuer.render_to_xr(img)
+
+    def render_wrist_to_xr(self, img):
+        """Publica um quadro (RGB) no painel de pulso que segue a mão do operador."""
+        self.tvuer.render_wrist_to_xr(img)
+
+    def set_wrist_cam_visible(self, visible: bool) -> bool:
+        """Liga/desliga o painel de pulso. Devolve o estado resultante."""
+        return self.tvuer.set_wrist_cam_visible(visible)
     
     def close(self):
         self.tvuer.close()

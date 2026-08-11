@@ -106,6 +106,12 @@ LOWSTATE_PORT  = 6001
 HANDSTATE_PORT = 6002
 HANDCMD_PORT   = 6003
 STATUS_PORT    = 6004   # ← Novo: publica o modo atual para o LeRobot
+LOCOCMD_PORT   = 6005   # ← Novo: velocidade de locomoção (PC → robô), só em --loco
+
+# Se o PC parar de mandar velocidade por mais que isto, o robô para sozinho.
+# É a rede caindo, o teleop travando ou o operador tirando o óculos: em todos
+# esses casos um G1 andando sem ninguém no comando é o pior desfecho possível.
+LOCO_WATCHDOG_S = 0.4
 
 NUM_MOTORS      = 35
 NUM_HAND_MOTORS = 7
@@ -268,6 +274,73 @@ def handcmd_forward_loop(handcmd_sock, left_pub, right_pub, shutdown_event):
         elif topic == kTopicDex3RightCommand: right_pub.Write(cmd)
 
 
+def loco_cmd_loop(loco_sock, loco_client, shutdown_event):
+    """Recebe velocidade do PC e chama o LocoClient AQUI, no robô.
+
+    O DDS fica todo deste lado de propósito: do PC só sai um JSON por ZMQ,
+    pela mesma ponte que já carrega lowcmd e handcmd. Chamar LocoClient de
+    fora exigiria abrir o domínio DDS do robô para a rede — mais superfície,
+    e um segundo participante DDS competindo pelo mesmo tópico.
+
+    Mensagens aceitas:
+        {"vx": float, "vy": float, "vyaw": float}
+        {"damp": true}                              → parada macia
+    """
+    ultimo_cmd = 0.0
+    andando = False
+
+    while not shutdown_event.is_set():
+        try:
+            payload = loco_sock.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            # Sem mensagem: é aqui que o watchdog trabalha.
+            if andando and (time.time() - ultimo_cmd) > LOCO_WATCHDOG_S:
+                try:
+                    loco_client.Move(0.0, 0.0, 0.0, continous_move=False)
+                except Exception as e:
+                    print(f"[Loco] Falha ao parar no watchdog: {e}")
+                andando = False
+                print("[Loco] ⏱️  Watchdog: sem comando do PC, robô parado.")
+            time.sleep(0.005)
+            continue
+        except zmq.ContextTerminated:
+            break
+
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+        except Exception:
+            continue
+
+        ultimo_cmd = time.time()
+
+        if msg.get("damp"):
+            try:
+                loco_client.Damp()
+                print("[Loco] 🛑 Damping por pedido do PC.")
+            except Exception as e:
+                print(f"[Loco] Falha no Damp: {e}")
+            andando = False
+            continue
+
+        vx = float(msg.get("vx", 0.0))
+        vy = float(msg.get("vy", 0.0))
+        vyaw = float(msg.get("vyaw", 0.0))
+
+        # Teto também aqui, não só no PC: o servidor não deve confiar que o
+        # cliente respeitou o próprio limite.
+        vx = max(-0.5, min(0.5, vx))
+        vy = max(-0.5, min(0.5, vy))
+        vyaw = max(-0.5, min(0.5, vyaw))
+
+        try:
+            loco_client.Move(vx, vy, vyaw, continous_move=False)
+        except Exception as e:
+            print(f"[Loco] Falha ao mover: {e}")
+            continue
+
+        andando = not (vx == 0.0 and vy == 0.0 and vyaw == 0.0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="G1 ZMQ Bridge Server")
     parser.add_argument(
@@ -355,6 +428,25 @@ def main():
     status_sock = ctx.socket(zmq.PUB)
     status_sock.bind(f"tcp://0.0.0.0:{STATUS_PORT}")
 
+    # ← NOVO: velocidade de locomoção. Só existe em --loco: sem o WBC ativo
+    # o LocoClient não tem o que comandar, e abrir a porta daria a falsa
+    # impressão de que o analógico do VR faria alguma coisa.
+    loco_sock = None
+    loco_client = None
+    if use_loco:
+        try:
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+            loco_client = LocoClient()
+            loco_client.SetTimeout(0.0001)
+            loco_client.Init()
+            loco_sock = ctx.socket(zmq.PULL)
+            loco_sock.bind(f"tcp://0.0.0.0:{LOCOCMD_PORT}")
+            print(f"[Startup] 🏃 Locomoção habilitada — escutando velocidade na porta {LOCOCMD_PORT}.")
+        except Exception as e:
+            loco_client = None
+            loco_sock = None
+            print(f"[Startup] ⚠️  Locomoção DESABILITADA (LocoClient falhou: {e}). O resto segue normal.")
+
     shutdown_event = threading.Event()
 
     t_state = threading.Thread(
@@ -379,10 +471,20 @@ def main():
         daemon=True,
     )
 
+    t_loco = None
+    if loco_sock is not None:
+        t_loco = threading.Thread(
+            target=loco_cmd_loop,
+            args=(loco_sock, loco_client, shutdown_event),
+            daemon=True,
+        )
+
     t_state.start()
     t_handstate.start()
     t_handcmd.start()
     t_status.start()
+    if t_loco is not None:
+        t_loco.start()
 
     print(f"\n[INFO] Servidor ZMQ escutando na porta {LOWCMD_PORT} para comandos de corpo...")
     print(f"[INFO] LeRobot pode conectar. Modo '{active_mode}' será informado na porta {STATUS_PORT}.")
@@ -392,12 +494,21 @@ def main():
     except KeyboardInterrupt:
         print("\nDesligando a bridge...")
     finally:
+        # Parar os pés ANTES de derrubar os sockets: se a bridge cair com uma
+        # velocidade pendente, o robô continua andando sem ninguém escutando.
+        if loco_client is not None:
+            try:
+                loco_client.Move(0.0, 0.0, 0.0, continous_move=False)
+            except Exception:
+                pass
         shutdown_event.set()
         ctx.term()
         t_state.join(timeout=2.0)
         t_handstate.join(timeout=2.0)
         t_handcmd.join(timeout=2.0)
         t_status.join(timeout=2.0)
+        if t_loco is not None:
+            t_loco.join(timeout=2.0)
         print("Finalizado.")
 
 

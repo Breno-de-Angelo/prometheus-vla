@@ -3,6 +3,10 @@
 # Caminho absoluto para a pasta do seu projeto
 PROJECT_DIR=~/prometheus-vla/lerobot-ext/Scripts_Prometheus_int
 
+# Modo do WBC: "true" = High Level/Loco (rt/arm_sdk, WBC da Unitree cuida das pernas)
+#              "false" = Low Level/Debug (rt/lowcmd, robô precisa estar suspenso/apoiado)
+USE_LOCO=true
+
 # 1. Inicializa o Conda usando o ativador exato do seu terminal
 source ~/miniconda3/bin/activate
 
@@ -36,10 +40,16 @@ echo "   [OK] Servidor RealSense ZMQ RIGHT_WRIST (PID: $PID_CAM_RIGHT)"
 # Dá um respiro de 1 segundo para as câmeras inicializarem sem gargalar a USB/CPU
 sleep 1
 
-# 5. Inicia o Servidor da Mão (Dex3) em background (&)
-python $PROJECT_DIR/dex3_g1_server.py &
+# 5. Inicia o Servidor da Mão + Corpo (Dex3 Bridge v2) em background (&)
+if [ "$USE_LOCO" = "true" ]; then
+    python $PROJECT_DIR/dex3_g1_server_v2.py --loco &
+    echo "   [!!] Modo HIGH LEVEL / LOCO — WBC da Unitree assume as pernas"
+else
+    python $PROJECT_DIR/dex3_g1_server_v2.py &
+    echo "   [!!] Modo LOW LEVEL / DEBUG — robô precisa estar suspenso/apoiado"
+fi
 PID_DEX=$!
-echo "   [OK] Servidor Dex3 Bridge (PID: $PID_DEX)"
+echo "   [OK] Servidor Dex3 Bridge v2 (PID: $PID_DEX)"
 
 echo "-------------------------------------------------------"
 echo "🚀 Sistema 100% online! Aguardando conexão do LeRobot."

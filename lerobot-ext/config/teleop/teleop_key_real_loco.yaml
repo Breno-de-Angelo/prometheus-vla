@@ -1,0 +1,41 @@
+# Teleoperação por TECLADO no ROBÔ REAL, em modo HIGH LEVEL/LOCO (WBC ativo).
+#
+# Pré-requisito: no robô, `./init_prometheus-vla.sh` já rodando com
+# USE_LOCO=true (ver o log: "Modo 'loco' será informado na porta 6004").
+#
+# Rodar (SEM --sim — robô real):
+#
+#   cd lerobot-ext
+#   python init_lerobot_teleoparate_v2.py --config_path=config/teleop/teleop_key_real_loco.yaml
+#
+# A janela do pygame ("Controle G1 - clique aqui para focar") precisa estar
+# EM FOCO para o teclado funcionar.
+#
+#   TRONCO   ,  gira p/ esquerda    .  gira p/ direita
+#
+# Ver docs/SCHEMA_G1_V2.md para o mapa de teclas completo e o robot/unitree_g1/
+# unitree_g1_loco.py para o handshake de modo (porta ZMQ 6004).
+
+robot:
+  type: unitree_g1_dex3
+  robot_ip: "192.168.123.164"
+
+  # true → control_mode vira "high_level" sozinho (ver __post_init__ de
+  # UnitreeG1Dex3Config). Precisa bater com o --loco do dex3_g1_server_v2.py
+  # que já está rodando no robô — senão os dois lados esperam tópicos
+  # diferentes (rt/arm_sdk x rt/lowcmd).
+  use_loco: true
+
+  # Yaw do tronco no vetor de ação (28 → 29 dims com as mãos). Ver
+  # docs/SCHEMA_G1_V2.md — roll e pitch da cintura ficam travados.
+  use_waist_yaw: true
+  waist_yaw_limit: 1.0
+
+  # Câmera de pulso direito (right_arm_realsense_server.py, porta 5556).
+  # Deixe false se esse servidor não estiver rodando no robô.
+  use_wrist_camera: true
+
+teleop:
+  type: keyboard_g1_arm
+  waist_speed: 0.01
+  waist_yaw_limit: 1.0

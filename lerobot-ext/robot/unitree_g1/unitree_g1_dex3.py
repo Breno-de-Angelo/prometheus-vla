@@ -110,12 +110,12 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
             self.cameras = {
                 # A NOSSA ÚNICA CÂMERA RGB (HD para o VR e para a IA)
                 "head_camera": ZMQCameraConfig(
-                    server_address=self.robot_ip, port=5555, camera_name="head_camera", width=cam2_width, height=cam2_height, warmup_s=6
+                    server_address=self.robot_ip, port=5555, camera_name="head_camera", width=cam2_width, height=cam2_height, warmup_s=3
                 ),
                 
                 # AS 3 LENTES TÉCNICAS (Baixa Resolução para o processamento ser imediato)
                 "head_camera_depth": ZMQCameraConfig(
-                    server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height, warmup_s=6
+                    server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height, warmup_s=3
                 )
                 ,
                 # ── Câmera de pulso direito ────────────────────────────────
@@ -133,10 +133,10 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
                 **(
                     {
                         "right_wrist_camera": ZMQCameraConfig(
-                            server_address=self.robot_ip, port=5555,
+                            server_address=self.robot_ip, port=5556,
                             camera_name="right_wrist_camera",
                             width=self.wrist_cam_size, height=self.wrist_cam_size,
-                            warmup_s=6,
+                            warmup_s=3,
                         )
                     }
                     if self.use_wrist_camera else {}

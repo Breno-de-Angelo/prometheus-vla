@@ -1,0 +1,207 @@
+# Teleoperação por VR (Vuer) no ROBÔ REAL, modo HIGH LEVEL/LOCO (WBC ativo).
+#
+# Pré-requisito: no robô, `./init_prometheus-vla.sh` já rodando com
+# USE_LOCO=true (ver o log: "Modo 'loco' será informado na porta 6004").
+#
+# Rodar (SEM --sim — robô real):
+#
+#   cd lerobot-ext
+#   python init_lerobot_teleoparate_v2.py --config_path=config/teleop/teleop_vr_real_loco.yaml
+#
+# Depois, no navegador do headset, abre o endereço que o teleop imprime num
+# quadro no terminal — hoje:
+#
+#     https://192.168.68.77:8012?ws=wss://192.168.68.77:8012
+#
+# (192.168.68.77 é o IP DESTE PC, não o do robô; o teleop descobre sozinho.)
+#
+# MAIS FÁCIL: abra o DASHBOARD em http://192.168.68.77:8080 e escaneie o QR
+# code que aparece nele com o leitor do Quest — o QR já contém a URL acima.
+# O dashboard também mostra ao vivo o vídeo que está indo para o headset.
+#
+# NÃO use a linha "Visit: https://vuer.ai?..." que o Vuer imprime: aquele é o
+# cliente hospedado e ele procura o servidor no localhost DO HEADSET.
+# O "?ws=" também não é enfeite — sem ele o cliente monta o websocket como
+# wss://<host> sem porta, cai em 443 e nunca conecta.
+# O certificado é autoassinado: aceite o aviso do navegador, senão o WebXR
+# não abre. Depois toque em "Enter VR" na página.
+#
+# CONTROLES (input_mode: "controller"):
+#
+#   ESQUERDO  X  trava/destrava o robô     Y  encerra
+#   DIREITO   A  salva episódio            B  descarta episódio
+#   TRONCO    analógico DIREITO no eixo X (esquerda/direita) gira o yaw da
+#             cintura — só com o robô DESTRAVADO, igual aos braços.
+#   ANDAR     analógico ESQUERDO — Y frente/trás, X gira o corpo.
+#             Só com o robô DESTRAVADO. NÃO é gravado no dataset.
+#   VISÃO     CLIQUE do analógico direito liga/desliga o painel de pulso.
+#   PARADA    CLIQUE nos DOIS analógicos = damping (robô mole) + trava.
+#
+# Um HUD no alto da visão mostra TRAVADO/LIVRE, REC e a posição do tronco.
+#
+# A visão da câmera de pulso aparece num painel que SEGUE A SUA MÃO DIREITA
+# dentro do VR (ver show_wrist_cam abaixo).
+#
+# ⚠️ O braço ESQUERDO está com kp=0/kd=0 em robot/unitree_g1/config_unitree_g1.py
+# (defeito temporário de hardware): ele fica mole e não obedece. O teleop
+# continua gravando as juntas esquerdas no dataset, mas elas não são
+# executadas — não grave demonstrações "boas" enquanto isso não voltar.
+#
+# ── DIVISÃO DE REDE: Wi-Fi para o VR, CABO para o ZMQ ────────────────────
+#
+#   Wi-Fi (192.168.68.x)  → headset ↔ Vuer, e o dashboard. É onde o Quest
+#                           está; não tem outro jeito de chegar nele.
+#   Cabo  (192.168.123.x) → TODO o ZMQ: câmeras (5555/5556) e a ponte do robô
+#                           (6000-6005). É banda dedicada, sem disputar com o
+#                           vídeo do headset — o que importa na hora de gravar
+#                           dataset, onde perder quadro estraga o episódio.
+#
+# É por isso que os IPs abaixo são 192.168.123.x e o `vuer_host_ip` fica vazio
+# (ele resolve sozinho para o IP da rota padrão, que é o do Wi-Fi).
+#
+# O teleop imprime um mapa da rede no startup e avisa se algo escorregar para
+# a interface errada. Dois erros que ele pega:
+#   • cabo desconectado → o 192.168.123.x cai no gateway padrão e nada chega;
+#   • ZMQ apontado para 192.168.68.71 → funciona, mas divide o Wi-Fi com o
+#     vídeo do headset e derruba o FPS da gravação.
+#
+# IMPORTANTE: `img_server_ip` aqui é o feed que aparece DENTRO do headset (a
+# visão em 1ª pessoa), lido via SensorClient na porta 5555 — é o mesmo
+# full_realsenser_server.py que já está rodando no robô. Sem setar isso
+# explícito, o teleoperator cai no IP padrão da Unitree (192.168.123.164),
+# que não é o deste robô.
+
+robot:
+  type: unitree_g1_dex3
+  robot_ip: "192.168.123.164"
+
+  # true → control_mode vira "high_level" sozinho (ver __post_init__ de
+  # UnitreeG1Dex3Config). Precisa bater com o --loco do dex3_g1_server_v2.py
+  # que já está rodando no robô — senão os dois lados esperam tópicos
+  # diferentes (rt/arm_sdk x rt/lowcmd).
+  use_loco: true
+
+  # Yaw do tronco no vetor de ação (28 → 29 dims com as mãos). Ver
+  # docs/SCHEMA_G1_V2.md — roll e pitch da cintura ficam travados.
+  use_waist_yaw: true
+  waist_yaw_limit: 1.0
+
+  # Câmera de pulso direito (right_arm_realsense_server.py, porta 5556).
+  # Deixe false se esse servidor não estiver rodando no robô.
+  use_wrist_camera: true
+
+teleop:
+  type: xr_g1_arm
+  zmq: true
+  img_server_ip: "192.168.123.164"
+
+  # 'hand': rastreia dedos/mão livre (hand tracking do Quest/Vision Pro).
+  # 'controller': usa os controles físicos do headset.
+  input_mode: "controller"
+
+  # 'immersive': só a câmera do robô. 'ego': pass-through com tela flutuante
+  # da visão do robô. 'pass-through': só o ambiente real, sem câmera do robô.
+  display_mode: "ego"
+
+  # Atuador final — ativa o HandRetargeting certo.
+  ee_type: "dex3"
+
+  # ── Dashboard HTTP ────────────────────────────────────────────────────
+  # Abra http://<ip-deste-pc>:8080 em qualquer navegador da rede (celular
+  # incluído) para ver o mesmo vídeo que vai para o headset, o estado da
+  # teleoperação e um QR CODE com o link do VR — escaneie no Quest em vez de
+  # digitar aquele endereço enorme. O endereço aparece no terminal ao subir.
+  dashboard: true
+  dashboard_port: 8080
+
+  # IP DESTE PC que o headset deve procurar. Vazio = o da rota padrão (Wi-Fi).
+  # Não deixe cair no IP da rota até o robô: com o robô no cabo
+  # (192.168.123.x) esse IP é de uma rede ponto a ponto que o headset, no
+  # Wi-Fi, não alcança. Preencha aqui só se a detecção automática errar.
+  vuer_host_ip: ""
+
+  # ── Andar com o analógico ESQUERDO ────────────────────────────────────
+  # Y = frente/trás, X = gira o corpo inteiro (pivota andando).
+  #
+  # ⚠️ NÃO é gravado no dataset. Move() é comando de VELOCIDADE, não posição
+  # de junta, então não cabe no vetor de ação — o schema fica em 29 dims e os
+  # datasets antigos continuam compatíveis. O preço é que a política nunca
+  # aprende a andar e, pior, ela vê a cena girar sem nada no vetor de ação
+  # explicando o porquê. Ande ENTRE episódios, não no meio de um.
+  #
+  # O DDS fica TODO no robô: daqui sai só um JSON por ZMQ para a porta 6005
+  # da ponte, e quem chama o LocoClient é o dex3_g1_server_v2.py lá dentro.
+  #
+  # PRÉ-REQUISITO: o servidor no robô precisa estar com a versão nova deste
+  # arquivo (a que abre a porta 6005) e rodando com --loco. Sem isso os
+  # comandos caem no vazio e o robô simplesmente não anda.
+  #
+  # O robô tem watchdog de 0.4 s: se estes comandos pararem de chegar — rede
+  # caiu, teleop travou, você tirou o óculos — ele para os pés sozinho.
+  enable_locomotion: true
+  loco_port: 6005
+  # Vazio = usa o img_server_ip acima (mesmo robô).
+  loco_ip: ""
+  loco_max_speed: 0.3   # m/s — teto do Unitree, subir daqui é pedir queda
+  loco_max_yaw: 0.5     # rad/s
+  loco_deadzone: 0.2
+
+  # ── Tamanho da janela da câmera da cabeça ─────────────────────────────
+  # O que pesa na visão é o ÂNGULO, ou seja size/distance — não o size
+  # sozinho. O padrão do televuer no modo "ego" era 0.75/2.0 (≈21° de altura,
+  # grande demais); 0.5/2.0 dá ≈14°, tamanho de monitor. Para diminuir mais,
+  # baixe head_cam_size ou aumente head_cam_distance.
+  head_cam_size: 1.0
+  head_cam_distance: 1.5
+
+  # HUD sobre a visão da cabeça: TRAVADO/LIVRE, REC, painel de pulso e a
+  # posição do tronco. Só aparece no headset — não entra no dataset.
+  show_hud: true
+
+  # ── Câmera de pulso dentro do headset ─────────────────────────────────
+  # Painel extra que segue a SUA mão no VR: olhe para a própria mão e você vê
+  # o que a câmera do pulso direito do robô está vendo. Precisa do
+  # right_arm_realsense_server.py rodando no robô (porta 5556) — sem ele o
+  # painel não aparece e o resto continua funcionando.
+  show_wrist_cam: true
+  wrist_img_port: 5556
+  wrist_cam_name: "right_wrist_camera"
+  wrist_cam_side: "right"
+  # Altura do painel em metros. Pequeno de propósito: com a mão a ~0.5 m, 0.10
+  # dá ≈11° — um retrovisor ao lado da janela da cabeça (≈14°), não uma
+  # segunda tela competindo com ela.
+  wrist_cam_size: 0.10
+  # Deslocamento em relação à mão, no referencial da cabeça (x, y, z).
+  # -y desce: ACIMA da mão o painel caía bem em cima da janela da cabeça, que
+  # é centralizada. Abaixo dela ele fica fora do caminho.
+  wrist_cam_offset: [0.0, -0.14, 0.0]
+
+  # ── Yaw do tronco pelo analógico direito ──────────────────────────────
+  # Mesmos números do teleop_key_real_loco.yaml, para uma demo gravada no VR
+  # e outra gravada no teclado ficarem parecidas no dataset.
+  waist_speed: 0.01
+  waist_yaw_limit: 1.0
+  # Zona morta: aumente se o tronco derivar sozinho com o analógico solto.
+  waist_deadzone: 0.15
+  # Vire para true se o tronco girar para o lado contrário ao do analógico.
+  waist_invert: false
+
+  # ── Âncora de guinada dos braços ──────────────────────────────────────
+  # O televuer entrega o alvo do pulso como (mão − cabeça) com a ORIENTAÇÃO
+  # DO MUNDO. Como sua mão vive ~40 cm à frente do peito, esse vetor gira
+  # junto com você: vire 180° e o alvo, que apontava para a frente do robô,
+  # passa a apontar para trás. Com isto ligado a guinada da cabeça é
+  # descontada antes do IK — "mão à minha frente" vira "mão à frente do
+  # robô", olhando para onde for.
+  head_yaw_lock: true
+  # Constante de tempo (s) da âncora. É o que separa olhada de pescoço de
+  # giro de corpo, e é um COMPROMISSO — não existe valor que zere os dois
+  # (a cabeça sozinha não distingue um do outro). Medido, mão a 40 cm:
+  #   0.8 → olhada de 0.3 s a 90° arrasta o braço 19 cm; giro de 180° pronto
+  #         em 3 s.
+  #   2.0 → mesma olhada arrasta 9 cm; giro de 180° ainda com 40° de erro aos
+  #         3 s, 9° aos 6 s.
+  #   5.0 → olhada arrasta 4 cm, mas o giro de 180° leva ~15 s.
+  # SUBA se o que incomoda é o braço andar quando você olha para o lado;
+  # DESÇA se o que incomoda é ele demorar a reorientar quando você gira.
+  head_yaw_lock_tau: 2.0

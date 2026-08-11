@@ -373,7 +373,11 @@ class KeyboardG1Arm(Teleoperator):
         # Integra para POSIÇÃO, não velocidade: o dataset guarda posições de
         # junta e o modelo prevê posições — mapear a tecla direto para velocidade
         # gravaria um alvo que não corresponde ao que foi executado.
-        waist_dir = keys[pygame.K_PERIOD] - keys[pygame.K_COMMA]
+        #
+        # SINAL: kWaistYaw positivo gira o tronco para a ESQUERDA (convenção do
+        # URDF, confirmada no robô real). Por isso a vírgula é que soma — estava
+        # invertido e as teclas faziam o oposto do que o mapa acima promete.
+        waist_dir = keys[pygame.K_COMMA] - keys[pygame.K_PERIOD]
         if waist_dir:
             alvo = self.body_joints["kWaistYaw.q"] + waist_dir * self.config.waist_speed
             lim = self.config.waist_yaw_limit
