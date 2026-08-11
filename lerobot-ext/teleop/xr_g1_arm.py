@@ -343,6 +343,14 @@ class XRG1Arm(Teleoperator):
         braços, mãos e tronco.
         """
         if not self.config.enable_locomotion:
+            # Avisa alto: durante a gravação o analógico esquerdo fica inerte de
+            # propósito, e sem esta linha isso é indistinguível de controle
+            # quebrado — já custou depuração antes.
+            logger.info(
+                "Locomoção DESLIGADA por config (enable_locomotion: false) — "
+                "analógico esquerdo inerte. Posicione o robô ANTES, com o "
+                "config/teleop/teleop_vr_real_loco.yaml."
+            )
             return
         try:
             ctx = zmq.Context.instance()

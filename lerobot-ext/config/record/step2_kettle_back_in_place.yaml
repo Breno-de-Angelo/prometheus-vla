@@ -1,0 +1,137 @@
+# ETAPA 2 do café: COLOCAR A CHALEIRA NO LUGAR.
+#
+# Gravação de dataset no ROBÔ REAL, por VR (Vuer), modo HIGH LEVEL/LOCO.
+# Mesmo robô e mesmo teleop do config/teleop/teleop_vr_real_loco.yaml — o que
+# muda aqui é o bloco `dataset` e, principalmente, os PÉS TRAVADOS (ver
+# enable_locomotion lá embaixo).
+#
+# Pré-requisito: no robô, `./init_prometheus-vla.sh` rodando com USE_LOCO=true
+# (o log tem que dizer "Modo 'loco' será informado na porta 6004").
+#
+# Rodar (SEM --sim — robô real):
+#
+#   cd lerobot-ext
+#   python init_lerobot_record_v2.py --config_path=config/record/step2_kettle_back_in_place.yaml
+#
+# Depois abra o DASHBOARD em http://<ip-deste-pc>:8080 e escaneie o QR code
+# com o Quest. Aceite o aviso de certificado e toque em "Enter VR".
+#
+# CONTROLES DURANTE A GRAVAÇÃO:
+#
+#   ESQUERDO  X  trava/destrava o robô     Y  encerra a sessão
+#   DIREITO   A  SALVA o episódio          B  DESCARTA e regrava o episódio
+#   TRONCO    analógico DIREITO no eixo X gira o yaw da cintura.
+#   ANDAR     DESLIGADO nesta config (analógico esquerdo não faz nada).
+#   VISÃO     CLIQUE do analógico direito liga/desliga o painel de pulso.
+#   PARADA    CLIQUE nos DOIS analógicos = damping (robô mole) + trava.
+#
+# Também dá para salvar/descartar pela VOZ ("pausar", "continuar", "sair") e
+# pelas setas do teclado — ver init_lerobot_record_v2.py.
+#
+# ⚠️ O braço ESQUERDO está com kp=0/kd=0 em robot/unitree_g1/config_unitree_g1.py
+# (defeito temporário de hardware): fica mole e não obedece. As juntas
+# esquerdas continuam entrando no dataset sem terem sido executadas — não
+# grave demonstração "boa" enquanto isso não voltar.
+
+robot:
+  type: unitree_g1_dex3
+  robot_ip: "192.168.123.164"
+
+  # Precisa BATER com o --loco do dex3_g1_server_v2.py que está rodando no
+  # robô, senão os dois lados falam tópicos diferentes (rt/arm_sdk x rt/lowcmd).
+  # NÃO confundir com `enable_locomotion` do teleop: este aqui é o MODO DE
+  # CONTROLE (WBC ligado, braços por arm_sdk); aquele é só quem pode mandar o
+  # robô ANDAR. Aqui: modo loco ligado, pés travados.
+  # control_mode não vai aqui de propósito: o __post_init__ o deriva de use_loco.
+  use_loco: true
+
+  # Yaw do tronco entra no vetor de ação (28 → 29 dims com as mãos).
+  # Ver docs/SCHEMA_G1_V2.md — roll e pitch da cintura ficam travados.
+  use_waist_yaw: true
+  waist_yaw_limit: 1.0
+
+  # Câmera do pulso direito (right_arm_realsense_server.py, porta 5556).
+  # false se esse servidor não estiver rodando — senão a gravação trava
+  # esperando um feed que não vem.
+  use_wrist_camera: true
+
+teleop:
+  type: xr_g1_arm
+  zmq: true
+  img_server_ip: "192.168.123.164"
+  input_mode: "controller"
+  display_mode: "ego"
+  ee_type: "dex3"
+
+  # ── 🚫 ANDAR DESLIGADO — a razão de existir desta config ──────────────
+  # Locomoção é comando de VELOCIDADE, não posição de junta: não cabe no vetor
+  # de ação e por isso NÃO É GRAVADA. Andar no meio de um episódio envenena o
+  # dataset — a política vê a cena inteira girar e translada, e não tem uma
+  # única coluna no vetor de ação explicando por quê. Ela então aprende a
+  # associar o movimento da cena a QUALQUER coisa que os braços estivessem
+  # fazendo naquele instante, que é ruído puro.
+  #
+  # Com false o socket da porta 6005 nem é aberto e o analógico esquerdo fica
+  # inerte: não dá para escorregar e andar sem perceber no meio da tomada.
+  # Posicione o robô ANTES, com o config/teleop/teleop_vr_real_loco.yaml, e só
+  # então suba esta gravação.
+  enable_locomotion: false
+
+  # ── Dashboard HTTP (QR code do link do VR + vídeo ao vivo) ────────────
+  dashboard: true
+  dashboard_port: 8080
+
+  # Vazio = IP da rota padrão (Wi-Fi). Preencha só se a detecção errar.
+  vuer_host_ip: ""
+
+  head_cam_size: 1.0
+  head_cam_distance: 1.5
+  show_hud: true
+
+  show_wrist_cam: true
+  wrist_img_port: 5556
+  wrist_cam_name: "right_wrist_camera"
+  wrist_cam_side: "right"
+  wrist_cam_size: 0.10
+  wrist_cam_offset: [0.0, -0.14, 0.0]
+
+  # Yaw do tronco pelo analógico direito. Mesmos números do teclado, para uma
+  # demo gravada no VR e outra no teclado ficarem parecidas no dataset.
+  waist_speed: 0.01
+  waist_yaw_limit: 1.0
+  waist_deadzone: 0.15
+  waist_invert: false
+
+  # Âncora de guinada dos braços: sem isso o alvo do pulso gira junto com o
+  # seu corpo e a 180° o braço aponta para trás do robô. Ver os números do
+  # compromisso em config/teleop/teleop_vr_real_loco.yaml.
+  head_yaw_lock: true
+  head_yaw_lock_tau: 2.0
+
+dataset:
+  # A data no nome é de propósito: evita continuar sem querer um dataset de
+  # outra sessão (iluminação, posição da mesa e altura do robô mudam).
+  repo_id: Mrwlker/kettle_back_in_place_2026-08-11
+  root: "meu_dataset/kettle_back_in_place_2026-08-11"
+  push_to_hub: true
+
+  # Instrução que a política vai ler. Curta, imperativa e sempre a mesma
+  # dentro do dataset — é ela que a VLA condiciona.
+  single_task: "put the kettle back in its place"
+
+  fps: 30
+  num_episodes: 50
+  # Teto por episódio, não duração fixa: aperte A assim que terminar a tomada.
+  # 40 s é folga para pegar a chaleira e assentá-la; se estourar, o episódio
+  # corta no meio e vira exemplo ruim. A chaleira é mais pesada e pede
+  # aproximação mais devagar que a xícara — se 40 s ficar apertado, suba.
+  episode_time_s: 40
+  # Tempo para você devolver a chaleira à posição inicial entre episódios.
+  reset_time_s: 20
+
+  # h264 e não o libsvtav1 padrão: AV1 come CPU demais nesta máquina e derruba
+  # o FPS da gravação. O hack de profundidade em init_lerobot_record_v2.py
+  # também assume h264.
+  vcodec: "h264"
+
+play_sounds: false
