@@ -13,7 +13,17 @@
 #
 # `opencv-python-headless` e NUNCA `opencv-python`: os dois instalam o mesmo módulo cv2
 # (§2.1). O requirements.txt do unitree-g1-mujoco pede o não-headless — não use aquele
-# arquivo direto.
+# arquivo direto. O unitree_sdk2py pede o não-headless no install_requires: instale com
+# --no-deps (§2.10).
+#
+# `cyclonedds` é 11.0.1 e não o 0.10.2 que o unitree_sdk2py pina — aquele não tem wheel
+# para py3.12 e nem chega a instalar (§2.10).
+#
+# O pinocchio e o casadi NÃO estão neste arquivo: vêm do conda-forge, e o pip nem os
+# enxerga. Reinstalar só a partir daqui deixa o IK sem os bindings (§2.11):
+#   conda install -y -c conda-forge --override-channels pinocchio casadi
+# (as linhas `libpinocchio`/`coal`/`eigenpy` abaixo são restos vindos do PyPI por
+# dependência transitiva, não o que o IK usa.)
 absl-py==2.5.0
 aiohappyeyeballs==2.7.1
 aiohttp==3.10.5
@@ -52,7 +62,7 @@ cuda-bindings==12.9.4
 cuda-pathfinder==1.2.2
 cuda-toolkit==12.8.1
 cycler==0.12.1
-cyclonedds==0.10.2
+cyclonedds==11.0.1
 datasets==4.8.5
 deepdiff==8.6.2
 dill==0.4.1

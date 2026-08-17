@@ -54,45 +54,61 @@ pip install --index-url https://download.pytorch.org/whl/cu128 \
     "torch>=2.7,<2.12" "torchvision>=0.22.0,<0.27.0"
 
 # ── 4. SDK da Unitree (não vem pelos extras do lerobot) ─────────────────────
-pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
+#    O --no-deps é obrigatório: o install_requires do SDK pede cyclonedds==0.10.2
+#    (sem wheel para py3.12 — o pip tenta compilar e para em "Could not locate
+#    cyclonedds") e opencv-python não-headless (§2.1). Ver §2.10.
+pip install "cyclonedds==11.0.1"
+pip install --no-deps -e ./unitree_sdk2_python
 
 # ── 5. lerobot (nosso fork) com os extras ───────────────────────────────────
 pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]"
 
-# ── 6. os dois forks vendorizados, editable e por último ────────────────────
+# ── 6. os dois forks vendorizados, editable ─────────────────────────────────
 #    O PyPI tem pacotes com estes nomes, mas NÃO servem — ver §2.7 e §4.4.
 pip uninstall -y televuer dex_retargeting
 pip install -e ./lerobot-ext/teleop/televuer
 pip install -e ./lerobot-ext/teleop/robot_control/dex-retargeting
 
-# ── 7. resto ────────────────────────────────────────────────────────────────
+# ── 7. pinocchio + casadi: única exceção à regra "pacotes só de pip" ────────
+#    TEM que vir depois do passo 6: o dex_retargeting puxa o `pin` do PyPI, que
+#    escreve no MESMO site-packages/pinocchio/ e apaga os bindings de casadi que
+#    o IK usa. Quem roda por último ganha. Ver §2.11.
+conda install -y -c conda-forge --override-channels pinocchio casadi
+conda env config vars set -n prometheus-vla OMP_NUM_THREADS=1   # §2.11
+
+# ── 8. resto ────────────────────────────────────────────────────────────────
 pip install flask pytest
 pip install "transformers>=5.4.0,<5.6.0"   # só se algum passo trouxe fora do range
 
-# ── 8. opcional: simulação MuJoCo ───────────────────────────────────────────
+# ── 9. opcional: simulação MuJoCo ───────────────────────────────────────────
 #    NÃO use unitree-g1-mujoco/requirements.txt: ele pede opencv-python
 #    (não-headless) e reintroduz o conflito de dois cv2 do §2.1.
 pip install mujoco loguru msgpack msgpack-numpy matplotlib
 
-# ── 9. conferir ─────────────────────────────────────────────────────────────
+# ── 10. conferir ────────────────────────────────────────────────────────────
+conda activate prometheus-vla                    # recarrega OMP_NUM_THREADS=1
 cd lerobot-ext && python -m pytest tests/ -q     # esperado: 12 passed
 ```
 
 Depois disso, a verificação completa (versões, forks certos, IK, retargeting) está no
 §5 — vale rodar na primeira instalação.
 
-### Três coisas que mordem, e onde estão explicadas
+### Coisas que mordem, e onde estão explicadas
 
 | Sintoma | Causa | Onde |
 |---|---|---|
+| `Could not locate cyclonedds. Try to set CYCLONEDDS_HOME` | SDK da Unitree instalado sem `--no-deps`, puxando `cyclonedds==0.10.2` | §2.10 |
+| `ModuleNotFoundError: pinocchio` (ou `pinocchio.casadi`) | pinocchio/casadi não vêm de pip nem de extra nenhum | §2.11 |
+| IK a ~83 ms por chamada, teleop travando | `OMP_NUM_THREADS` não é 1 | §2.11 |
 | `dex_retargeting is required` / dedos parados | veio a 0.5.0 do PyPI em vez do fork 0.4.7 | §2.7 |
 | `Retargeting type must be one of [...]` | cwd errado — rode de `lerobot-ext/` | §5.1 |
 | vuer reclamando de `aiohttp` | mentira; é o `params-proto` 3.x | §2.2 |
 
-> **Numa máquina nova**, o passo 1 só funciona depois que a branch
-> `prometheus-vla/v0.6.1` do submódulo tiver sido enviada para o fork
-> (`git push origin prometheus-vla/v0.6.1` de dentro de `lerobot/`). Hoje ela existe
-> apenas localmente.
+> **Numa máquina nova**, o passo 1 depende da branch `prometheus-vla/v0.6.1` existir no
+> fork — ela **já foi enviada**, então `git submodule update --init --recursive` resolve
+> sozinho. Só é preciso ter o `git-lfs` instalado **antes** do clone: a branch carrega
+> objetos LFS (os meshes) e, sem ele, você baixa ponteiros de texto no lugar dos
+> arquivos.
 
 ---
 
@@ -361,6 +377,105 @@ Duas mudanças em `src/lerobot/cameras/zmq/camera_zmq.py`:
 Efeito colateral mensurável: a suíte de testes caiu de ~22 s para ~11 s, porque o
 encerramento de cada câmera deixou de esperar o timeout inteiro.
 
+### 2.10 `unitree_sdk2py`: instalar com `--no-deps` e o cyclonedds à parte
+
+O `setup.py` do SDK da Unitree declara três dependências, e **duas delas quebram o env**:
+
+```python
+install_requires=["cyclonedds==0.10.2", "numpy", "opencv-python"]
+```
+
+- **`cyclonedds==0.10.2`** não tem wheel para o py3.12. O pip cai no sdist, que tenta
+  compilar contra uma instalação nativa do Cyclone DDS e para com:
+
+  ```
+  Could not locate cyclonedds. Try to set CYCLONEDDS_HOME or CMAKE_PREFIX_PATH
+  ERROR: Failed to build 'cyclonedds' when getting requirements to build wheel
+  ```
+
+  Isso interrompe a instalação inteira — foi o que travou a primeira máquina nova. O
+  **11.0.1 tem wheel** para py3.12 e é a versão do env validado.
+- **`opencv-python`** é o não-headless, e instala o mesmo módulo `cv2` do
+  `opencv-python-headless` de que o lerobot depende: dois binários disputando o mesmo
+  import, resolvido por ordem de instalação (§2.1). Esta é a via mais comum de o
+  problema do §2.1 voltar depois de resolvido.
+- `numpy` é inofensiva, e já vem pelo torch/lerobot.
+
+Como nenhuma das três precisa vir daqui, a instalação correta é:
+
+```bash
+pip install "cyclonedds==11.0.1"
+pip install --no-deps -e ./unitree_sdk2_python
+```
+
+O `-e ./unitree_sdk2_python` (submódulo) em vez de
+`git+https://github.com/unitreerobotics/unitree_sdk2_python.git`: o upstream avança
+sozinho, e o SHA que testamos é o que está registrado no submódulo. O `install.sh` fazia
+o clone direto do GitHub até isto ser corrigido.
+
+O passo 9 do §5 confere as duas coisas — falha se o `cyclonedds` não importar e falha se
+`opencv-python` reaparecer ao lado do headless.
+
+### 2.11 pinocchio + casadi vêm do conda-forge, e o IK exige `OMP_NUM_THREADS=1`
+
+**Nenhum extra do lerobot instala o pinocchio**, e nem o §0 instalava até agora — no
+ambiente original ele tinha sido posto à mão e ninguém notou a falta. Numa máquina nova
+o IK simplesmente não importa.
+
+Não adianta `pip install pin`: o pacote do PyPI **não traz os bindings de casadi**, e
+`teleop/robot_control/robot_arm_ik.py` monta o problema de otimização em
+`pinocchio.casadi`. É a única exceção à regra "o conda entra só pelo interpretador":
+
+```bash
+conda install -y -c conda-forge --override-channels pinocchio casadi
+```
+
+Isso traz também o `ipopt` (o solver do IK), o `coal` e o `eigenpy`. Versões do env
+validado: `pinocchio` 4.1.0, `casadi` 3.7.2, `ipopt` 3.14.19.
+
+#### A ordem é o que faz isso funcionar — este passo vem por ÚLTIMO
+
+O `dex_retargeting` 0.4.7 declara `pin>=2.7.0`, e o `pin` do PyPI instala no **mesmo
+diretório** que o pacote do conda: `site-packages/pinocchio/`. Os dois têm nomes de
+distribuição diferentes (`pin` × `pinocchio`), então **nenhum dos dois gerenciadores
+enxerga o outro** — não há conflito reportado, aviso, nada. Quem escreve por último
+vence, em silêncio.
+
+| Ordem | Resultado |
+|---|---|
+| conda → pip (`dex_retargeting`) | o `pin` sobrescreve, `pinocchio.casadi` some, IK morre |
+| pip (`dex_retargeting`) → conda | o dist-info do `pin` fica satisfazendo o requisito, os arquivos são os do conda, com casadi ✅ |
+
+A segunda linha é o que o env validado tem, e é por isso que o passo 7 do §0 vem depois
+do 6. Se você reinstalar o `dex_retargeting` sozinho mais tarde, **rode o `conda
+install` de novo em seguida**.
+
+Sintoma de ter invertido: `pinocchio` importa normalmente, com versão plausível, e só
+`import pinocchio.casadi` falha. O passo 10 do §0 pega isso; um `import pinocchio` solto,
+não.
+
+**Segundo motivo da ordem**: o conda substitui o `numpy` do pip pelo build de
+conda-forge. Depois do lerobot, quem fixa a versão (2.2.6) é o lerobot e o conda só troca
+o build. Antes dele, o resolver do conda escolhe a versão sozinho.
+
+#### `OMP_NUM_THREADS=1` não é ajuste fino, é requisito
+
+O `ipopt` do conda-forge vem multithread. Sem limitar, cada chamada de
+`G1_29_ArmIK.solve_ik` custa **~83 ms** em vez de **~0,8 ms** — cem vezes mais — e o FPS
+da teleoperação afunda. O overhead é de coordenação entre threads: o problema é pequeno
+demais para se beneficiar delas.
+
+Grave no env, para valer em toda sessão e não só naquela em que você lembrou:
+
+```bash
+conda env config vars set -n prometheus-vla OMP_NUM_THREADS=1
+conda activate prometheus-vla   # só passa a valer na próxima ativação
+```
+
+O `install.sh` grava a variável e avisa (sem falhar) se ela não estiver valendo na
+sessão da verificação — o que é esperado logo após a instalação, já que o env ainda não
+foi reativado.
+
 ---
 
 ## 3. O rebase do fork sobre a v0.6.1 — **já feito**
@@ -456,10 +571,13 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ### 4.2 Unitree SDK
 
-Não vem pelos extras do LeRobot (está comentado no upstream):
+Não vem pelos extras do LeRobot (está comentado no upstream). Do submódulo, com
+`--no-deps`, e com o cyclonedds instalado à parte — o porquê das duas coisas está no
+§2.10:
 
 ```bash
-pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
+pip install "cyclonedds==11.0.1"
+pip install --no-deps -e ./unitree_sdk2_python
 ```
 
 ### 4.3 LeRobot (fork rebaseado) com os extras

@@ -44,7 +44,7 @@ cd "$RAIZ"
 
 if [[ $SO_VERIFICAR -eq 0 ]]; then
     # ── 1. Submódulos ────────────────────────────────────────────────────────
-    passo "1/9  submódulos"
+    passo "1/10  submódulos"
     git submodule update --init --recursive
 
     # O submódulo vem no SHA registrado, em detached HEAD. A branch é nossa e precisa
@@ -61,7 +61,7 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
     echo "lerobot em $(git -C lerobot rev-parse --short HEAD) ($BRANCH_LEROBOT)"
 
     # ── 2. Interpretador ─────────────────────────────────────────────────────
-    passo "2/9  env conda '$ENV_NOME' (Python 3.12)"
+    passo "2/10  env conda '$ENV_NOME' (Python 3.12)"
     if conda env list | awk '{print $1}' | grep -qx "$ENV_NOME"; then
         echo "já existe — reaproveitando."
     else
@@ -70,12 +70,13 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
         conda create -n "$ENV_NOME" python=3.12 -y -c conda-forge --override-channels
     fi
     conda activate "$ENV_NOME"
-    # O conda entra só pelo interpretador; os pacotes vêm todos de pip, para não
-    # misturar dois resolvers no mesmo ambiente.
+    # O conda entra pelo interpretador e mais nada, para não misturar dois resolvers no
+    # mesmo ambiente. A única exceção é o pinocchio/casadi do passo 7, que não tem
+    # equivalente em wheel.
     echo "python: $(python -V) em $(which python)"
 
     # ── 3. torch ANTES de tudo ───────────────────────────────────────────────
-    passo "3/9  torch + torchvision (índice cu128)"
+    passo "3/10  torch + torchvision (índice cu128)"
     # A RTX 5070 é Blackwell (sm_120) e precisa de CUDA 12.8+. Se o torch vier depois,
     # como dependência transitiva, o resolver escolhe um wheel CPU ou cu126 e a GPU
     # some sem aviso nenhum — o import continua funcionando igual.
@@ -83,21 +84,34 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
         "torch>=2.7,<2.12" "torchvision>=0.22.0,<0.27.0"
 
     # ── 4. SDK da Unitree ────────────────────────────────────────────────────
-    passo "4/9  unitree_sdk2py"
+    passo "4/10  cyclonedds + unitree_sdk2py"
     # Fica comentado no pyproject do lerobot upstream ("requires specific installation
     # instructions"), então não vem por extra nenhum.
-    if python -c "import unitree_sdk2py" >/dev/null 2>&1; then
-        echo "já instalado."
-    else
-        pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
-    fi
+    #
+    # O install_requires do SDK tem DUAS armadilhas, e as duas são desarmadas pelo
+    # --no-deps abaixo:
+    #
+    #  - `cyclonedds==0.10.2`: não existe wheel dessa versão para o py3.12, então o pip
+    #    cai no sdist, tenta compilar e para em "Could not locate cyclonedds. Try to set
+    #    CYCLONEDDS_HOME". O 11.0.1 tem wheel e é o que o env validado usa — por isso ele
+    #    entra ANTES, e o --no-deps é o que impede o pip de reverter para o 0.10.2.
+    #  - `opencv-python` (não-headless): instala o MESMO módulo cv2 do
+    #    opencv-python-headless de que o lerobot depende, e os dois binários brigam pelo
+    #    mesmo import (§2.1).
+    #
+    # `numpy`, a terceira dependência, já vem pelo torch/lerobot.
+    #
+    # E vem do submódulo (editable), não do git+https: o upstream avança sozinho e o
+    # SHA que testamos é o registrado no submódulo.
+    pip install "cyclonedds==11.0.1"
+    pip install --no-deps -e ./unitree_sdk2_python
 
     # ── 5. lerobot ───────────────────────────────────────────────────────────
-    passo "5/9  lerobot (fork) + extras"
+    passo "5/10  lerobot (fork) + extras"
     pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]"
 
     # ── 6. Forks vendorizados ────────────────────────────────────────────────
-    passo "6/9  televuer e dex_retargeting (forks do repo, editable)"
+    passo "6/10  televuer e dex_retargeting (forks do repo, editable)"
     # Os dois existem no PyPI com estes nomes e NENHUM dos dois serve:
     #  - o televuer de upstream tem a MESMA versão (4.0.0) com conteúdo diferente, e o
     #    teleop quebra com "unexpected keyword argument 'wrist_cam'";
@@ -108,21 +122,49 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
     pip install -e ./lerobot-ext/teleop/televuer
     pip install -e ./lerobot-ext/teleop/robot_control/dex-retargeting
 
-    # ── 7. Resto ─────────────────────────────────────────────────────────────
-    passo "7/9  flask, pytest, transformers no range"
+    # ── 7. Cinemática: pinocchio + casadi ────────────────────────────────────
+    passo "7/10  pinocchio + casadi (conda-forge)"
+    # Estes NÃO vêm de pip: o `pin` do PyPI não traz os bindings de casadi, e o IK do
+    # G1 (teleop/robot_control/robot_arm_ik.py) monta o problema em `pinocchio.casadi`.
+    # É a única exceção à regra "pacotes só de pip" do passo 2 — não tem wheel
+    # equivalente. Vem junto o ipopt, que é o solver que o IK usa.
+    #
+    # A POSIÇÃO DESTE PASSO É O PONTO DELICADO, por dois motivos:
+    #
+    #  - o `pin` do PyPI (dependência do dex_retargeting, passo 6) e o `pinocchio` do
+    #    conda-forge instalam no MESMO diretório, site-packages/pinocchio/. Não há
+    #    conflito declarado — os nomes de distribuição são diferentes, então nenhum dos
+    #    dois gerenciadores vê o outro — e quem sobrescreve é simplesmente quem roda por
+    #    último. Rodando o conda DEPOIS, o dist-info do `pin` continua lá satisfazendo o
+    #    requisito do dex_retargeting, e os arquivos são os do conda, com os bindings de
+    #    casadi. Invertido, o pip apaga os bindings e o IK morre com
+    #    `ModuleNotFoundError: pinocchio.casadi`;
+    #  - o conda substitui o numpy do pip pelo build de conda-forge da MESMA versão
+    #    (2.2.6). Depois do lerobot, é o lerobot que fixa a versão e o conda só troca o
+    #    build; antes dele, o resolver do conda escolhe sozinho.
+    conda install -y -c conda-forge --override-channels pinocchio casadi
+
+    # O ipopt do conda-forge é multithread e, sem limitar, cada chamada de IK gasta
+    # ~83 ms em vez de ~0,8 ms — o FPS da teleop afunda. Gravado no env para valer em
+    # toda sessão, não só nesta.
+    conda env config vars set -n "$ENV_NOME" OMP_NUM_THREADS=1 >/dev/null
+    export OMP_NUM_THREADS=1
+
+    # ── 8. Resto ─────────────────────────────────────────────────────────────
+    passo "8/10  flask, pytest, transformers no range"
     pip install flask pytest
     # A 0.6.1 exige >=5.4,<5.6; o env antigo tinha 5.6.1, fora do range.
     pip install "transformers>=5.4.0,<5.6.0"
 
-    # ── 8. MuJoCo (opcional) ─────────────────────────────────────────────────
+    # ── 9. MuJoCo (opcional) ─────────────────────────────────────────────────
     if [[ $COM_MUJOCO -eq 1 ]]; then
-        passo "8/9  mujoco (simulação)"
+        passo "9/10  mujoco (simulação)"
         # NÃO instale unitree-g1-mujoco/requirements.txt: ele pede opencv-python
         # (não-headless), que instala o MESMO módulo cv2 do opencv-python-headless de
         # que o lerobot depende — dois binários brigando pelo mesmo import.
         pip install mujoco loguru msgpack msgpack-numpy matplotlib
     else
-        passo "8/9  mujoco — pulado (--sem-mujoco)"
+        passo "9/10  mujoco — pulado (--sem-mujoco)"
     fi
 else
     passo "modo --so-verificar: nada será instalado"
@@ -130,8 +172,8 @@ else
     echo "env ativo: $CONDA_DEFAULT_ENV"
 fi
 
-# ── 9. Verificação ───────────────────────────────────────────────────────────
-passo "9/9  verificação"
+# ── 10. Verificação ──────────────────────────────────────────────────────────
+passo "10/10  verificação"
 
 cd "$RAIZ"
 python - <<'PYCHECK'
@@ -148,6 +190,37 @@ print(f"  torch        {torch.__version__}  cuda={torch.version.cuda} disponivel
 
 if not torch.cuda.is_available():
     print("  AVISO: torch sem CUDA. Numa máquina com GPU isso é wheel errado (§4.1).")
+
+# O IK do G1 monta o problema em `pinocchio.casadi`. O `pin` de pip não traz esse
+# submódulo, então importar o pinocchio sozinho não prova nada — tem que ser este.
+try:
+    import pinocchio, casadi
+    import pinocchio.casadi  # noqa: F401
+    print(f"  pinocchio    {pinocchio.__version__} (+casadi {casadi.__version__})")
+except ImportError as e:
+    falhas.append(
+        f"pinocchio/casadi: {e}. Se o pinocchio importa mas `pinocchio.casadi` não, o "
+        "`pin` do PyPI (dep do dex_retargeting) sobrescreveu o do conda — reinstale "
+        "DEPOIS dele: `conda install -c conda-forge pinocchio casadi` (passo 7).")
+
+# O 0.10.2 que o setup.py do unitree_sdk2py pede não tem wheel para py3.12 e nem
+# chega a instalar; se importou, veio o wheel certo.
+try:
+    import cyclonedds  # noqa: F401
+    from importlib.metadata import version
+    print(f"  cyclonedds   {version('cyclonedds')}   (esperado 11.x)")
+except Exception as e:
+    falhas.append(f"cyclonedds: {e}. Use `pip install cyclonedds==11.0.1` (passo 4).")
+
+# opencv-python e opencv-python-headless instalam o MESMO módulo cv2; ter os dois é
+# não-determinístico (§2.1). O SDK da Unitree puxa o não-headless se instalado sem
+# --no-deps, que é justamente como isso costuma entrar.
+from importlib.metadata import distributions
+_cv = sorted(d.metadata["Name"] for d in distributions()
+             if (d.metadata["Name"] or "").startswith("opencv"))
+if "opencv-python" in _cv:
+    falhas.append(f"opencv duplicado: {_cv}. Só opencv-python-headless — "
+                  "`pip uninstall -y opencv-python` (§2.1).")
 
 # Os dois forks precisam vir do REPO, não do PyPI. A versão não distingue — só o
 # caminho, e no televuer um parâmetro que só o fork tem.
@@ -182,6 +255,14 @@ for m in modulos:
     except Exception as e:
         falhas.append(f"import {m}: {type(e).__name__}: {e}")
 print(f"  imports      {len(modulos) - len(falhas)}/{len(modulos)}")
+
+# Não é falha: o passo 6 grava a variável no env, e ela só passa a valer no próximo
+# `conda activate`. Nesta sessão o script exporta na mão.
+import os
+if os.environ.get("OMP_NUM_THREADS") != "1":
+    print("  AVISO: OMP_NUM_THREADS != 1. O ipopt do conda-forge é multithread e o IK"
+          " cai de ~0,8 ms para ~83 ms. Reative o env (`conda activate`) antes de rodar"
+          " a teleop.")
 
 if falhas:
     print("\nFALHAS:")
