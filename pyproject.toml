@@ -3,12 +3,28 @@ name = "prometheus-vla"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+# LeRobot 0.6.1 exige >=3.12. O env novo é o `prometheus-vla` (Python 3.12);
+# o antigo (`g1`, Python 3.10 / LeRobot 0.4.4) continua intacto — ver docs/INSTALL.md.
+requires-python = ">=3.12"
 dependencies = [
     "flask>=3.1.2",
-    "lerobot[unitree_g1_dex3,televuer,intelrealsense,pi]",
-    "vuer>=0.1.1",
+    # `dataset` é obrigatório desde a 0.6.1: o `datasets` saiu do core do lerobot e
+    # virou extra. Sem ele, `from lerobot.datasets.lerobot_dataset import LeRobotDataset`
+    # só quebra na hora de rodar.
+    "lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]",
+    # Era `vuer>=0.1.1`, que NUNCA foi satisfeito: o televuer pina `vuer[all]==0.0.60`
+    # e vence a disputa. Mantido no 0.0.60 de propósito — o televuer importa
+    # WebRTCVideoPlane/WebRTCStereoVideoPlane de `vuer.schemas`, que é API dessa versão.
+    "vuer==0.0.60",
 ]
+
+# Três pacotes NÃO entram por aqui e são instalados à mão (ver docs/INSTALL.md §4):
+#   - unitree_sdk2py            : git+https://github.com/unitreerobotics/unitree_sdk2_python
+#   - televuer (nosso fork)     : pip install -e ./lerobot-ext/teleop/televuer
+#   - dex_retargeting 0.4.7     : pip install -e ./lerobot-ext/teleop/robot_control/dex-retargeting
+# O dex_retargeting do PyPI não serve: a 0.5.0 mudou o schema do RetargetingConfig
+# (os três campos `target_link_human_indices_*` viraram um só) e os nossos .yml de
+# mão são do formato antigo. A 0.4.7 é fork vendorizado no repo e não existe no PyPI.
 
 [tool.uv.sources]
 lerobot = { path = "lerobot", editable = true }

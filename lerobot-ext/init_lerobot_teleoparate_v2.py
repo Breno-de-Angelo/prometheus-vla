@@ -4,8 +4,28 @@ Teleoperation Entry Point V2 for Unitree G1 with Dex3 Hands.
 Inclui SISTEMA HANDS-FREE por Voz para Congelar/Destravar o robô.
 """
 
-import sys
 import os
+
+# ── OpenMP com uma thread: precisa vir ANTES de numpy/casadi/pinocchio ────────
+# O ipopt e a BLAS deste ambiente vieram do conda-forge e são multithread. Para o
+# NLP da IK, que tem 14 variáveis e converge em 2 iterações, o custo de abrir e
+# sincronizar threads domina o cálculo inteiro: `solve_ik` media 83 ms com uma
+# variância absurda (6 ms a 170 ms, ao sabor da carga da máquina) contra 0,8 ms
+# estáveis com uma thread só. Medido: o laço de teleoperação sai de 6-8 Hz para
+# ~24 Hz só com esta linha.
+#
+# As estatísticas do ipopt mostram o mesmo `iter_count` nos dois casos e
+# `t_wall_nlp_*` perto de zero — o tempo não está no solver, está na orquestração
+# de threads em volta dele. Por isso `OPENBLAS_NUM_THREADS`/`BLIS_NUM_THREADS`
+# não mudam nada aqui, e só `OMP_NUM_THREADS` resolve.
+#
+# A runtime OpenMP lê isto ao ser carregada, junto com o primeiro import pesado;
+# depois disso, mudar a variável não tem efeito. Daí estar na primeira linha.
+# Respeita quem já tiver definido algo — se você precisa de CPU multithread para
+# alguma etapa, exporte `OMP_NUM_THREADS` antes de chamar o script.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import sys
 import time
 import threading
 
@@ -47,18 +67,24 @@ UnitreeG1Dex3.send_action = patched_send_action
 # =========================================================================
 # 🎤 INJEÇÃO 2: Captura de Eventos de Teclado (Para a voz poder encerrar)
 # =========================================================================
-import lerobot.utils.control_utils
-original_init_keyboard = lerobot.utils.control_utils.init_keyboard_listener
+# Na 0.6.1 o `lerobot.utils.control_utils` deixou de existir: o módulo virou
+# `lerobot.common.control_utils`, e o `init_keyboard_listener` NÃO foi junto — ele mora
+# agora em `lerobot.utils.keyboard_input`. O patch precisa acontecer antes de qualquer
+# `from lerobot.scripts... import`, porque os consumidores ligam o nome no topo do
+# próprio módulo (`from lerobot.utils.keyboard_input import init_keyboard_listener`) e
+# depois disso já não olham mais para cá.
+import lerobot.utils.keyboard_input
+original_init_keyboard = lerobot.utils.keyboard_input.init_keyboard_listener
 
 global_events = None
 
 def patched_init_keyboard():
     global global_events
     listener, events = original_init_keyboard()
-    global_events = events  
+    global_events = events
     return listener, events
 
-lerobot.utils.control_utils.init_keyboard_listener = patched_init_keyboard
+lerobot.utils.keyboard_input.init_keyboard_listener = patched_init_keyboard
 
 # =========================================================================
 # 🎙️ INJEÇÃO 3: Controle de Voz Hands-Free

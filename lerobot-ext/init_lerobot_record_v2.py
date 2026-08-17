@@ -4,6 +4,13 @@ Data Collection Entry Point - HACKER EDITION V9 + VOICE CONTROL
 Corrigindo validação de Tuplas e adicionando controle Hands-Free.
 """
 
+import os
+
+# Ver a nota longa no init_lerobot_teleoparate_v2.py: o ipopt/BLAS multithread do
+# conda-forge faz a IK custar 83 ms em vez de 0,8 ms, e a variável tem que ser
+# definida antes do primeiro import que carregue a runtime OpenMP (numpy já basta).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import sys
 import logging
 import numpy as np
@@ -112,11 +119,15 @@ lerobot.datasets.utils.build_dataset_frame = patched_build_dataset_frame
 # =========================================================================
 # 🎤 INJEÇÃO 4: Comandos de Voz e Teclado (Setas, Pulo Duplo e PAUSE!)
 # =========================================================================
-import lerobot.utils.control_utils
+# Ver a nota do init_lerobot_teleoparate_v2.py: na 0.6.1 o `init_keyboard_listener`
+# migrou de `lerobot.utils.control_utils` para `lerobot.utils.keyboard_input`. Aqui o
+# patch tem efeito de verdade — o `lerobot_record` chama a função —, mas só porque o
+# `from lerobot.scripts.lerobot_record import main` lá embaixo vem DEPOIS desta linha.
+import lerobot.utils.keyboard_input
 import threading
 import time
 
-original_init_keyboard = lerobot.utils.control_utils.init_keyboard_listener
+original_init_keyboard = lerobot.utils.keyboard_input.init_keyboard_listener
 
 global_events = None
 
@@ -126,7 +137,7 @@ def patched_init_keyboard():
     global_events = events  
     return listener, events
 
-lerobot.utils.control_utils.init_keyboard_listener = patched_init_keyboard
+lerobot.utils.keyboard_input.init_keyboard_listener = patched_init_keyboard
 
 # --- ⌨️ NOVO: Listener de Teclado Paralelo (Setas e Espaço) ---
 try:

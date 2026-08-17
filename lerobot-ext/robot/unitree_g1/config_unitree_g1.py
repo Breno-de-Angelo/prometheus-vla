@@ -127,3 +127,20 @@ class UnitreeG1Config(RobotConfig):
 
     # Cameras (ZMQ-based remote cameras)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    # ── Tolerância a engasgo de rede na leitura das câmeras ───────────────
+    # Um soluço de Wi-Fi de alguns centenas de ms fazia `cam.async_read()`
+    # estourar TimeoutError e MATAR a teleoperação inteira. Agora a leitura
+    # só espera `camera_read_timeout_ms` por um quadro NOVO; se não vier,
+    # reaproveita o último quadro bom e segue o laço. O robô continua
+    # obedecendo — o que congela é a imagem, por alguns quadros.
+    #
+    # Esperar muito aqui é pior do que reaproveitar: cada ms deste timeout é
+    # um ms de laço de controle parado. Mantenha na ordem do período do FPS
+    # da câmera (30 fps → 33 ms), com folga.
+    camera_read_timeout_ms: int = 300
+
+    # Aí sim: se a câmera ficar MUDA por mais que isto — sem um único quadro
+    # novo —, não é engasgo, é servidor caído. Só nesse caso o erro sobe e
+    # derruba a sessão, para não gravar dataset com imagem congelada.
+    camera_grace_s: float = 10.0

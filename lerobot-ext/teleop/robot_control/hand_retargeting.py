@@ -1,4 +1,9 @@
-from dex_retargeting import RetargetingConfig
+# Do submódulo, não do topo do pacote: o dex_retargeting 0.5.0 parou de re-exportar
+# RetargetingConfig em `dex_retargeting/__init__.py` (o env antigo `g1` tinha a 0.4.7,
+# onde funcionava). Aqui o import é direto, sem try — ou seja, a 0.5.0 derrubava o
+# `teleop/xr_g1_arm.py` já no import, antes de a teleoperação subir.
+# `dex_retargeting.retargeting_config` existe nas duas versões.
+from dex_retargeting.retargeting_config import RetargetingConfig
 from pathlib import Path
 import yaml
 from enum import Enum

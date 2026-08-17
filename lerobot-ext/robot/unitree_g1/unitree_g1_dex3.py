@@ -107,15 +107,27 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
         if not self.cameras:
             from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig
             
+            # ⚠️ warmup_s é DOIS parâmetros num só, na versão da lerobot que
+            # está instalada (site-packages, que NÃO é a de lerobot/ neste
+            # repo): além de quanto tempo aquecer, ele vira o timeout do
+            # PRIMEIRO quadro — `async_read(timeout_ms=warmup_s * 1000)`.
+            # Com warmup_s=1 a subida morria em "async_read timeout after
+            # 1000ms" sempre que o primeiro quadro demorava, que pelo Wi-Fi é
+            # o normal. 5 s dá folga sem travar a subida quando o servidor de
+            # imagem no robô realmente não está no ar (aí o erro é o certo).
+            #
+            # timeout_ms=10000 é o RCVTIMEO do socket. Nenhum dos dois é o
+            # timeout de cada leitura durante a sessão — esse é curto de
+            # propósito: `camera_read_timeout_ms` em config_unitree_g1.py.
             self.cameras = {
                 # A NOSSA ÚNICA CÂMERA RGB (HD para o VR e para a IA)
                 "head_camera": ZMQCameraConfig(
-                    server_address=self.robot_ip, port=5555, camera_name="head_camera", width=cam2_width, height=cam2_height, warmup_s=3
+                    server_address=self.robot_ip, port=5555, camera_name="head_camera", width=cam2_width, height=cam2_height, warmup_s=5, timeout_ms=10000
                 ),
-                
+
                 # AS 3 LENTES TÉCNICAS (Baixa Resolução para o processamento ser imediato)
                 "head_camera_depth": ZMQCameraConfig(
-                    server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height, warmup_s=3
+                    server_address=self.robot_ip, port=5555, camera_name="head_camera_depth", width=cam2_width, height=cam2_height, warmup_s=5, timeout_ms=10000
                 )
                 ,
                 # ── Câmera de pulso direito ────────────────────────────────
@@ -133,10 +145,24 @@ class UnitreeG1Dex3Config(UnitreeG1Config):
                 **(
                     {
                         "right_wrist_camera": ZMQCameraConfig(
-                            server_address=self.robot_ip, port=5556,
+                            # A porta depende de QUEM publica, e são dois publicadores
+                            # diferentes:
+                            #  - robô real: `right_arm_realsense_server.py`, um servidor
+                            #    à parte, na 5556;
+                            #  - simulação: o MuJoCo publica TODAS as câmeras num único
+                            #    stream ZMQ compartilhado, na 5555 (`env.make_env` tem um
+                            #    só `camera_port`, e `unitree_g1_loco.py` nem passa esse
+                            #    argumento — fica no default).
+                            # Com 5556 fixo, a simulação subia, conectava e só então
+                            # estourava `TimeoutError: ZMQ stream 127.0.0.1:5556` no
+                            # primeiro `get_observation` — as outras duas câmeras, na
+                            # 5555, funcionavam, o que faz o erro parecer da câmera de
+                            # pulso e não da porta.
+                            server_address=self.robot_ip,
+                            port=5555 if self.is_simulation else 5556,
                             camera_name="right_wrist_camera",
                             width=self.wrist_cam_size, height=self.wrist_cam_size,
-                            warmup_s=3,
+                            warmup_s=5, timeout_ms=10000,
                         )
                     }
                     if self.use_wrist_camera else {}

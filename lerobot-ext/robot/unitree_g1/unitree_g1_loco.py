@@ -114,6 +114,13 @@ class UnitreeG1(Robot):
         # Initialize cameras config (ZMQ-based) - actual connection in connect()
         self._cameras = make_cameras_from_configs(config.cameras)
 
+        # Último quadro bom de cada câmera e desde quando ela está muda.
+        # Ver `_read_camera`: é o que segura a teleoperação de pé quando a rede
+        # engasga por alguns quadros.
+        self._cam_ultimo_quadro: dict[str, np.ndarray] = {}
+        self._cam_mudo_desde: dict[str, float] = {}
+        self._cam_ultimo_aviso: dict[str, float] = {}
+
         # Channel classes will be imported in connect() to avoid circular imports
         self._ChannelFactoryInitialize = None
         self._ChannelPublisher = None
@@ -171,7 +178,21 @@ class UnitreeG1(Robot):
             if self.config.is_simulation and self.sim_env is not None:
                 self.sim_env.step()
 
-            msg = self.lowstate_subscriber.Read()
+            # Timeout explícito para esta thread nunca poder parar de vez. `Read()` sem
+            # argumento vira `take_one()` no cyclonedds, que espera indefinidamente
+            # (`timeout or duration(weeks=99999)`) — e em simulação quem PRODUZ o lowstate
+            # é o `sim_env.step()` logo acima, na mesma thread. O laço só gira porque cada
+            # step publica uma amostra antes do Read consumi-la; se uma se perder, o Read
+            # ficaria esperando um estado que ninguém mais publicaria.
+            #
+            # Nunca vi isso acontecer — em 60 s de teleoperação em simulação não houve um
+            # único timeout aqui. É proteção barata contra um travamento que o desenho
+            # permite, não conserto de bug observado.
+            #
+            # 100 ms é folgado para os dois lados: em simulação o step acabou de publicar,
+            # e no robô real o lowstate vem a centenas de hertz. Quando estoura, o
+            # unitree_sdk2py devolve None — caso já tratado logo abaixo.
+            msg = self.lowstate_subscriber.Read(timeout=0.1)
             if msg is not None:
                 lowstate = G1_29_LowState()
 
@@ -522,9 +543,67 @@ class UnitreeG1(Robot):
 
         # Cameras - read images from ZMQ cameras
         for cam_name, cam in self._cameras.items():
-            obs[cam_name] = cam.async_read()
+            obs[cam_name] = self._read_camera(cam_name, cam)
 
         return obs
+
+    def _read_camera(self, nome: str, cam) -> np.ndarray:
+        """Lê um quadro da câmera SEM deixar a rede derrubar a teleoperação.
+
+        O caminho antigo era `cam.async_read()` cru: qualquer engasgo de rede
+        que atrasasse o quadro além do timeout levantava TimeoutError, que
+        subia pelo `get_observation` e matava o processo inteiro no meio da
+        sessão. Um soluço de Wi-Fi de 200 ms custava a demonstração toda.
+
+        Agora a espera é curta (`camera_read_timeout_ms`) e o fracasso é
+        barato: reaproveita o último quadro bom e segue. Só se a câmera ficar
+        muda por mais de `camera_grace_s` — servidor caído, não engasgo — o
+        erro sobe, porque aí seguir seria gravar dataset com imagem parada.
+        """
+        try:
+            frame = cam.async_read(timeout_ms=self.config.camera_read_timeout_ms)
+        except Exception as e:
+            anterior = self._cam_ultimo_quadro.get(nome)
+            if anterior is None:
+                # Nunca chegou um quadro sequer: não é engasgo, é a câmera no
+                # ar errado (IP, porta, servidor não subiu). Falhar aqui é o
+                # certo — e acontece no início, não no meio da demo.
+                raise
+
+            agora = time.monotonic()
+            desde = self._cam_mudo_desde.setdefault(nome, agora)
+            mudo_ha = agora - desde
+
+            if mudo_ha > self.config.camera_grace_s:
+                raise TimeoutError(
+                    f"Câmera '{nome}' sem nenhum quadro novo há {mudo_ha:.1f}s "
+                    f"(limite: {self.config.camera_grace_s}s). Não é engasgo de "
+                    f"rede — verifique o servidor de imagem no robô."
+                ) from e
+
+            # Aviso no máximo 1x por segundo: em 30 Hz isto floodaria o log.
+            if agora - self._cam_ultimo_aviso.get(nome, 0.0) > 1.0:
+                self._cam_ultimo_aviso[nome] = agora
+                logger.warning(
+                    f"Câmera '{nome}': sem quadro novo há {mudo_ha:.2f}s "
+                    f"(rede engasgada) — reusando o último quadro."
+                )
+            # Devolve uma cópia: o array guardado é a nossa reserva e não pode sair
+            # daqui para as mãos de quem escreve nele.
+            return anterior.copy()
+
+        # Guardar uma CÓPIA, não a referência. O `frame` que sai daqui é o mesmo objeto
+        # que o consumidor recebe — e a camada ZMQ do lerobot também entrega o array do
+        # `latest_frames` sem copiar. Se alguém desenhar um HUD em cima da observação,
+        # sem esta cópia a reserva seria corrompida junto, e o estrago só apareceria no
+        # próximo engasgo de rede: imagem com lixo, no pior momento possível, sem erro
+        # nenhum no log.
+        #
+        # O custo é um memcpy por quadro por câmera (~1,2 MB a 848x480x3): irrisório
+        # perto do decode que acabou de acontecer, e pago de propósito.
+        self._cam_ultimo_quadro[nome] = frame.copy()
+        self._cam_mudo_desde.pop(nome, None)
+        return frame
 
     @property
     def is_calibrated(self) -> bool:

@@ -105,6 +105,12 @@ class UnitreeG1(Robot):
         # Initialize cameras config (ZMQ-based) - actual connection in connect()
         self._cameras = make_cameras_from_configs(config.cameras)
 
+        # Último quadro bom de cada câmera e desde quando ela está muda.
+        # Ver `_read_camera` (mesma lógica de unitree_g1_loco.py).
+        self._cam_ultimo_quadro: dict[str, np.ndarray] = {}
+        self._cam_mudo_desde: dict[str, float] = {}
+        self._cam_ultimo_aviso: dict[str, float] = {}
+
         # Channel classes will be imported in connect() to avoid circular imports
         self._ChannelFactoryInitialize = None
         self._ChannelPublisher = None
@@ -411,10 +417,59 @@ class UnitreeG1(Robot):
 
         # Cameras - read images from ZMQ cameras
         for cam_name, cam in self._cameras.items():
-            obs[cam_name] = cam.async_read()
+            obs[cam_name] = self._read_camera(cam_name, cam)
 
-        
+
         return obs
+
+    def _read_camera(self, nome: str, cam) -> np.ndarray:
+        """Lê um quadro sem deixar a rede derrubar a sessão.
+
+        Espera curta por quadro novo; se a rede engasgar, reusa o último quadro
+        bom. Só levanta erro se a câmera ficar muda além de `camera_grace_s`
+        (servidor caído, não engasgo). Ver a versão comentada em
+        `unitree_g1_loco.py`, que é a classe em uso hoje.
+        """
+        try:
+            frame = cam.async_read(timeout_ms=self.config.camera_read_timeout_ms)
+        except Exception as e:
+            anterior = self._cam_ultimo_quadro.get(nome)
+            if anterior is None:
+                raise
+
+            agora = time.monotonic()
+            desde = self._cam_mudo_desde.setdefault(nome, agora)
+            mudo_ha = agora - desde
+
+            if mudo_ha > self.config.camera_grace_s:
+                raise TimeoutError(
+                    f"Câmera '{nome}' sem nenhum quadro novo há {mudo_ha:.1f}s "
+                    f"(limite: {self.config.camera_grace_s}s). Verifique o "
+                    f"servidor de imagem no robô."
+                ) from e
+
+            if agora - self._cam_ultimo_aviso.get(nome, 0.0) > 1.0:
+                self._cam_ultimo_aviso[nome] = agora
+                logger.warning(
+                    f"Câmera '{nome}': sem quadro novo há {mudo_ha:.2f}s "
+                    f"(rede engasgada) — reusando o último quadro."
+                )
+            # Devolve uma cópia: o array guardado é a nossa reserva e não pode sair
+            # daqui para as mãos de quem escreve nele.
+            return anterior.copy()
+
+        # Guardar uma CÓPIA, não a referência. O `frame` que sai daqui é o mesmo objeto
+        # que o consumidor recebe — e a camada ZMQ do lerobot também entrega o array do
+        # `latest_frames` sem copiar. Se alguém desenhar um HUD em cima da observação,
+        # sem esta cópia a reserva seria corrompida junto, e o estrago só apareceria no
+        # próximo engasgo de rede: imagem com lixo, no pior momento possível, sem erro
+        # nenhum no log.
+        #
+        # O custo é um memcpy por quadro por câmera (~1,2 MB a 848x480x3): irrisório
+        # perto do decode que acabou de acontecer, e pago de propósito.
+        self._cam_ultimo_quadro[nome] = frame.copy()
+        self._cam_mudo_desde.pop(nome, None)
+        return frame
 
     @property
     def is_calibrated(self) -> bool:

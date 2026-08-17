@@ -27,7 +27,7 @@ ENABLE_ELASTIC_BAND: True
 # Timing
 SIMULATE_DT: 0.004  # 250Hz physics
 VIEWER_DT: 0.02     # 50Hz viewer update
-IMAGE_DT: 0.033333  # ~30Hz camera
+IMAGE_DT: 0.016667  # 60Hz camera (teste)
 
 # Rendering
 ENABLE_ONSCREEN: true

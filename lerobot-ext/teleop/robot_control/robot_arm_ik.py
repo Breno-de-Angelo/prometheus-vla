@@ -10,6 +10,41 @@ import sys
 import pickle
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
+
+
+# ── Cache do modelo pinocchio: por versão do pin, e nunca fatal ──────────────
+# O .pkl guarda objetos `pin.Model` serializados pelo próprio pinocchio, e o
+# formato NÃO é estável entre versões: o cache gravado pelo pin 2.7 (env antigo
+# `g1`) faz o pin 4.1 (env `prometheus-vla`) estourar
+# `RuntimeError: input stream error` já no __init__, antes de a teleoperação subir.
+#
+# Por isso o nome do arquivo carrega a versão do pin: cada ambiente escreve e lê o
+# seu, e voltar para o env `g1` continua funcionando sem regravar nada.
+_PIN_TAG = pin.__version__.split("+")[0].replace(".", "_")
+
+
+def _nome_cache(base: str) -> str:
+    return f"{base}_pin{_PIN_TAG}.pkl"
+
+
+def _carregar_cache_se_valido(dono, rotulo: str):
+    """Devolve (robot, reduced_robot) do cache, ou None para reconstruir do URDF.
+
+    Nunca levanta: um cache ausente, truncado (queda de energia no meio do
+    `pickle.dump`) ou de formato alheio só custa a reconstrução do URDF, que é
+    lenta mas correta. Falhar aqui derrubaria a sessão por um arquivo descartável.
+    """
+    if dono.Visualization or not os.path.exists(dono.cache_path):
+        return None
+    logger_mp.info(f"[{rotulo}] >>> Loading cached robot model: {dono.cache_path}")
+    try:
+        return dono.load_cache()
+    except Exception as e:
+        logger_mp.warning(
+            f"[{rotulo}] >>> Cache {dono.cache_path} ilegível ({type(e).__name__}: {e}); "
+            f"reconstruindo do URDF."
+        )
+        return None
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
 
@@ -23,7 +58,7 @@ class G1_29_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "g1_29_model_cache.pkl"
+        self.cache_path = _nome_cache("g1_29_model_cache")
 
         if not self.Unit_Test:
             self.urdf_path = '../assets/g1/g1_body29_hand14.urdf'
@@ -33,9 +68,9 @@ class G1_29_ArmIK:
             self.model_dir = '../../assets/g1/'
 
         # Try loading cache first
-        if os.path.exists(self.cache_path) and (not self.Visualization):
-            logger_mp.info(f"[G1_29_ArmIK] >>> Loading cached robot model: {self.cache_path}")
-            self.robot, self.reduced_robot = self.load_cache()
+        _cache = _carregar_cache_se_valido(self, "G1_29_ArmIK")
+        if _cache is not None:
+            self.robot, self.reduced_robot = _cache
         else:
             logger_mp.info("[G1_29_ArmIK] >>> Loading URDF (slow)...")
             self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
@@ -317,7 +352,7 @@ class G1_23_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "g1_23_model_cache.pkl"
+        self.cache_path = _nome_cache("g1_23_model_cache")
 
         if not self.Unit_Test:
             self.urdf_path = '../assets/g1/g1_body23.urdf'
@@ -327,9 +362,9 @@ class G1_23_ArmIK:
             self.model_dir = '../../assets/g1/'
 
         # Try loading cache first
-        if os.path.exists(self.cache_path) and (not self.Visualization):
-            logger_mp.info(f"[G1_23_ArmIK] >>> Loading cached robot model: {self.cache_path}")
-            self.robot, self.reduced_robot = self.load_cache()
+        _cache = _carregar_cache_se_valido(self, "G1_23_ArmIK")
+        if _cache is not None:
+            self.robot, self.reduced_robot = _cache
         else:
             logger_mp.info("[G1_23_ArmIK] >>> Loading URDF (slow)...")
             self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
@@ -597,7 +632,7 @@ class H1_2_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "h1_2_model_cache.pkl"
+        self.cache_path = _nome_cache("h1_2_model_cache")
 
         if not self.Unit_Test:
             self.urdf_path = '../assets/h1_2/h1_2.urdf'
@@ -607,9 +642,9 @@ class H1_2_ArmIK:
             self.model_dir = '../../assets/h1_2/'
 
         # Try loading cache first
-        if os.path.exists(self.cache_path) and (not self.Visualization):
-            logger_mp.info(f"[H1_2_ArmIK] >>> Loading cached robot model: {self.cache_path}")
-            self.robot, self.reduced_robot = self.load_cache()
+        _cache = _carregar_cache_se_valido(self, "H1_2_ArmIK")
+        if _cache is not None:
+            self.robot, self.reduced_robot = _cache
         else:
             logger_mp.info("[H1_2_ArmIK] >>> Loading URDF (slow)...")
             self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
@@ -900,7 +935,7 @@ class H1_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "h1_model_cache.pkl"
+        self.cache_path = _nome_cache("h1_model_cache")
 
         if not self.Unit_Test:
             self.urdf_path = '../assets/h1/h1_with_hand.urdf'
@@ -910,9 +945,9 @@ class H1_ArmIK:
             self.model_dir = '../../assets/h1/'
 
         # Try loading cache first
-        if os.path.exists(self.cache_path) and (not self.Visualization):
-            logger_mp.info(f"[H1_ArmIK] >>> Loading cached robot model: {self.cache_path}")
-            self.robot, self.reduced_robot = self.load_cache()
+        _cache = _carregar_cache_se_valido(self, "H1_ArmIK")
+        if _cache is not None:
+            self.robot, self.reduced_robot = _cache
         else:
             logger_mp.info("[H1_ArmIK] >>> Loading URDF (slow)...")
             self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)

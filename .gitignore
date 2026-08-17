@@ -29,6 +29,12 @@ lerobot-ext/train_output/
 *.pt
 *.pth
 
+# Caches gerados em runtime (o do pinocchio é por versão do pin — INSTALL §2.8)
+g1_29_model_cache*.pkl
+MUJOCO_LOG.TXT
+.pytest_cache/
+.deps/
+
 # IDE
 .vscode/
 lerobot-ext/g1_env.tar.gz
