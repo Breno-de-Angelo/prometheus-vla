@@ -35,6 +35,8 @@ import os
 import re
 import shutil
 import sys
+
+import numpy as np
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +119,43 @@ def _publica(estagio: Path, destino: Path) -> None:
         shutil.rmtree(antigo)
 
 
+def _instala_eval_representativo() -> None:
+    """Faz o `max_eval_samples` amostrar o held-out INTEIRO, não só o começo.
+
+    O laço nativo monta o subconjunto de validação com
+    `(task_arr == t).nonzero()[0][:per_task]` (`lerobot_train.py`), ou seja, os
+    PRIMEIROS N quadros de cada tarefa. Como os episódios são concatenados em
+    ordem, isso pega só o início do primeiro episódio held-out — a fase de
+    aproximação — e nunca o momento de fechar a mão, que é justamente onde este
+    modelo erra. Um `eval_loss` medido assim melhora enquanto a garra piora.
+
+    A troca é no `Subset`: ele aparece uma única vez no laço, e é exatamente
+    para isto. Os índices viram um espaçamento uniforme sobre todo o conjunto de
+    validação, cobrindo todos os episódios held-out do começo ao fim.
+
+    Com mais de uma tarefa a amostragem deixa de ser equilibrada por tarefa e
+    passa a ser proporcional ao tamanho de cada uma — o que é razoável, mas é
+    diferente do que o de origem faz. Hoje o dataset tem uma tarefa só.
+    """
+    import torch.utils.data as tud
+
+    subset_original = tud.Subset
+
+    class SubsetUniforme(subset_original):
+        def __init__(self, dataset, indices):
+            n = len(indices)
+            total = len(dataset)
+            if 0 < n < total:
+                indices = np.linspace(0, total - 1, n).round().astype(int).tolist()
+                logging.info(
+                    "[FastWAM-D] validação: %d amostras espaçadas uniformemente sobre %d "
+                    "quadros held-out (em vez dos %d primeiros).", n, total, n
+                )
+            super().__init__(dataset, indices)
+
+    tud.Subset = SubsetUniforme
+
+
 def _instala_handler() -> None:
     """Põe o `_CapturaEvalLoss` na raiz, sem duplicar se já estiver lá."""
     raiz = logging.getLogger()
@@ -193,6 +232,7 @@ def _instala_melhor_apenas() -> None:
 
 def main() -> None:
     _instala_melhor_apenas()
+    _instala_eval_representativo()
     train()
 
 

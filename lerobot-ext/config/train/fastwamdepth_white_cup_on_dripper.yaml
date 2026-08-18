@@ -118,7 +118,11 @@ policy:
 # Fora do repo e fora do disco de sistema, pelo mesmo motivo do `HF_HOME` acima.
 # Sobrescrevível com `--output_dir=...` em outra máquina.
 output_dir: "/data/train_output/fastwamdepth_white_cup_on_dripper"
-steps: 20000
+# 20 mil eram exagero: na primeira corrida o eval_loss já subia a partir do
+# step ~1000 (0,3266 → 0,3550 no 3000) enquanto a loss de treino continuava
+# caindo — decoreba com 22 episódios. Com o "só o melhor" funcionando, passar do
+# mínimo custa tempo mas não custa qualidade: o checkpoint guardado é o melhor.
+steps: 10000
 
 # Ponto de partida para uma A100 de 80 GB. O expert congelado ainda ocupa os
 # ~10 GB de pesos; o que cresce com o batch são as ativações do action expert
@@ -129,8 +133,20 @@ num_workers: 8
 log_freq: 50
 save_checkpoint: true
 
-# Loss nos episódios held-out a cada N steps (0 desliga).
-eval_steps: 500
+# ── Validação frequente, para achar o melhor ponto com precisão ───────────
+# A primeira corrida avaliava a cada 500 steps sobre TODOS os ~1.760 quadros
+# held-out: 8,5 min por avaliação, uns 35% de overhead, e uma resolução grossa
+# demais para localizar o mínimo (ele caiu entre os steps 500 e 2000).
+#
+# Agora: mais frequente e mais barata. As 200 amostras não são as 200 primeiras
+# — o `run_train.py` troca a seleção por um espaçamento uniforme sobre todo o
+# held-out (ver `_instala_eval_representativo`). Sem isso o subconjunto seria só
+# o começo do primeiro episódio, que é a fase de aproximação, e o eval_loss
+# melhoraria enquanto a garra piora.
+#
+#   250 steps ≈ 7,3 min de treino | 200 amostras ≈ 1 min de eval → ~14%
+eval_steps: 250
+max_eval_samples: 200
 
 # `save_freq` aqui é "de quantos em quantos steps CONSIDERAR salvar": o
 # `run_train.py` só escreve quando o `eval_loss` melhora, e sempre por cima de
@@ -141,7 +157,7 @@ eval_steps: 500
 # Tem que ser MÚLTIPLO de `eval_steps` — é o que garante que todo step de save
 # tenha um eval fresco para comparar. Se não for, o save cai no caminho do
 # aviso e escreve sem critério.
-save_freq: 1000
+save_freq: 500
 
 # O nome que aparece no wandb. A ablação sobrescreve na linha de comando
 # (`--job_name=fastwamdepth_token`), senão as três corridas viram o mesmo nome.
