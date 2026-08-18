@@ -158,6 +158,31 @@ def load_pre_post_processors(checkpoint_dir: str, policy):
 # ─────────────────────────────────────────────────────────────────────
 # 4. MONTA OBSERVAÇÃO BRUTA (ACT e PI05 usam a mesma função)
 # ─────────────────────────────────────────────────────────────────────
+def _depth_to_tensor(depth: "np.ndarray", device=None) -> "torch.Tensor":
+    """Mapa de profundidade → `[1, H, W]` float32 em MILÍMETROS.
+
+    Formato nativo da 0.6.1: 1 canal, valor métrico. O caminho antigo replicava
+    em 3 canais e dividia por 255, porque a profundidade era gravada como
+    imagem de 8 bits (0–2000 mm espremidos em 0–255). Fazer isso hoje não
+    quebra nada visivelmente — só entrega milímetros divididos por 255 à
+    política, que espera milímetros. Erro silencioso, o pior tipo.
+
+    A política converte mm → metros na projeção 3D
+    (`policies/act_depth/depth_encoder.py::depth_to_pointcloud`, `depth_unit`).
+    """
+    import numpy as _np
+
+    depth = _np.squeeze(depth)
+    if depth.ndim != 2:
+        raise ValueError(
+            f"Profundidade deveria ser um mapa de 1 canal [H, W], veio {depth.shape}. "
+            "Se o servidor ainda publica cinza de 3 canais, atualize-o "
+            "(Scripts_Prometheus_int/full_realsenser_server.py)."
+        )
+    tensor = torch.from_numpy(_np.ascontiguousarray(depth)).float().unsqueeze(0)
+    return tensor if device is None else tensor.to(device)
+
+
 def make_raw_obs(
     obs: dict,
     joint_names: list[str],
@@ -193,13 +218,7 @@ def make_raw_obs(
     if has_depth:
         depth = obs.get("head_camera_depth")
         if depth is not None:
-            if len(depth.shape) == 2:
-                depth = np.stack([depth] * 3, axis=-1)
-            elif depth.shape[2] == 1:
-                depth = np.repeat(depth, 3, axis=-1)
-            raw["observation.images.head_camera_depth"] = (
-                torch.from_numpy(depth).permute(2, 0, 1).float().div(255.0)
-            )
+            raw["observation.images.head_camera_depth"] = _depth_to_tensor(depth)
 
     # Pressão [33] — sem batch dim
     if has_pressure:

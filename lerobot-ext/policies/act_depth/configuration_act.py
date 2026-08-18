@@ -91,9 +91,21 @@ class ACTConfig(PreTrainedConfig):
     # ══════════════════════════════════════════════════════════
 
     use_depth_3d: bool = True
+
+    # Intrínsecos do stream de COR a 848×480 (o depth é alinhado a ele pelo
+    # `full_realsenser_server.py`). O padrão antigo — cx=320, cy=240 — era o
+    # centro de uma imagem de 640 px: 104 px de erro no ponto principal, que a
+    # projeção pinhole transforma em cisalhamento da nuvem proporcional à
+    # distância. Estes valores vêm do FOV nominal do D435i e são ESTIMATIVA;
+    # para os reais rode no robô `Scripts_Prometheus_int/print_camera_intrinsics.py`.
     camera_intrinsics: dict = field(
-        default_factory=lambda: {'fx': 600.0, 'fy': 600.0, 'cx': 320.0, 'cy': 240.0}
+        default_factory=lambda: {'fx': 617.0, 'fy': 617.0, 'cx': 424.0, 'cy': 240.0}
     )
+
+    # Unidade em que a profundidade chega do dataset. O LeRobot 0.6.1 entrega
+    # milímetros por padrão (`depth_output_unit`); a projeção 3D converte para
+    # metros. Só mexa aqui se mudar o `depth_output_unit` do dataset.
+    depth_unit: str = "mm"
     pointnet_num_points: int = 1024
 
     # ── Seleção do encoder de profundidade ──────────────────

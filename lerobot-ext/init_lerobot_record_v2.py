@@ -65,56 +65,92 @@ UnitreeG1Dex3.get_observation = patched_get_observation
 # =========================================================================
 # 💉 INJEÇÃO 2: Editar a Planta Baixa do Parquet (TUPLAS!)
 # =========================================================================
-import lerobot.datasets.utils
-original_hw_to_dataset_features = lerobot.datasets.utils.hw_to_dataset_features
+# Na 0.6.1 os dois helpers saíram de `lerobot.datasets.utils` e foram para
+# `lerobot.utils.feature_utils` — módulo propositalmente leve, para poder ser
+# importado sem arrastar o `datasets` do HuggingFace junto.
+#
+# Trocar o atributo só no módulo de origem NÃO basta: quem consome faz
+# `from lerobot.utils.feature_utils import build_dataset_frame`, ou seja, copia
+# a referência para o próprio namespace no momento do import. Quem já foi
+# importado (o `robot.unitree_g1` lá em cima arrasta meio lerobot) continuaria
+# com a função original. `_patch_lerobot` reescreve a referência em todo módulo
+# lerobot já carregado; trocar no módulo de origem cobre os que ainda vão ser
+# importados — entre eles o `lerobot.scripts.lerobot_record` lá embaixo.
+import lerobot.utils.feature_utils as lr_feature_utils
+from lerobot.utils.constants import OBS_STR
 
-def patched_hw_to_dataset_features(features, feature_type, use_videos):
-    dataset_features = original_hw_to_dataset_features(features, feature_type, use_videos)
-    
+
+def _patch_lerobot(nome: str, func_nova, func_velha) -> None:
+    setattr(lr_feature_utils, nome, func_nova)
+    for mod_nome, mod in list(sys.modules.items()):
+        if mod is None or mod is lr_feature_utils or not mod_nome.startswith("lerobot"):
+            continue
+        if getattr(mod, nome, None) is func_velha:
+            setattr(mod, nome, func_nova)
+
+
+original_hw_to_dataset_features = lr_feature_utils.hw_to_dataset_features
+
+
+# *args/**kwargs de propósito: o terceiro parâmetro se chama `use_video` na 0.6.1
+# (era `use_videos`) e há chamador que passa por nome. Repassar cru evita casar
+# assinatura com uma API que ainda está se mexendo.
+def patched_hw_to_dataset_features(*args, **kwargs):
+    dataset_features = original_hw_to_dataset_features(*args, **kwargs)
+
     if "observation.state" in dataset_features:
         print("\n[HACK LEROBOT] 🗜️ Configurando colunas do Parquet para Pressão...")
-        
+
         old_names = dataset_features["observation.state"].get("names", [])
         new_names = [n for n in old_names if "pressure" not in n]
         dataset_features["observation.state"]["names"] = new_names
         dataset_features["observation.state"]["shape"] = (len(new_names),)
-        
+
         dataset_features["observation.left_hand_pressure"] = {
             "dtype": "float32", "shape": (33,), "names": [f"left_hand_pressure_{i}" for i in range(33)]
         }
         dataset_features["observation.right_hand_pressure"] = {
             "dtype": "float32", "shape": (33,), "names": [f"right_hand_pressure_{i}" for i in range(33)]
         }
-        
-        chave_depth = "observation.images.head_camera_depth"
-        if chave_depth in dataset_features:
-            print("[HACK LEROBOT] 🚀 Configurando Câmera de Profundidade...")
-            if "info" not in dataset_features[chave_depth] or dataset_features[chave_depth]["info"] is None:
-                dataset_features[chave_depth]["info"] = {
-                    "video.fps": 30, "video.codec": "h264", "video.pix_fmt": "yuv420p", "video.channels": 3, "has_audio": False
-                }
-            dataset_features[chave_depth]["info"]["video.is_depth_map"] = True
-            
+
+    # A marcação `video.is_depth_map` da head_camera_depth saiu daqui de propósito.
+    # Na 0.6.1 essa flag deixou de ser enfeite de metadado: `meta.depth_keys` a lê e
+    # manda a câmera inteira para OUTRO pipeline — quadros gravados como TIFF 16 bits
+    # e vídeo encodado pelo `DepthEncoderConfig`, que quantiza profundidade métrica de
+    # 1 canal. O nosso `realsense_server.py` publica profundidade já normalizada para
+    # cinza uint8 de 3 canais (`cv2.merge([d, d, d])`), que é o que o `_cameras_ft`
+    # declara. Ligar a flag mandaria dado de 3 canais para o encoder de 1 canal.
+    # Quando a profundidade métrica de verdade for publicada (uint16, 1 canal), o
+    # caminho certo é declarar (H, W, 1) no `_cameras_ft`: o próprio
+    # `hw_to_dataset_features` marca `info["is_depth_map"] = True` sozinho.
+
     return dataset_features
 
-lerobot.datasets.utils.hw_to_dataset_features = patched_hw_to_dataset_features
+
+_patch_lerobot("hw_to_dataset_features", patched_hw_to_dataset_features, original_hw_to_dataset_features)
 
 # =========================================================================
 # 💉 INJEÇÃO 3: Contrabando de volta pro Empacotador
 # =========================================================================
-original_build_dataset_frame = lerobot.datasets.utils.build_dataset_frame
+original_build_dataset_frame = lr_feature_utils.build_dataset_frame
 
-def patched_build_dataset_frame(features, obs_dict, prefix="observation."):
-    lp = buffer_pressao["left"]
-    rp = buffer_pressao["right"]
-    
-    for i in range(33):
-        obs_dict[f"left_hand_pressure_{i}"] = float(lp[i])
-        obs_dict[f"right_hand_pressure_{i}"] = float(rp[i])
-        
-    return original_build_dataset_frame(features, obs_dict, prefix)
 
-lerobot.datasets.utils.build_dataset_frame = patched_build_dataset_frame
+def patched_build_dataset_frame(ds_features, values, prefix, *args, **kwargs):
+    # O `prefix` perdeu o default na 0.6.1 e virou "observation" (sem ponto), o
+    # mesmo `OBS_STR` que o record passa. A mesma função também empacota a ação —
+    # aí não há pressão nenhuma para contrabandear.
+    if prefix == OBS_STR:
+        lp = buffer_pressao["left"]
+        rp = buffer_pressao["right"]
+
+        for i in range(33):
+            values[f"left_hand_pressure_{i}"] = float(lp[i])
+            values[f"right_hand_pressure_{i}"] = float(rp[i])
+
+    return original_build_dataset_frame(ds_features, values, prefix, *args, **kwargs)
+
+
+_patch_lerobot("build_dataset_frame", patched_build_dataset_frame, original_build_dataset_frame)
 
 # =========================================================================
 # 🎤 INJEÇÃO 4: Comandos de Voz e Teclado (Setas, Pulo Duplo e PAUSE!)

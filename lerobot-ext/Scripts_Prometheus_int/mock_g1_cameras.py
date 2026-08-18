@@ -20,7 +20,8 @@
 ║    solid      Frame sólido simples (mais leve)                   ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Porta: 5555  (idêntica ao servidor real)                        ║
-║  Formato: mesmo JSON + base64 JPEG do SensorServer real          ║
+║  Formato: RGB em JSON+base64 JPEG; profundidade uint16 (mm) crua ║
+║  em quadro binário — igual ao SensorServer real                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Dependências: pyzmq numpy opencv-python
@@ -119,8 +120,7 @@ RGB_SCENES = {
 def make_depth_frame(t: float) -> np.ndarray:
     """
     Gera um frame de profundidade sintético no mesmo formato do servidor real:
-    - valores uint16 em milímetros (0–2000)
-    - depois: clip → escala 8-bit → replicado em 3 canais (cinza RGB)
+    uint16 em MILÍMETROS, 1 canal, cru (sem clip, sem escalar para 8 bits).
 
     Simula um objeto se aproximando e afastando em loop — útil para testar
     se o LeRobot lê a profundidade corretamente.
@@ -141,22 +141,21 @@ def make_depth_frame(t: float) -> np.ndarray:
     noise = np.random.randint(-10, 10, (HEIGHT, WIDTH), dtype=np.int16)
     depth_mm = np.clip(depth_mm.astype(np.int32) + noise, 0, 2000).astype(np.uint16)
 
-    # === Mesmo pipeline do servidor real ===
-    # 1. Clipa em 2000mm
-    depth_clipped = np.clip(depth_mm, 0, 2000)
-    # 2. Escala linear para 8-bit
-    depth_8bit = (depth_clipped * (255.0 / 2000.0)).astype(np.uint8)
-    # 3. Replica canal cinza × 3 (R=G=B=depth)
-    depth_3c = cv2.cvtColor(depth_8bit, cv2.COLOR_GRAY2RGB)
+    # Anotação escrita nos próprios milímetros (o texto fica a 300 mm da câmera),
+    # para dar para conferir no dataset gravado que o valor chegou inteiro.
+    cv2.putText(depth_mm, f"MOCK DEPTH  obj={pulse}mm  {time.strftime('%H:%M:%S')}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, 300, 1, cv2.LINE_AA)
 
-    # Anotação com profundidade do objeto central
-    cv2.putText(depth_3c, f"MOCK DEPTH  obj={pulse}mm  {time.strftime('%H:%M:%S')}",
-                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-
-    return depth_3c
+    return depth_mm
 
 
 # ─────────────────────────── Codificação ──────────────────────────────────────
+
+def encode_depth_raw(depth_mm: np.ndarray) -> tuple:
+    """Buffer cru uint16 + descritor — mesmo formato do ImageUtils.encode_raw() real."""
+    buf = np.ascontiguousarray(depth_mm)
+    return {"part": 1, "dtype": buf.dtype.str, "shape": list(buf.shape)}, buf.tobytes()
+
 
 def encode_image(img_rgb: np.ndarray) -> str:
     """
@@ -243,8 +242,8 @@ def main():
 
         # Codifica
         try:
-            rgb_b64   = encode_image(rgb_frame)
-            depth_b64 = encode_image(depth_frame)
+            rgb_b64 = encode_image(rgb_frame)
+            descritor_depth, depth_part = encode_depth_raw(depth_frame)
         except Exception as e:
             print(f"[MOCK CAM] ⚠️  Erro ao codificar frame: {e}")
             time.sleep(frame_dt)
@@ -255,7 +254,9 @@ def main():
         message = {
             "images": {
                 "head_camera":       rgb_b64,
-                "head_camera_depth": depth_b64,
+                # Profundidade não cabe no JSON: vai crua (uint16), em quadro
+                # binário próprio da mensagem ZMQ (o índice 0 é sempre o JSON).
+                "head_camera_depth": descritor_depth,
             },
             "timestamps": {
                 "head_camera":       current_time,
@@ -266,7 +267,7 @@ def main():
         # Publica
         payload = json.dumps(message).encode()
         try:
-            sock.send(payload, zmq.NOBLOCK)
+            sock.send_multipart([payload, depth_part], zmq.NOBLOCK)
         except zmq.Again:
             pass  # Subscriber mais lento que o publisher — descarta frame
 
@@ -276,8 +277,8 @@ def main():
         now = time.time()
         if now - last_log >= 5.0:
             real_fps  = frame_count / (now - t0)
-            rgb_kb    = len(base64.b64decode(rgb_b64))   / 1024
-            depth_kb  = len(base64.b64decode(depth_b64)) / 1024
+            rgb_kb    = len(base64.b64decode(rgb_b64)) / 1024
+            depth_kb  = len(depth_part) / 1024
             total_kbs = (rgb_kb + depth_kb) * real_fps / 1024
             print(
                 f"[MOCK CAM] 📷 frame #{frame_count:>5} | "
@@ -290,7 +291,12 @@ def main():
         # Janela de preview local
         if args.show:
             # Coloca RGB e Depth lado a lado
-            preview = np.hstack([rgb_frame, depth_frame])
+            # Profundidade agora é uint16 de 1 canal: normaliza só para caber na
+            # janela de preview, o que vai para a rede continua sendo o cru.
+            depth_vis = cv2.cvtColor(
+                cv2.convertScaleAbs(depth_frame, alpha=255.0 / 2000.0), cv2.COLOR_GRAY2RGB
+            )
+            preview = np.hstack([rgb_frame, depth_vis])
             cv2.imshow("MOCK G1 Cameras  (Q para sair)", cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break

@@ -35,15 +35,18 @@ ACT Decoder (1 camada)
 O mapa de profundidade gravado pelo sensor Intel RealSense D435i passa por:
 
 ```
-depth_raw (z16, mm) → clip(0, 2000mm) → /2000 * 255 → uint8 → vídeo MP4
+depth_raw (z16, mm) → ZMQ cru → LeRobotDataset (mapa nativo de 1 canal)
+                                  TIFF sem perda → HEVC gray12le lossless
+                                  quantização log de 12 bits
                                                                     ↓
                                                             LeRobot __getitem__
                                                                     ↓
-                                                              / 255 → [0, 1]
+                                                  float32 [1, H, W] em MILÍMETROS
                                                                     ↓
                                                         depth_to_pointcloud()
-                                                          z = tensor * 2.0  (metros)
+                                                          z = tensor * 0.001  (metros)
                                                           projeção pinhole 3D
+                                                          0,05 m < z < z_max
                                                           amostra 1024 pontos
                                                                     ↓
                                                             PointNetEncoder
@@ -51,7 +54,19 @@ depth_raw (z16, mm) → clip(0, 2000mm) → /2000 * 255 → uint8 → vídeo MP4
                                                         depth token [B, 1, dim_model]
 ```
 
-**Bug crítico resolvido:** o `factory.py` do LeRobot sobrescreve as stats de todas as `camera_keys` com valores ImageNet (`mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]`) quando `use_imagenet_stats: true`. O depth também é uma `camera_key`, então era normalizado antes de chegar na PointNet, produzindo valores negativos e zerando todos os pontos válidos. A correção é feita no `run_train.py` resetando as stats do depth para identidade (`mean=0, std=1`) logo após a criação do dataset.
+**Isto mudou em 18/08/2026** — ver [`docs/PROFUNDIDADE_NATIVA.md`](../../docs/PROFUNDIDADE_NATIVA.md).
+Até então a profundidade era gravada como imagem de 8 bits (`clip(0, 2000mm) →
+/2000*255`), chegava em [0,1] e o código fazia `z = tensor * 2.0`. Com o mapa
+nativo esse fator erra por três ordens de grandeza — e em silêncio: o treino
+roda normal, com a cena a ~1 km. A unidade agora vem do config (`depth_unit`).
+
+**Dois remendos que sumiram na migração:** a reversão da normalização ImageNet
+(dentro de `_extract_depth_features`) e o override das stats do depth por
+identidade (no `run_train.py`). Ambos existiam porque o `factory.py` do LeRobot
+carimbava stats do ImageNet em TODAS as `camera_keys`, depth incluída. A 0.6.1
+pula as câmeras de profundidade nesse ponto (`if key in depth_keys: continue`),
+e o `processor_act.py` já tira o depth do normalizador. Mantidos, os dois
+passariam a aplicar mean/std de 3 canais num mapa de 1 canal.
 
 ### Token de depth como token próprio no Encoder
 

@@ -187,14 +187,21 @@ devem ser conferidos com o robô suspenso antes de qualquer demonstração.
 
 ### Sobre o depth
 
-A INJEÇÃO 2 do `init_lerobot_record_v2.py` marca
+> **FEITO em 18/08/2026** — ver [PROFUNDIDADE_NATIVA.md](PROFUNDIDADE_NATIVA.md).
+> O texto abaixo descreve o estado ANTIGO e fica como registro do porquê.
+
+~~A INJEÇÃO 2 do `init_lerobot_record_v2.py` marca
 `dataset_features[...]["info"]["video.is_depth_map"] = True`. Isso é **metadado
 cosmético**: o vídeo continua sendo gravado em **h264 `yuv420p`, 8 bits com perda**.
 O `full_realsenser_server.py` já corta em 2000 mm e escala para 0–255 antes de
 publicar, então a profundidade tem ~7,8 mm de resolução e passa ainda por
-compressão com perda.
+compressão com perda.~~
 
-Ou seja: a flag não faz o LeRobot guardar depth real, e o modelo está aprendendo
-com uma nuvem de pontos quantizada. Consertar de verdade significa mudar o formato
-de gravação (16 bits sem perda), não a flag — é uma mudança de schema também, e
-deve entrar junto com esta se for entrar.
+O conserto entrou: a profundidade trafega crua (uint16 em mm, 1 canal), é
+declarada com 1 canal no `_cameras_ft` e o LeRobot 0.6.1 a grava como mapa de
+profundidade nativo — TIFF sem perda e HEVC `gray12le` lossless com quantização
+log de 12 bits. Round-trip medido: 500 mm → 500,00; 700 mm → 701,00.
+
+O hack da flag saiu do `init_lerobot_record_v2.py`: na 0.6.1 ela deixou de ser
+metadado e passa a rotear a câmera para outro pipeline de gravação, então
+ligá-la com dado de 3 canais mandaria RGB para o encoder de 1 canal.

@@ -132,6 +132,31 @@ def resolve_checkpoint_path(checkpoint_dir: str | None) -> str | None:
 # ─────────────────────────────────────────────────────────────────────
 # 3. HELPERS DE IMAGEM
 # ─────────────────────────────────────────────────────────────────────
+def _depth_to_tensor(depth: "np.ndarray", device=None) -> "torch.Tensor":
+    """Mapa de profundidade → `[1, H, W]` float32 em MILÍMETROS.
+
+    Formato nativo da 0.6.1: 1 canal, valor métrico. O caminho antigo replicava
+    em 3 canais e dividia por 255, porque a profundidade era gravada como
+    imagem de 8 bits (0–2000 mm espremidos em 0–255). Fazer isso hoje não
+    quebra nada visivelmente — só entrega milímetros divididos por 255 à
+    política, que espera milímetros. Erro silencioso, o pior tipo.
+
+    A política converte mm → metros na projeção 3D
+    (`policies/act_depth/depth_encoder.py::depth_to_pointcloud`, `depth_unit`).
+    """
+    import numpy as _np
+
+    depth = _np.squeeze(depth)
+    if depth.ndim != 2:
+        raise ValueError(
+            f"Profundidade deveria ser um mapa de 1 canal [H, W], veio {depth.shape}. "
+            "Se o servidor ainda publica cinza de 3 canais, atualize-o "
+            "(Scripts_Prometheus_int/full_realsenser_server.py)."
+        )
+    tensor = torch.from_numpy(_np.ascontiguousarray(depth)).float().unsqueeze(0)
+    return tensor if device is None else tensor.to(device)
+
+
 def _img_to_tensor_single(img: np.ndarray) -> torch.Tensor:
     """Converte HxWxC uint8 → [C, H, W] float32 em [0,1]. SEM batch dim.
     Usado como entrada para o preprocessor (to_batch_processor cuida do batch dim).
@@ -191,11 +216,7 @@ def make_raw_obs_for_preprocessor(
     if has_depth:
         depth = obs.get("head_camera_depth")
         if depth is not None:
-            if len(depth.shape) == 2:
-                depth = np.stack([depth] * 3, axis=-1)
-            elif depth.shape[2] == 1:
-                depth = np.repeat(depth, 3, axis=-1)
-            raw["observation.images.head_camera_depth"] = _img_to_tensor_single(depth)
+            raw["observation.images.head_camera_depth"] = _depth_to_tensor(depth)
 
     # Pressão [33] — sem batch dim
     if has_pressure:
@@ -242,11 +263,7 @@ def make_batch_for_actdepth(
     if has_depth:
         depth = obs.get("head_camera_depth")
         if depth is not None:
-            if len(depth.shape) == 2:
-                depth = np.stack([depth] * 3, axis=-1)
-            elif depth.shape[2] == 1:
-                depth = np.repeat(depth, 3, axis=-1)
-            batch["observation.images.head_camera_depth"] = _img_to_tensor(depth, device)
+            batch["observation.images.head_camera_depth"] = _depth_to_tensor(depth, device).unsqueeze(0)
 
     if has_pressure:
         for side in ["left", "right"]:

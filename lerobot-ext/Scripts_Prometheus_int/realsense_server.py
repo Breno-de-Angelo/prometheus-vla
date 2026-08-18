@@ -53,24 +53,29 @@ def start_realsense_zmq(port: int, serial: str | None, fps: int, enable_depth: b
                 if not depth_frame:
                     continue
 
-                depth_raw = np.asanyarray(depth_frame.get_data())  # uint16, mm
+                # Profundidade crua: uint16 em MILÍMETROS, 1 canal. É o formato
+                # nativo de profundidade do LeRobot 0.6.1 — ver a nota longa no
+                # full_realsenser_server.py, que é o servidor de cabeça em uso.
+                depth_raw = np.asanyarray(depth_frame.get_data())
+                depth_units_to_mm = depth_scale * 1000.0
+                if abs(depth_units_to_mm - 1.0) > 1e-6:
+                    depth_mm = (depth_raw.astype(np.float32) * depth_units_to_mm).astype(np.uint16)
+                else:
+                    depth_mm = depth_raw
 
-                depth_m = depth_raw.astype(np.float32) * depth_scale  # metros
-                depth_norm = np.clip(depth_m / 2.0, 0.0, 1.0)         # [0, 1]
-                depth_u8 = (depth_norm * 255.0).astype(np.uint8)
-                depth_3ch = cv2.merge([depth_u8, depth_u8, depth_u8])  # 3 canais p/ encoder
-                encoded_depth = ImageUtils.encode_image(depth_3ch)
-
+                descritor_depth, buffer_depth = ImageUtils.encode_raw(depth_mm, part=1)
                 message = {
                     "images": {
                         "head_camera": ImageUtils.encode_image(rgb),
-                        "head_camera_depth": encoded_depth,
+                        # Crua, em quadro binário próprio (índice 1).
+                        "head_camera_depth": descritor_depth,
                     },
                     "timestamps": {
                         "head_camera": time.time(),
                         "head_camera_depth": time.time(),
                     },
                 }
+                depth_parts = [buffer_depth]
             else:
                 message = {
                     "images": {
@@ -80,8 +85,9 @@ def start_realsense_zmq(port: int, serial: str | None, fps: int, enable_depth: b
                         "head_camera": time.time()
                     }
                 }
+                depth_parts = None
 
-            server.send_message(message)
+            server.send_message(message, parts=depth_parts)
 
     except KeyboardInterrupt:
         print("Encerrando...")

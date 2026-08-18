@@ -327,8 +327,15 @@ class ChannelSubscriber:
         """Initialize the subscriber (no-op for ZMQ)."""
         pass
 
-    def Read(self) -> LowStateMsg | HandStateMsg | None:  # noqa: N802
-        """Receive and deserialize a state message from the robot."""
+    def Read(self, timeout: float | None = None) -> LowStateMsg | HandStateMsg | None:  # noqa: N802
+        """Receive and deserialize a state message from the robot.
+
+        `timeout` existe só para casar com a assinatura do `ChannelSubscriber` do
+        unitree_sdk2py (DDS), que o `unitree_g1_loco.py` chama com `timeout=0.1`.
+        Aqui ele é ignorado de propósito: o recv já é `zmq.NOBLOCK` e volta na
+        hora com `None` quando não há amostra — que é exatamente o que o timeout
+        do lado DDS existe para garantir.
+        """
         if self.topic == "rt/lowstate":
             if _lowstate_sock is None:
                 raise RuntimeError("ChannelFactoryInitialize must be called first")

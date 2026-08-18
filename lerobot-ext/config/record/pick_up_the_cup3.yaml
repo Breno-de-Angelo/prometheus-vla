@@ -14,6 +14,9 @@ dataset:
   root: "meu_dataset/pick_up_the_cup_new"
   push_to_hub: true
   single_task: "pick up the cup"
-  vcodec: "h264"
+  # Na 0.6.1 o codec vive dentro de `rgb_encoder`. Profundidade não passa por
+  # aqui: usa o `depth_encoder` (HEVC gray12le sem perda).
+  rgb_encoder:
+    vcodec: "h264"
 
 play_sounds: false

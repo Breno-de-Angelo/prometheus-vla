@@ -41,7 +41,15 @@ def start_real_robot_cameras():
             # 0 desativa a prioridade, forçando a câmera a manter os 30 FPS constantes
             color_sensor.set_option(rs.option.auto_exposure_priority, 0)
         
+        # Fator para converter as unidades cruas do stream z16 em MILÍMETROS.
+        # A D435i costuma vir com depth_scale=0.001 (1 unidade = 1 mm), mas isso é
+        # calibração de fábrica, não garantia: quem grava depende do número certo,
+        # porque o LeRobot lê inteiro como milímetro.
+        depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        depth_units_to_mm = depth_scale * 1000.0
+
         print(f"[RealSense D435i] Iniciada com sucesso a {FPS} FPS fixos!")
+        print(f"[RealSense D435i] depth_scale={depth_scale} → 1 unidade = {depth_units_to_mm:.4f} mm")
     except Exception as e:
         print(f"[Erro RealSense] {e}")
         return
@@ -74,32 +82,40 @@ def start_real_robot_cameras():
             img_bgr = np.asanyarray(color_frame.get_data())
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-            # --- TRATAMENTO DEPTH (CORRIGIDO PARA IA) ---
+            # --- TRATAMENTO DEPTH (formato nativo do LeRobot 0.6.1) ---
+            # Profundidade sai CRUA: uint16 em milímetros, 1 canal, sem clip e sem
+            # escalar para 8 bits. Era esse achatamento que jogava a medida fora —
+            # 2000 mm espremidos em 256 níveis dão 7,8 mm por degrau, e depois o
+            # JPEG ainda borrava as bordas do que sobrou.
+            #
+            # A 0.6.1 sabe guardar profundidade de verdade: declarada com 1 canal,
+            # ela vai para o `DepthEncoderConfig` (HEVC gray12le lossless), que
+            # quantiza em log com 4096 níveis — ~1 mm de resolução a meio metro,
+            # que é a resolução do próprio sensor. Inteiro é lido como milímetro
+            # (`infer_depth_unit`), então a unidade aqui não é detalhe.
             depth_raw = np.asanyarray(depth_frame.get_data())
-            
-            # 1. Corta tudo acima de 2 metros (foca na manipulação)
-            depth_clipped = np.clip(depth_raw, 0, 2000)
-            
-            # 2. Converte metricamente para 8-bits (escala de cinza linear)
-            depth_8bit = (depth_clipped * (255.0 / 2000.0)).astype(np.uint8)
-            
-            # 3. Replica o canal cinza 3 vezes (R=Depth, G=Depth, B=Depth)
-            # Sem Colormap! Apenas cinza triplicado para o codec MP4 aceitar.
-            depth_3c = cv2.cvtColor(depth_8bit, cv2.COLOR_GRAY2RGB)
+            if abs(depth_units_to_mm - 1.0) > 1e-6:
+                depth_mm = (depth_raw.astype(np.float32) * depth_units_to_mm).astype(np.uint16)
+            else:
+                depth_mm = depth_raw
 
             # --- ENVIO ---
+            descritor_depth, buffer_depth = ImageUtils.encode_raw(depth_mm, part=1)
             current_time = time.time()
             message = {
                 "images": {
                     "head_camera": ImageUtils.encode_image(img_rgb),
-                    "head_camera_depth": ImageUtils.encode_image(depth_3c), # Envia a imagem cinza corrigida
+                    # Fora do JSON: 16 bits não sobrevivem a JPEG nem a base64 sem
+                    # inchar. Vai crua, em quadro binário próprio da mensagem ZMQ
+                    # (índice 1; o 0 é sempre o JSON) — ver ImageUtils.encode_raw.
+                    "head_camera_depth": descritor_depth,
                 },
                 "timestamps": {
                     "head_camera": current_time,
                     "head_camera_depth": current_time,
                 }
             }
-            server.send_message(message)
+            server.send_message(message, parts=[buffer_depth])
 
     except KeyboardInterrupt:
         print("\nEncerrando transmissão...")

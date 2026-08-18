@@ -11,7 +11,7 @@ dependencies = [
     # `dataset` é obrigatório desde a 0.6.1: o `datasets` saiu do core do lerobot e
     # virou extra. Sem ele, `from lerobot.datasets.lerobot_dataset import LeRobotDataset`
     # só quebra na hora de rodar.
-    "lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]",
+    "lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset,training]",
     # Era `vuer>=0.1.1`, que NUNCA foi satisfeito: o televuer pina `vuer[all]==0.0.60`
     # e vence a disputa. Mantido no 0.0.60 de propósito — o televuer importa
     # WebRTCVideoPlane/WebRTCStereoVideoPlane de `vuer.schemas`, que é API dessa versão.

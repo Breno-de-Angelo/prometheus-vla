@@ -1271,6 +1271,31 @@ def load_pre_post_processors(checkpoint_dir: str, policy):
 # ─────────────────────────────────────────────────────────────────────
 # 4. MONTA OBSERVAÇÃO BRUTA (ACT e PI05 usam a mesma função)
 # ─────────────────────────────────────────────────────────────────────
+def _depth_to_tensor(depth: "np.ndarray", device=None) -> "torch.Tensor":
+    """Mapa de profundidade → `[1, H, W]` float32 em MILÍMETROS.
+
+    Formato nativo da 0.6.1: 1 canal, valor métrico. O caminho antigo replicava
+    em 3 canais e dividia por 255, porque a profundidade era gravada como
+    imagem de 8 bits (0–2000 mm espremidos em 0–255). Fazer isso hoje não
+    quebra nada visivelmente — só entrega milímetros divididos por 255 à
+    política, que espera milímetros. Erro silencioso, o pior tipo.
+
+    A política converte mm → metros na projeção 3D
+    (`policies/act_depth/depth_encoder.py::depth_to_pointcloud`, `depth_unit`).
+    """
+    import numpy as _np
+
+    depth = _np.squeeze(depth)
+    if depth.ndim != 2:
+        raise ValueError(
+            f"Profundidade deveria ser um mapa de 1 canal [H, W], veio {depth.shape}. "
+            "Se o servidor ainda publica cinza de 3 canais, atualize-o "
+            "(Scripts_Prometheus_int/full_realsenser_server.py)."
+        )
+    tensor = torch.from_numpy(_np.ascontiguousarray(depth)).float().unsqueeze(0)
+    return tensor if device is None else tensor.to(device)
+
+
 def make_raw_obs(
     obs: dict,
     joint_names: list,
@@ -1302,13 +1327,7 @@ def make_raw_obs(
     if has_depth:
         depth = obs.get("head_camera_depth")
         if depth is not None:
-            if len(depth.shape) == 2:
-                depth = np.stack([depth] * 3, axis=-1)
-            elif depth.shape[2] == 1:
-                depth = np.repeat(depth, 3, axis=-1)
-            raw["observation.images.head_camera_depth"] = (
-                torch.from_numpy(depth).permute(2, 0, 1).float().div(255.0)
-            )
+            raw["observation.images.head_camera_depth"] = _depth_to_tensor(depth)
 
     # Pressão [33]
     if has_pressure:
@@ -1373,11 +1392,13 @@ def setup_cameras(cam_robot_ip, cam_port, fake_video_path, fake_depth_path=None)
             if depth_bgr is None:
                 depth_bgr = cv2.imread(fake_depth_path)
             if depth_bgr is not None:
-                if len(depth_bgr.shape) == 2:
-                    # Grayscale → replica para 3 canais (make_raw_obs espera H×W×3)
-                    fake_depth_img = np.stack([depth_bgr] * 3, axis=-1)
-                else:
-                    fake_depth_img = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB)
+                # Imagem de profundidade LEGADA (8 bits, 0–255 ↔ 0–2000 mm):
+                # desfaz a escala para entregar milímetros, que é o que a
+                # política espera hoje. Ver a mesma conversão no leitor de
+                # vídeo fake, mais abaixo.
+                if depth_bgr.ndim == 3:
+                    depth_bgr = depth_bgr[:, :, 0]
+                fake_depth_img = depth_bgr.astype(np.float32) * (2000.0 / 255.0)
             print("✅ Imagem fake Depth carregada!")
     elif fake_depth_path and cam_robot_ip:
         print("⚠️  --fake-depth ignorado: ZMQ já fornece depth nativo.")
@@ -1424,12 +1445,16 @@ def get_camera_frames(obs, stream_client, fake_cap, fake_img_rgb,
                 fake_depth_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret_d, depth_frame = fake_depth_cap.read()
             if ret_d:
-                # Converte para RGB de 3 canais (make_raw_obs → div(255) → PointNet)
-                if len(depth_frame.shape) == 2:
-                    depth_rgb = np.stack([depth_frame] * 3, axis=-1)
-                else:
-                    depth_rgb = cv2.cvtColor(depth_frame, cv2.COLOR_BGR2RGB)
-                obs["head_camera_depth"] = depth_rgb
+                # Reconstrói MILÍMETROS a partir do vídeo de profundidade LEGADO.
+                # Este caminho lê um dataset antigo, gravado quando a
+                # profundidade ia como cinza de 8 bits com 2000 mm cortados em
+                # 0–255. A política de hoje espera 1 canal em mm, então
+                # desfazemos a escala em vez de repassar os 8 bits crus — o
+                # valor volta quantizado em degraus de ~7,8 mm, que é o que
+                # aquele formato preservou.
+                if depth_frame.ndim == 3:
+                    depth_frame = depth_frame[:, :, 0]
+                obs["head_camera_depth"] = depth_frame.astype(np.float32) * (2000.0 / 255.0)
 
         elif fake_depth_img is not None:
             obs["head_camera_depth"] = fake_depth_img

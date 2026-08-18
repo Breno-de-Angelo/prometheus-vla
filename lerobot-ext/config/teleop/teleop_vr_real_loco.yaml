@@ -73,7 +73,7 @@
 
 robot:
   type: unitree_g1_dex3
-  robot_ip: "192.168.68.71"
+  robot_ip: "192.168.123.164"
 
   # true → control_mode vira "high_level" sozinho (ver __post_init__ de
   # UnitreeG1Dex3Config). Precisa bater com o --loco do dex3_g1_server_v2.py
@@ -93,7 +93,7 @@ robot:
 teleop:
   type: xr_g1_arm
   zmq: true
-  img_server_ip: "192.168.68.71"
+  img_server_ip: "192.168.123.164"
 
   # 'hand': rastreia dedos/mão livre (hand tracking do Quest/Vision Pro).
   # 'controller': usa os controles físicos do headset.

@@ -508,10 +508,24 @@ class UnitreeG1(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        """Define os tensores de imagem. O cliente ZMQ do LeRobot converte tudo para 3 canais por padrão."""
+        """Define os tensores de imagem: RGB com 3 canais, profundidade com 1.
+
+        O número de canais aqui não é papelada: é ele que decide como o LeRobot
+        0.6.1 GRAVA a câmera. Com 1 canal o `hw_to_dataset_features` marca
+        `info["is_depth_map"] = True` sozinho, e a câmera passa a ser gravada
+        como mapa de profundidade — quadros em TIFF sem perda e vídeo pelo
+        `DepthEncoderConfig` (HEVC gray12le, quantização log de 12 bits), com o
+        inteiro lido como MILÍMETRO. Com 3 canais ela vira vídeo RGB comum e a
+        medida se perde no h264.
+
+        Quem precisa casar com isto é o servidor de imagem: o
+        `full_realsenser_server.py` publica a profundidade crua em uint16 (mm),
+        1 canal. Trocar um lado sem o outro quebra a gravação.
+        """
         features = {}
         for cam in self.cameras:
-            features[cam] = (self.config.cameras[cam].height, self.config.cameras[cam].width, 3)
+            canais = 1 if cam.endswith("depth") else 3
+            features[cam] = (self.config.cameras[cam].height, self.config.cameras[cam].width, canais)
         return features
 
     @cached_property

@@ -130,8 +130,11 @@ dataset:
   reset_time_s: 20
 
   # h264 e não o libsvtav1 padrão: AV1 come CPU demais nesta máquina e derruba
-  # o FPS da gravação. O hack de profundidade em init_lerobot_record_v2.py
-  # também assume h264.
-  vcodec: "h264"
+  # o FPS da gravação. Na 0.6.1 o codec deixou de ser um campo solto e passou a
+  # viver dentro de `rgb_encoder` — e as câmeras de profundidade nem passam por
+  # aqui: elas têm o `depth_encoder` só delas (HEVC gray12le sem perda), que é o
+  # que preserva o milímetro. Não troque o codec do depth por h264.
+  rgb_encoder:
+    vcodec: "h264"
 
 play_sounds: false

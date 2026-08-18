@@ -61,7 +61,7 @@ pip install "cyclonedds==11.0.1"
 pip install --no-deps -e ./unitree_sdk2_python
 
 # ── 5. lerobot (nosso fork) com os extras ───────────────────────────────────
-pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]"
+pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset,training]"
 
 # ── 6. os dois forks vendorizados, editable ─────────────────────────────────
 #    O PyPI tem pacotes com estes nomes, mas NÃO servem — ver §2.7 e §4.4.
@@ -139,6 +139,26 @@ Dois pontos que não são óbvios e explicam a dor de cabeça atual:
 Na 0.4.4, `datasets` vinha junto com o LeRobot. Na 0.6.1 ele foi movido para o extra
 `dataset`. **Quem usa `LeRobotDataset` precisa instalar `lerobot[dataset]`
 explicitamente** — senão o import quebra só na hora de rodar.
+
+### 1.1.1 `accelerate` e `wandb` saíram para o extra `training`
+
+Mesma história do `dataset`, e pega quem vai TREINAR. O `run_train.py` de todas as
+políticas (`policies/act_depth`, `policies/pi0_depth`, `train/`) abre com
+
+```python
+from accelerate import Accelerator
+```
+
+e o env montado sem o extra morre aí — `ModuleNotFoundError: No module named
+'accelerate'`. O `wandb` vem no mesmo extra e é importado pelo
+`lerobot.common.wandb_utils`, mesmo com `wandb.enable: false` no YAML.
+
+Por isso a linha de instalação agora inclui `training`. Se você montou o env antes
+desta mudança, o conserto é:
+
+```bash
+pip install -e "./lerobot[training]"
+```
 
 ### 1.2 Os extras `unitree_g1_dex3` e `televuer` não existem no upstream
 
@@ -229,7 +249,7 @@ teleop. Na raiz:
 # pyproject.toml (raiz)
 dependencies = [
     "flask>=3.1.2",
-    "lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]",
+    "lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset,training]",
     "vuer==0.0.60",   # era "vuer>=0.1.1" — nunca foi satisfeito, o televuer pina 0.0.60
 ]
 requires-python = ">=3.12"
@@ -583,7 +603,7 @@ pip install --no-deps -e ./unitree_sdk2_python
 ### 4.3 LeRobot (fork rebaseado) com os extras
 
 ```bash
-pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]"
+pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset,training]"
 ```
 
 Se o rebase do §3 ainda não estiver feito, `unitree_g1_dex3` e `televuer` não existem e

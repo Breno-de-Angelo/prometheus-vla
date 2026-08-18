@@ -1,0 +1,131 @@
+# ==========================================================
+# TREINO — FastWAM-D (FastWAM + profundidade métrica)
+#
+# Rodar na athena (GPU grande). O expert de vídeo do Wan2.2 tem ~5B: só os
+# pesos em bf16 já passam de 10 GB, então isto NÃO roda no notebook de 8 GB.
+#
+#   cd lerobot-ext
+#   python -m policies.fastwam_depth.run_train \
+#       --config_path=config/train/fastwamdepth_white_cup_on_dripper.yaml
+#
+# Ver policies/fastwam_depth/README.md para o desenho do enxerto e para a
+# tabela de ablação (latent / token / off).
+# ==========================================================
+
+dataset:
+  repo_id: Mrwlker/white_cup_on_dripper_2026-08-11
+  root: meu_dataset/white_cup_on_dripper_2026-08-11
+  # O episódio 26 tem 6 quadros (tomada abortada) e fica de fora.
+  episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+  # Validação nativa da 0.6.1: os últimos episódios de cada tarefa viram
+  # held-out e o `eval_steps` mede loss neles. Não é preciso o `val_dataset`
+  # do run_train forkeado do ACT-D.
+  eval_split: 0.12
+
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+policy:
+  type: fastwamdepth
+  push_to_hub: false
+
+  # ── O enxerto de profundidade ──────────────────────────
+  # latent = profundidade concatenada ao latente do vídeo (correspondência
+  #          espacial por token). É a condição experimental principal.
+  # token  = um token global de contexto (linha de base barata).
+  # off    = FastWAM puro (controle).
+  depth_mode: latent
+  depth_unit: mm          # como o dataset entrega (depth_output_unit da 0.6.1)
+  depth_min: 0.05         # metros — abaixo disso é ruído/sem medida
+  depth_max: 5.0          # metros — a cena do café vive entre 0,3 e 1,8 m
+  depth_use_log: true
+  depth_train_patch_embedding: true   # obrigatório no modo latent
+
+  # ── Dimensões do robô ──────────────────────────────────
+  action_dim: 29          # 14 braços + yaw da cintura + 14 das mãos Dex3
+  proprio_dim: 29
+  action_horizon: 32
+  n_action_steps: 32
+
+  # 33 quadros amostrados de 4 em 4 → 9 quadros de vídeo, cobrindo a mesma
+  # janela temporal das 32 ações (~1,1 s a 30 fps).
+  num_video_frames: 33
+  action_video_freq_ratio: 4
+
+  # Duas câmeras de COR concatenadas na largura: 224 + 224 = 448.
+  # A profundidade NÃO entra nessa conta — ela viaja pelo latente.
+  image_size: [224, 448]
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 224, 224]
+    observation.images.right_wrist_camera:
+      type: VISUAL
+      shape: [3, 224, 224]
+    # 1 canal: é mapa de profundidade nativo, não imagem. O nome terminando em
+    # `depth` é o que faz o FastWAM-D reconhecê-lo, e o prefixo antes de
+    # `_depth` diz a qual câmera de cor ele pertence (head_camera) — é assim
+    # que a geometria cai na fatia certa do mosaico.
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [1, 480, 848]
+    observation.state:
+      type: STATE
+      shape: [29]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [29]
+
+  # ── O que treina e o que congela ───────────────────────
+  # Com 23 episódios (~11 mil quadros), destravar os 30 blocos de 5B do expert
+  # de vídeo é decorar o dataset. Congelados, eles continuam entregando o prior
+  # de cena do pré-treino em vídeo, que é a razão de usar FastWAM.
+  # Treinam: patch_embedding (canais de profundidade), action expert e o
+  # encoder de propriocepção.
+  freeze_video_expert: true
+  loss:
+    lambda_video: 0.0     # sem supervisão de vídeo: o expert está congelado
+    lambda_action: 1.0
+  use_gradient_checkpointing: true
+
+  torch_dtype: bfloat16
+  num_inference_steps: 10
+  optimizer_lr: 1.0e-4
+  optimizer_weight_decay: 1.0e-2
+
+# ==========================================================
+# TREINAMENTO
+# ==========================================================
+output_dir: "train_output/fastwamdepth_white_cup_on_dripper"
+steps: 20000
+
+# Ponto de partida para uma A100 de 80 GB. O expert congelado ainda ocupa os
+# ~10 GB de pesos; o que cresce com o batch são as ativações do action expert
+# e os tokens de vídeo. Suba até onde couber.
+batch_size: 4
+num_workers: 8
+
+log_freq: 50
+save_freq: 2000
+save_checkpoint: true
+
+# Loss nos episódios held-out a cada N steps (0 desliga).
+eval_steps: 500
+
+wandb:
+  enable: false
+  project: prometheus_g1
+  disable_artifact: true

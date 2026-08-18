@@ -19,55 +19,31 @@ from torch.optim import Optimizer
 # Add current directory to path to ensure we can import train.utils
 sys.path.append(os.getcwd())
 
-# --- MONKEY PATCHES START ---
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# guarda o original
-_original_getitem = LeRobotDataset.__getitem__
-
-def patched_getitem(self, idx):
-    # garante que o dataset está carregado (opcional, mas seguro)
-    self._ensure_hf_dataset_loaded()
-
-    # --- SEU PATCH: mapear índice global → relativo ---
-    if getattr(self, "_absolute_to_relative_idx", None) is not None:
-        if idx in self._absolute_to_relative_idx:
-            idx = self._absolute_to_relative_idx[idx]
-    # --------------------------------------------------
-
-    # delega TODO o resto para o método original
-    return _original_getitem(self, idx)
-
-# aplica o patch
-LeRobotDataset.__getitem__ = patched_getitem
-
-# Image-transform patch: aplica image_transforms APENAS em RGB, nunca em depth.
-# Color jitter / affine em mapas de profundidade destrói a geometria, então
-# removemos os transforms antes de chamar o original e re-aplicamos só nos RGB.
-def patched_getitem_rgb_only_transforms(self, idx):
-    orig_transforms = self.image_transforms
-    self.image_transforms = None
-    try:
-        item = patched_getitem(self, idx)
-    finally:
-        self.image_transforms = orig_transforms
-
-    if orig_transforms is not None:
-        for key in list(item.keys()):
-            if key.startswith("observation.images.") and "depth" not in key and torch.is_tensor(item[key]):
-                item[key] = orig_transforms(item[key])
-
-    return item
-
-LeRobotDataset.__getitem__ = patched_getitem_rgb_only_transforms
-
-# --- MONKEY PATCHES END ---
+# --- MONKEY PATCHES (removidos na migração 0.6.1) ---
+# Os dois patches daqui — remapear índice absoluto→relativo quando o YAML
+# seleciona um subconjunto de `episodes`, e aplicar o ColorJitter só nas
+# câmeras RGB — viraram comportamento nativo do LeRobot, em
+# `datasets/dataset_reader.py`:
+#
+#   - o índice é resolvido pelo próprio reader (`_absolute_to_relative_idx`);
+#   - as transformações pulam a profundidade
+#     (`for cam in camera_keys: if cam in depth_keys: continue`).
+#
+# Manter o patch quebrava o treino de saída: ele chamava
+# `self._ensure_hf_dataset_loaded()`, método que não existe mais no dataset.
 
 
 from lerobot.configs.train import TrainPipelineConfig, DatasetConfig
 @dataclasses.dataclass
 class CustomTrainPipelineConfig(TrainPipelineConfig):
     val_dataset: DatasetConfig | None = None
+    # De quantos em quantos steps rodar a validação no `val_dataset`.
+    # Na 0.6.1 o `eval_freq` do LeRobot foi partido em dois — `env_eval_freq`
+    # (rollout no simulador) e `eval_steps` (loss em episódios separados, via
+    # `eval_split`) — e sumiu com esse nome. O laço de validação aqui é nosso e
+    # usa o `val_dataset`, não o `eval_split`, então o knob volta como campo
+    # nosso, com a semântica de sempre: 0 desliga.
+    eval_freq: int = 0
     depth_fusion: bool = True
     # Fusion mode when depth_fusion=True and policy.type="pi05":
     #   "full"       — PointNet (depth) + pressure_proj (tactile)  [pi05-D, default]
@@ -78,13 +54,14 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
+# 0.6.1: `cycle` saiu de `lerobot.datasets.utils` (que virou só coisa de dataset).
+from lerobot.utils.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.rl.wandb_utils import WandBLogger
+from lerobot.common.wandb_utils import WandBLogger  # 0.6.1: era lerobot.rl.wandb_utils
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import MetricsTracker
@@ -92,7 +69,7 @@ from lerobot.utils.logging_utils import AverageMeter
 from train.utils import VarianceMeter 
 
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
+from lerobot.common.train_utils import (  # 0.6.1: era lerobot.utils.train_utils
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -348,8 +325,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
     rabc_weights = None
-    if cfg.use_rabc:
-        from lerobot.utils.rabc import RABCWeights
+    if getattr(cfg, "use_rabc", False):
+        # 0.6.1: o RA-BC virou parte do subsistema de recompensa (SARM).
+        from lerobot.rewards.sarm.rabc import RABCWeights
         chunk_size = getattr(policy.config, "chunk_size", None)
         if chunk_size is None:
             raise ValueError("Chunk size is not found in policy config")
@@ -400,6 +378,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
+            # 0.6.1: o sampler numera os quadros pelo índice ABSOLUTO do dataset
+            # inteiro, mas o `__getitem__` recebe índice RELATIVO ao subconjunto de
+            # `episodes`. Este mapa é a ponte — sem ele o treino estoura com
+            # "Invalid key: N is out of bounds" assim que o YAML seleciona episódios.
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
     else:
         shuffle = True
@@ -409,6 +392,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=0,
             shuffle=True,
+            # 0.6.1: o sampler numera os quadros pelo índice ABSOLUTO do dataset
+            # inteiro, mas o `__getitem__` recebe índice RELATIVO ao subconjunto de
+            # `episodes`. Este mapa é a ponte — sem ele o treino estoura com
+            # "Invalid key: N is out of bounds" assim que o YAML seleciona episódios.
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
 
     dataloader = torch.utils.data.DataLoader(
@@ -431,6 +419,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             episode_indices_to_use=val_dataset.episodes,
             drop_n_last_frames=getattr(cfg.policy, "drop_n_last_frames", 0),
             shuffle=False, # No need to shuffle val
+            # 0.6.1: o sampler numera os quadros pelo índice ABSOLUTO do dataset
+            # inteiro, mas o `__getitem__` recebe índice RELATIVO ao subconjunto de
+            # `episodes`. Este mapa é a ponte — sem ele o treino estoura com
+            # "Invalid key: N is out of bounds" assim que o YAML seleciona episódios.
+            absolute_to_relative_idx=val_dataset.absolute_to_relative_idx,
         )
         
         val_dataloader = torch.utils.data.DataLoader(

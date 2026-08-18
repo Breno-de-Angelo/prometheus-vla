@@ -22,8 +22,25 @@ class PointNetEncoder(nn.Module):
         x = F.relu(self.fc1(x))
         return self.fc2(x) # [Batch, output_dim]
 
-def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024):
-    """Reverte o Hack ZMQ e projeta os pixels no espaço 3D real"""
+def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024, depth_unit="mm", z_max=5.0):
+    """Projeta o mapa de profundidade métrico no espaço 3D.
+
+    O tensor chega `[B, 1, H, W]` na unidade nativa do dataset — MILÍMETROS, o
+    padrão do LeRobot 0.6.1 (`depth_output_unit`) — e cru, porque o processador
+    tira a profundidade do normalizador.
+
+    Isto MUDOU: até a migração a profundidade era gravada como imagem RGB de 8
+    bits (0–2000 mm espremidos em 0–255), o tensor chegava em [0,1] e o código
+    fazia `z = tensor * 2.0`. Com o mapa nativo esse fator erra por três ordens
+    de grandeza — e em silêncio: o treino roda normal, com a cena a ~1 km.
+
+    Args:
+        depth_unit: "mm" ou "m"; o resto da função trabalha em metros.
+        z_max: distância máxima (m) aceita na nuvem — ver o filtro abaixo.
+    """
+    if depth_unit not in ("mm", "m"):
+        raise ValueError(f"depth_unit deve ser 'mm' ou 'm', recebeu {depth_unit!r}")
+    para_metros = 0.001 if depth_unit == "mm" else 1.0
     B, C, H, W = depth_tensor.shape
     device = depth_tensor.device
 
@@ -32,9 +49,8 @@ def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024):
     grid_x = grid_x.float().unsqueeze(0).expand(B, -1, -1)
     grid_y = grid_y.float().unsqueeze(0).expand(B, -1, -1)
 
-    # 2. REVERSÃO MATEMÁTICA DO SEU HACK ZMQ (Recupera metros reais!)
-    # O tensor chega entre 0 e 1. Como 1.0 = 2000mm (2 metros), multiplicamos por 2.0.
-    z = depth_tensor[:, 0, :, :] * 2.0 
+    # 2. Unidade do dataset → metros
+    z = depth_tensor[:, 0, :, :] * para_metros
     
     # 3. Projeção Pinhole 3D
     fx, fy, cx, cy = intrinsics['fx'], intrinsics['fy'], intrinsics['cx'], intrinsics['cy']
@@ -47,7 +63,11 @@ def depth_to_pointcloud(depth_tensor, intrinsics, num_points=1024):
     sampled_pcs = []
     for b in range(B):
         pc = point_cloud[b]
-        valid_mask = pc[2, :] > 0.05 # Ignora ruído na lente (< 5cm)
+        # Piso de 5 cm: pixel sem medida volta da desquantização como o próprio
+        # `depth_min` (1 cm), não como zero. Teto de `z_max` porque a RealSense
+        # devolve alguns pixels saturados (o dataset tem max de 65 m), e um
+        # punhado deles domina a escala da nuvem.
+        valid_mask = (pc[2, :] > 0.05) & (pc[2, :] < z_max)
         valid_pc = pc[:, valid_mask]
         
         if valid_pc.shape[1] > num_points:

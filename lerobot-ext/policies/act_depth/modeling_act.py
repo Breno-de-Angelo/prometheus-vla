@@ -163,22 +163,19 @@ class ACTPolicy(PreTrainedPolicy):
     # EXTRAÇÃO DE FEATURES ACT-D
     # ──────────────────────────────────────────────────────────
 
-    # Constantes ImageNet — usadas na reversão do depth normalizado pelo factory
-    _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
-    _IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225])
-
     def _extract_depth_features(self, batch: dict[str, Tensor]) -> Tensor | None:
         """
         Remove o depth do batch e retorna o feature [B, dim_model] da PointNet.
 
-        PROBLEMA: o factory.py do LeRobot (linha 128) aplica normalização ImageNet
-        em todas as features VISUAL, incluindo o depth. Isso deixa o tensor com
-        valores negativos e a depth_to_pointcloud recebe Z completamente errado,
-        fazendo a PointNet colapsar para uma constante.
+        O tensor chega `[B, 1, H, W]` em MILÍMETROS, cru: o `processor_act.py`
+        tira a profundidade do normalizador, e o `make_dataset` da 0.6.1 já
+        pula as câmeras de profundidade ao aplicar stats do ImageNet
+        (`datasets/factory.py`: `if key in dataset.meta.depth_keys: continue`).
 
-        SOLUÇÃO: detecção automática via min() < -0.1.
-          - Treino: depth chega normalizado (negativo) → revertemos para [0,1]
-          - Inferência: depth chega cru de [0,1] → bloco não executa
+        Era aqui que morava a reversão do ImageNet, feita quando o depth era
+        gravado como imagem RGB e o factory o normalizava junto com as câmeras
+        de cor. Com o mapa de profundidade nativo ninguém mais o normaliza, e a
+        reversão passaria std/mean de 3 canais num tensor de 1 — some.
 
         Retorna None se use_depth_3d=false ou se a chave não existir no batch.
         """
@@ -189,36 +186,12 @@ class ACTPolicy(PreTrainedPolicy):
         if depth_tensor is None:
             return None
 
-        # ── Reverte normalização ImageNet aplicada pelo factory.py ──────────
-        #
-        # O factory.py do LeRobot itera dataset.meta.camera_keys e substitui
-        # as stats de TODAS as câmeras por ImageNet (mean/std), incluindo o
-        # depth. O NormalizerProcessorStep usa essas stats para normalizar.
-        #
-        # Não modificamos o LeRobot — revertemos aqui de forma determinística.
-        # use_imagenet_stats=true  → depth chegou normalizado → revertemos
-        # use_imagenet_stats=false → depth chegou em [0,1]    → não faz nada
-        #
-        # A detecção via min() < -0.1 é automática e cobre os dois casos:
-        #   normalizado: canal 0 = (0.44 - 0.485) / 0.229 ≈ -0.20 (negativo)
-        #   cru:         canal 0 = 0.44                             (positivo)
-        # Edge case coberto: inferência onde o depth chega direto da câmera
-        # sem passar pelo NormalizerProcessorStep — nenhuma reversão necessária.
-        if depth_tensor.min() < -0.1:
-            mean = (
-                self._IMAGENET_MEAN
-                .to(device=depth_tensor.device, dtype=depth_tensor.dtype)
-                .view(1, 3, 1, 1)
-            )
-            std = (
-                self._IMAGENET_STD
-                .to(device=depth_tensor.device, dtype=depth_tensor.dtype)
-                .view(1, 3, 1, 1)
-            )
-            depth_tensor = (depth_tensor * std + mean).clamp(0.0, 1.0)
 
         pc = depth_to_pointcloud(
-            depth_tensor, self.camera_intrinsics, self.config.pointnet_num_points
+            depth_tensor,
+            self.camera_intrinsics,
+            self.config.pointnet_num_points,
+            depth_unit=getattr(self.config, "depth_unit", "mm"),
         )
         return self.pointnet(pc)  # [B, dim_model]
 

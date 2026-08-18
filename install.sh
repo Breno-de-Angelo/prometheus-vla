@@ -108,7 +108,10 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
 
     # ── 5. lerobot ───────────────────────────────────────────────────────────
     passo "5/10  lerobot (fork) + extras"
-    pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset]"
+    # `training` traz accelerate e wandb — sem ele o `run_train.py` das políticas
+    # morre no `from accelerate import Accelerator`. Não é opcional para quem
+    # treina; o `dataset` sozinho só dá conta de gravar e ler dataset.
+    pip install -e "./lerobot[unitree_g1_dex3,televuer,intelrealsense,pi,dataset,training]"
 
     # ── 6. Forks vendorizados ────────────────────────────────────────────────
     passo "6/10  televuer e dex_retargeting (forks do repo, editable)"

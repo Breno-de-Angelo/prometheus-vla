@@ -31,33 +31,17 @@ sys.path.append(os.getcwd())
 # ─────────────────────────────────────────────────────────────
 # MONKEY PATCHES
 # ─────────────────────────────────────────────────────────────
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-_original_getitem = LeRobotDataset.__getitem__
-
-def patched_getitem(self, idx):
-    self._ensure_hf_dataset_loaded()
-    if getattr(self, "_absolute_to_relative_idx", None) is not None:
-        if idx in self._absolute_to_relative_idx:
-            idx = self._absolute_to_relative_idx[idx]
-    return _original_getitem(self, idx)
-
-def patched_getitem_rgb_only_transforms(self, idx):
-    """Aplica ColorJitter apenas em imagens RGB; depth nunca é distorcida."""
-    orig_transforms = self.image_transforms
-    self.image_transforms = None
-    try:
-        item = patched_getitem(self, idx)
-    finally:
-        self.image_transforms = orig_transforms
-
-    if orig_transforms is not None:
-        for key in list(item.keys()):
-            if key.startswith("observation.images.") and "depth" not in key and torch.is_tensor(item[key]):
-                item[key] = orig_transforms(item[key])
-    return item
-
-LeRobotDataset.__getitem__ = patched_getitem_rgb_only_transforms
+# Os dois patches que viviam aqui — remapear índice absoluto→relativo quando o
+# YAML seleciona um subconjunto de `episodes`, e aplicar o ColorJitter só nas
+# câmeras RGB — foram removidos na migração para a 0.6.1: o LeRobot passou a
+# fazer os dois nativamente, no `datasets/dataset_reader.py`:
+#
+#   - o índice é resolvido pelo próprio reader (`_absolute_to_relative_idx`);
+#   - as transformações pulam a profundidade
+#     (`for cam in camera_keys: if cam in depth_keys: continue`).
+#
+# Manter o patch quebrava o treino de saída: ele chamava
+# `self._ensure_hf_dataset_loaded()`, método que não existe mais no dataset.
 # ─────────────────────────────────────────────────────────────
 
 from .configuration_act import ACTConfig
@@ -69,6 +53,13 @@ from lerobot.configs.train import TrainPipelineConfig, DatasetConfig
 @dataclasses.dataclass
 class CustomTrainPipelineConfig(TrainPipelineConfig):
     val_dataset: DatasetConfig | None = None
+    # De quantos em quantos steps rodar a validação no `val_dataset`.
+    # Na 0.6.1 o `eval_freq` do LeRobot foi partido em dois — `env_eval_freq`
+    # (rollout no simulador) e `eval_steps` (loss em episódios separados, via
+    # `eval_split`) — e sumiu com esse nome. O laço de validação aqui é nosso e
+    # usa o `val_dataset`, não o `eval_split`, então o knob volta como campo
+    # nosso, com a semântica de sempre: 0 desliga.
+    eval_freq: int = 0
     # ── Novas flags de treinamento ──────────────────────────
     # Salva um checkpoint separado sempre que val_loss melhora
     save_best_checkpoint: bool = True
@@ -93,19 +84,20 @@ class CustomTrainPipelineConfig(TrainPipelineConfig):
 from lerobot.configs import parser
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
+# 0.6.1: `cycle` saiu de `lerobot.datasets.utils` (que virou só coisa de dataset).
+from lerobot.utils.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.rl.wandb_utils import WandBLogger
+from lerobot.common.wandb_utils import WandBLogger  # 0.6.1: era lerobot.rl.wandb_utils
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import MetricsTracker, AverageMeter
 from policies.act_depth.utils import VarianceMeter
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
+from lerobot.common.train_utils import (  # 0.6.1: era lerobot.utils.train_utils
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -498,30 +490,18 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
         else:
             val_dataset = None
 
-    # ── Correção ACT-D: neutraliza stats ImageNet do depth ───────────────
-    # O factory.py do LeRobot (linha 128) sobrescreve as stats de TODAS as
-    # camera_keys com ImageNet quando use_imagenet_stats=True. O depth entra
-    # como VISUAL e recebe mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225].
-    # O NormalizerProcessorStep usaria isso para normalizar o depth, fazendo
-    # todos os valores de Z ficarem negativos e a PointNet colapsar.
+    # A correção que ficava aqui — sobrescrever as stats do depth por
+    # identidade (mean=0, std=1) — saiu na migração para a 0.6.1. Ela existia
+    # porque o `make_dataset` carimbava stats do ImageNet em TODAS as
+    # camera_keys, depth incluída, e o normalizador jogava o Z para negativo.
+    # A 0.6.1 pula as câmeras de profundidade nesse ponto
+    # (`datasets/factory.py`: `if key in dataset.meta.depth_keys: continue`), e
+    # de qualquer forma o `processor_act.py` tira o depth do normalizador.
     #
-    # Solução: substituímos as stats do depth por identidade (mean=0, std=1)
-    # para que passe pelo normalizador sem alteração, chegando em [0,1] na
-    # depth_to_pointcloud — exatamente como foi gravado pelo sensor.
-    #
-    # Não modificamos o LeRobot — corrigimos externamente aqui.
-    _DEPTH_KEY = "observation.images.head_camera_depth"
-    _datasets_to_fix = [d for d in [dataset, val_dataset] if d is not None]
-    for _ds in _datasets_to_fix:
-        if _DEPTH_KEY in _ds.meta.stats:
-            _ds.meta.stats[_DEPTH_KEY]["mean"] = torch.zeros(3, 1, 1)
-            _ds.meta.stats[_DEPTH_KEY]["std"]  = torch.ones(3, 1, 1)
-    if any(_DEPTH_KEY in _ds.meta.stats for _ds in _datasets_to_fix):
-        logging.info(
-            "[ACT-D] Stats do depth resetadas para identidade (mean=0, std=1). "
-            "Depth chega na PointNet em [0,1] sem distorção ImageNet."
-        )
-    # ─────────────────────────────────────────────────────────────────────
+    # Além de virar dead code, ela agora estaria ERRADA: escrevia tensores de 3
+    # canais em stats de um mapa de 1 canal, e apagava as stats reais (em mm)
+    # que o visualizador usa para a escala de cor.
+
 
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
@@ -585,8 +565,9 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
     rabc_weights = None
-    if cfg.use_rabc:
-        from lerobot.utils.rabc import RABCWeights
+    if getattr(cfg, "use_rabc", False):
+        # 0.6.1: o RA-BC virou parte do subsistema de recompensa (SARM).
+        from lerobot.rewards.sarm.rabc import RABCWeights
         chunk_size = getattr(policy.config, "chunk_size", None)
         if chunk_size is None:
             raise ValueError("chunk_size não encontrado na configuração da política")
@@ -634,6 +615,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
+            # 0.6.1: o sampler numera os quadros pelo índice ABSOLUTO do dataset
+            # inteiro, mas o `__getitem__` recebe índice RELATIVO ao subconjunto de
+            # `episodes`. Este mapa é a ponte — sem ele o treino estoura com
+            # "Invalid key: N is out of bounds" assim que o YAML seleciona episódios.
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
     else:
         shuffle = True
@@ -643,6 +629,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=0,
             shuffle=True,
+            # 0.6.1: o sampler numera os quadros pelo índice ABSOLUTO do dataset
+            # inteiro, mas o `__getitem__` recebe índice RELATIVO ao subconjunto de
+            # `episodes`. Este mapa é a ponte — sem ele o treino estoura com
+            # "Invalid key: N is out of bounds" assim que o YAML seleciona episódios.
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
 
     dataloader = torch.utils.data.DataLoader(
@@ -664,6 +655,11 @@ def train(cfg: CustomTrainPipelineConfig, accelerator: Accelerator | None = None
             episode_indices_to_use=val_dataset.episodes,
             drop_n_last_frames=getattr(cfg.policy, "drop_n_last_frames", 0),
             shuffle=False,
+            # 0.6.1: o sampler numera os quadros pelo índice ABSOLUTO do dataset
+            # inteiro, mas o `__getitem__` recebe índice RELATIVO ao subconjunto de
+            # `episodes`. Este mapa é a ponte — sem ele o treino estoura com
+            # "Invalid key: N is out of bounds" assim que o YAML seleciona episódios.
+            absolute_to_relative_idx=val_dataset.absolute_to_relative_idx,
         )
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset,

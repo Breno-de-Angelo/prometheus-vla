@@ -449,12 +449,32 @@ def depth_to_pointcloud(
     depth_tensor: torch.Tensor,
     intrinsics: dict,
     num_points: int = 1024,
+    depth_unit: str = "mm",
+    z_max: float = 5.0,
 ) -> torch.Tensor:
     """
     Projeta mapa de profundidade em nuvem de pontos 3D.
 
-    O tensor de profundidade chega normalizado em [0,1], onde 1.0 = 2 metros.
+    O tensor chega `[B, 1, H, W]` na unidade nativa do dataset — MILÍMETROS,
+    que é o padrão do LeRobot 0.6.1 (`depth_output_unit`). Nada de normalizar:
+    `processor_act.py` tira a profundidade do normalizador de propósito, porque
+    a projeção pinhole precisa da distância métrica de verdade.
+
+    Isto mudou: até a migração o dataset guardava profundidade como imagem RGB
+    de 8 bits (0–2000 mm espremidos em 0–255), então o tensor chegava em [0,1]
+    e o código fazia `z = tensor * 2.0`. Com o mapa de profundidade nativo esse
+    fator ficou errado por três ordens de grandeza — um dataset gravado no
+    formato novo treinado com o fator velho põe a cena a 1,2 km de distância.
+
+    Args:
+        depth_unit: unidade do tensor de entrada, "mm" ou "m". Ela vem de
+            `dataset.depth_output_unit`; o resto da função trabalha em metros.
+        z_max: distância máxima (m) aceita na nuvem — ver o filtro lá embaixo.
     """
+    if depth_unit not in ("mm", "m"):
+        raise ValueError(f"depth_unit deve ser 'mm' ou 'm', recebeu {depth_unit!r}")
+    para_metros = 0.001 if depth_unit == "mm" else 1.0
+
     B, C, H, W = depth_tensor.shape
     device = depth_tensor.device
 
@@ -466,7 +486,7 @@ def depth_to_pointcloud(
     grid_x = grid_x.float().unsqueeze(0).expand(B, -1, -1)
     grid_y = grid_y.float().unsqueeze(0).expand(B, -1, -1)
 
-    z  = depth_tensor[:, 0, :, :] * 2.0
+    z  = depth_tensor[:, 0, :, :] * para_metros
     fx, fy = intrinsics["fx"], intrinsics["fy"]
     cx, cy = intrinsics["cx"], intrinsics["cy"]
     x  = (grid_x - cx) * z / fx
@@ -477,7 +497,12 @@ def depth_to_pointcloud(
     sampled_pcs = []
     for b in range(B):
         pc         = point_cloud[b]
-        valid_mask = pc[2, :] > 0.05
+        # Piso de 5 cm: pixel sem medida volta da desquantização como o próprio
+        # `depth_min` (1 cm), não como zero — sem o piso ele viraria uma parede
+        # falsa colada na lente. Teto de `z_max` porque a RealSense devolve
+        # alguns pixels saturados (o dataset tem max de 65 m); um punhado deles
+        # domina a escala da nuvem e a PointNet aprende o ruído.
+        valid_mask = (pc[2, :] > 0.05) & (pc[2, :] < z_max)
         valid_pc   = pc[:, valid_mask]
 
         if valid_pc.shape[1] >= num_points:

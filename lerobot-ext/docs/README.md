@@ -11,6 +11,8 @@ Na ordem em que você vai precisar:
 | [DATASETS_MULTITAREFA.md](DATASETS_MULTITAREFA.md) | Como gravar uma tarefa por dataset e juntar tudo num dataset multi-tarefa. Congelar o schema antes de gravar, string de `task`, balanceamento, merge, teste no MuJoCo. **Leia antes de gravar a primeira demo.** |
 | [TREINO_PASSO_A_PASSO.md](TREINO_PASSO_A_PASSO.md) | Roteiro linear: treinar a tarefa que já temos, e depois acrescentar a segunda. Orçamento de tempo medido, o que acompanhar no log, e por que fine-tune sequencial não produz multi-tarefa. |
 | [SCHEMA_G1_V2.md](SCHEMA_G1_V2.md) | Yaw do tronco (28→29 dims) e câmera de pulso. O que muda em cada arquivo, por que roll/pitch ficam travados, e a medição do ponto de suporte no MuJoCo. **Muda o schema — leia antes de gravar.** |
+| [PROFUNDIDADE_NATIVA.md](PROFUNDIDADE_NATIVA.md) | Profundidade métrica de ponta a ponta: uint16 em mm no ZMQ, mapa de 1 canal no dataset, milímetros na nuvem de pontos. As duas pontas têm que casar — mudar uma só dá dado errado em silêncio. **Leia antes de mexer em câmera, servidor ou política com depth.** |
+| [MIGRACAO_CODIGO_061.md](MIGRACAO_CODIGO_061.md) | O que quebrou no nosso código na subida para a 0.6.1: símbolos que mudaram de módulo, `eval_freq`/`vcodec` que sumiram dos configs, o índice do sampler, e os monkeypatches que viraram comportamento nativo. |
 | [SIM_REMOTO.md](SIM_REMOTO.md) | MuJoCo no seu PC, modelo de 7B na atena. Portas, IPs, e por que testar condicionamento por linguagem no simulador e não no robô. |
 | [INFERENCIA_COMANDO_TEXTO.md](INFERENCIA_COMANDO_TEXTO.md) | Rodar o robô mandando o comando em texto. `--task`, troca de comando em tempo de execução, e o teste que revela se o modelo está mesmo lendo o prompt. |
 
@@ -29,6 +31,7 @@ Na ordem em que você vai precisar:
 | [OPENVLA_DEPTH.md](OPENVLA_DEPTH.md) | **OpenVLA-Depth** — VLA multi-tarefa condicionado por texto, com profundidade e tato. Head OFT paralelo. |
 | [../policies/pi0_depth/README.md](../policies/pi0_depth/README.md) | **PI05-Depth** — flow matching + depth + tato. Como funciona a validação e o mapa das 28 juntas. |
 | [../policies/act_depth/README.md](../policies/act_depth/README.md) | **ACT-D** — ACT + PointNet/PointTransformer + tato. Sem linguagem. |
+| [../policies/fastwam_depth/README.md](../policies/fastwam_depth/README.md) | **FastWAM-D** — world action model (Wan2.2-5B) com profundidade métrica no latente. Texto, prior espacial de pré-treino em vídeo, e ablação embutida (latent/token/off). Precisa de GPU grande. |
 | [../train/train.md](../train/train.md) | Arquitetura do ACT-D e o pipeline de ingestão de dados. |
 
 ### Qual usar

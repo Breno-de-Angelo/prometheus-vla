@@ -55,8 +55,6 @@ from .configuration_openvla import OPENVLADEPTHConfig
 # Estatísticas ImageNet — usadas para desfazer a normalização que o
 # `lerobot/datasets/factory.py` aplica indiscriminadamente a TODA feature VISUAL,
 # incluindo o mapa de profundidade. Mesmo tratamento do act_depth/pi0_depth.
-_IMAGENET_MEAN = (0.485, 0.456, 0.406)
-_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
@@ -403,7 +401,11 @@ class OPENVLADEPTHPolicy(PreTrainedPolicy):
             img = batch[key].to(device=device, dtype=torch.float32)
 
             if "depth" in key.lower():
-                depth_images.append(self._undo_imagenet_norm(img))
+                # Crua, em MILÍMETROS: a 0.6.1 pula as câmeras de profundidade
+                # ao carimbar stats do ImageNet (`datasets/factory.py`), então
+                # não há normalização a desfazer — a reversão que existia aqui
+                # virou dead code e foi removida.
+                depth_images.append(img)
                 continue
 
             if img.shape[1] != 3:  # channels-last → channels-first
@@ -423,25 +425,6 @@ class OPENVLADEPTHPolicy(PreTrainedPolicy):
                 f"Nenhuma câmera RGB no batch. Esperava alguma de {self.config.rgb_keys}."
             )
         return rgb_pixel_values, depth_images
-
-    @staticmethod
-    def _undo_imagenet_norm(depth: Tensor) -> Tensor:
-        """
-        Desfaz a normalização ImageNet aplicada por engano ao mapa de profundidade.
-
-        O `factory.py` do LeRobot sobrescreve as stats de TODA feature VISUAL com
-        ImageNet quando `use_imagenet_stats=True`, o que inclui a câmera de depth.
-        O resultado tem valores negativos e destrói a projeção pinhole. Detecção
-        pelo sinal: se o mínimo é bem negativo, foi normalizado.
-
-        Treino → chega normalizado, revertemos. Inferência → chega cru em [0,1],
-        o bloco não executa.
-        """
-        if depth.min() >= -0.1:
-            return depth
-        mean = torch.tensor(_IMAGENET_MEAN, device=depth.device, dtype=depth.dtype).view(1, 3, 1, 1)
-        std = torch.tensor(_IMAGENET_STD, device=depth.device, dtype=depth.dtype).view(1, 3, 1, 1)
-        return (depth * std + mean).clamp(0.0, 1.0)
 
     def _extract_pressure(self, batch: dict[str, Tensor]) -> Tensor | None:
         if not self.config.use_pressure:
