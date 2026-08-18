@@ -159,12 +159,26 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
     # A 0.6.1 exige >=5.4,<5.6; o env antigo tinha 5.6.1, fora do range.
     pip install "transformers>=5.4.0,<5.6.0"
 
+    # ── 8b. OpenCV COM interface gráfica ─────────────────────────────────────
+    # O core do lerobot depende de `opencv-python-headless`, que é compilado com
+    # `GUI: NONE`: com ele, TODA janela de visualização deste repo é impossível —
+    # `cv2.namedWindow`/`imshow` não existem no build. Sem isto, o `--v` da
+    # teleoperação, o `--v-attn` da inferência e o `--v-debug` do FastWAM-D
+    # simplesmente não abrem tela.
+    #
+    # Os dois pacotes instalam o MESMO módulo `cv2`, então quem for instalado por
+    # último vence. Por isso este passo vem DEPOIS de tudo e usa `--no-deps` (não
+    # há por que deixar o resolvedor remexer em numpy por causa disto).
+    #
+    # Confira com:  python -c "import cv2; print(cv2.getBuildInformation())" | grep GUI
+    passo "8b/10  opencv-python (build com GUI, por cima do headless)"
+    pip install --no-deps "opencv-python>=4.9.0,<4.14.0"
+
     # ── 9. MuJoCo (opcional) ─────────────────────────────────────────────────
     if [[ $COM_MUJOCO -eq 1 ]]; then
         passo "9/10  mujoco (simulação)"
-        # NÃO instale unitree-g1-mujoco/requirements.txt: ele pede opencv-python
-        # (não-headless), que instala o MESMO módulo cv2 do opencv-python-headless de
-        # que o lerobot depende — dois binários brigando pelo mesmo import.
+        # NÃO instale unitree-g1-mujoco/requirements.txt: ele arrasta um pacote de
+        # opencv de novo e pode reverter o passo 8b para o headless.
         pip install mujoco loguru msgpack msgpack-numpy matplotlib
     else
         passo "9/10  mujoco — pulado (--sem-mujoco)"

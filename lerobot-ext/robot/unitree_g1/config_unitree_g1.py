@@ -31,8 +31,8 @@ _GAINS: dict[str, dict[str, list[float]]] = {
     #   waist_lock → roll e pitch, TRAVADOS em posição neutra
     # Separadas, dá para endurecer a trava sem alterar a resposta do yaw.
     # A ordem no vetor plano continua sendo yaw(12), roll(13), pitch(14).
-    "waist_yaw": {"kp": [250], "kd": [5]},          # 12
-    "waist_lock": {"kp": [250, 250], "kd": [5, 5]},  # 13 roll, 14 pitch
+    "waist_yaw": {"kp": [300], "kd": [6]},          # 12
+    "waist_lock": {"kp": [300, 300], "kd": [6, 6]},  # 13 roll, 14 pitch
     # ⚠️ TEMPORÁRIO — BRAÇO ESQUERDO DESLIGADO (defeito de hardware).
     # kp=0 e kd=0 com mode=1: o motor recebe o alvo mas não gera torque nenhum,
     # então o braço fica COMPLETAMENTE MOLE e cai por gravidade assim que o

@@ -336,6 +336,12 @@ class FastWAMDepthPolicy(FastWAMPolicy):
                 f"{self.config.depth_feature_keys}. Use `depth_mode: off` para rodar sem."
             )
 
+        # Só para depuração na inferência (`debug_inferencia.CapturaDebug`): é o
+        # mosaico normalizado como o VAE o recebeu. Desligado por padrão porque
+        # segurar esse tensor durante o treino é memória de GPU parada.
+        if getattr(self, "guardar_video_depth", False):
+            self._ultimo_video_depth = video_depth
+
         with torch.no_grad():
             # Sem gradiente de propósito: o VAE é congelado e nada antes dele é
             # treinável, então guardar o grafo só gastaria memória de ativação —

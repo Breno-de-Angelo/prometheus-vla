@@ -5,8 +5,14 @@
 # pesos em bf16 já passam de 10 GB, então isto NÃO roda no notebook de 8 GB.
 #
 #   cd lerobot-ext
+#   HF_HOME=/data/.cache/huggingface \
+#   CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
 #   python -m policies.fastwam_depth.run_train \
 #       --config_path=config/train/fastwamdepth_white_cup_on_dripper.yaml
+#
+# O `HF_HOME` é obrigatório na athena: o disco de sistema (`/`) está em 100% e
+# os pesos do Wan (DiT de 5B + encoder de texto UMT5-XXL) passam de 25 GB. Eles
+# e a saída do treino vivem no disco de dados (`/data`, 12 TB livres).
 #
 # Ver policies/fastwam_depth/README.md para o desenho do enxerto e para a
 # tabela de ablação (latent / token / off).
@@ -109,7 +115,9 @@ policy:
 # ==========================================================
 # TREINAMENTO
 # ==========================================================
-output_dir: "train_output/fastwamdepth_white_cup_on_dripper"
+# Fora do repo e fora do disco de sistema, pelo mesmo motivo do `HF_HOME` acima.
+# Sobrescrevível com `--output_dir=...` em outra máquina.
+output_dir: "/data/train_output/fastwamdepth_white_cup_on_dripper"
 steps: 20000
 
 # Ponto de partida para uma A100 de 80 GB. O expert congelado ainda ocupa os
@@ -119,13 +127,30 @@ batch_size: 4
 num_workers: 8
 
 log_freq: 50
-save_freq: 2000
 save_checkpoint: true
 
 # Loss nos episódios held-out a cada N steps (0 desliga).
 eval_steps: 500
 
+# `save_freq` aqui é "de quantos em quantos steps CONSIDERAR salvar": o
+# `run_train.py` só escreve quando o `eval_loss` melhora, e sempre por cima de
+# `checkpoints/best` (ver o cabeçalho dele). Um checkpoint deste modelo carrega
+# o expert de vídeo de 5B inteiro, então guardar um por step de save encheria
+# o disco antes do fim do treino.
+#
+# Tem que ser MÚLTIPLO de `eval_steps` — é o que garante que todo step de save
+# tenha um eval fresco para comparar. Se não for, o save cai no caminho do
+# aviso e escreve sem critério.
+save_freq: 1000
+
+# O nome que aparece no wandb. A ablação sobrescreve na linha de comando
+# (`--job_name=fastwamdepth_token`), senão as três corridas viram o mesmo nome.
+job_name: fastwamdepth_latent
+
 wandb:
-  enable: false
+  enable: true
   project: prometheus_g1
+  # Sem artefato: cada checkpoint deste modelo leva o expert de vídeo de 5B, e
+  # subir isso a cada save é lento e sem uso — o que interessa comparar entre as
+  # três condições da ablação são as curvas.
   disable_artifact: true

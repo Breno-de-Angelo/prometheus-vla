@@ -104,6 +104,24 @@ batch, ou o `torch.cat` quebra pelos canais, ou (se alguém declarasse 3 canais)
 ele entra como se fosse mais uma câmera de cor. Por isso a profundidade é
 retirada do batch antes de chamar o caminho de origem.
 
+**O `set_dataset_feature_metadata` conta a profundidade como câmera de cor.**
+Esse gancho do FastWAM roda dentro do `make_policy` e **descarta o
+`input_features` do YAML**, reconstruindo tudo a partir das chaves do dataset —
+toda chave `observation.images.*` vira câmera de cor, com 3 canais e
+`image_size[1] // n_cameras` de largura. Com o mapa de profundidade no dataset
+isso dá `448 // 3 = 149` px por câmera, e o `validate_features` (que tira a
+profundidade da conta) vê as duas câmeras de cor somando 298 em vez de 448:
+
+    ValueError: FastWAM image feature widths must sum to 448, got 298.
+
+O erro estoura ao criar a política, depois de já ter carregado o dataset — o
+YAML estava certo o tempo todo, só nunca chegou a ser usado. A subclasse
+sobrescreve o gancho: a largura é repartida **só entre as câmeras de cor**, e a
+profundidade entra na resolução nativa dela, com os canais que o dataset
+gravou. Os canais vêm do dataset de propósito: um dataset antigo, de quando a
+profundidade era imagem de 8 bits em 3 canais, tem que estourar com a mensagem
+que explica o que houve, e não ser redeclarado como métrico em silêncio.
+
 **O loader de checkpoint descartaria o `patch_embedding`.** O
 `_load_as_safetensor` do FastWAM ignora tensores com shape incompatível e deixa
 o parâmetro no valor recém-inicializado. Como ampliamos a entrada de 48 para 96
@@ -131,9 +149,32 @@ seria treinar às cegas sem nenhum sinal de que algo está errado.
 
 ```bash
 cd lerobot-ext
+HF_HOME=/data/.cache/huggingface CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
 python -m policies.fastwam_depth.run_train \
     --config_path=config/train/fastwamdepth_white_cup_on_dripper.yaml
 ```
+
+Na athena existe `/data/train_output/launch_fastwamd.sh`, que embrulha isso e
+escolhe a GPU com mais memória livre (`bash launch_fastwamd.sh` para automático,
+`bash launch_fastwamd.sh 0` para fixar). As duas variáveis de ambiente não são
+decoração:
+
+- **`HF_HOME=/data/...`** — os pesos do Wan (DiT de 5B + encoder de texto
+  UMT5-XXL) passam de 25 GB e o disco de sistema da athena vive perto de 100%.
+- **`CUDA_VISIBLE_DEVICES`** — as três A100 são compartilhadas com outras
+  pessoas. Só os pesos ocupam ~21 GB, então uma GPU com 20 GB livres dá
+  `OutOfMemoryError` antes do primeiro step, com qualquer `batch_size`.
+
+### Checkpoint: só o melhor
+
+O `run_train.py` guarda **um** checkpoint, em `checkpoints/best`, reescrito
+sempre que o `eval_loss` melhora (e publicado por rename atômico, então o que
+está em `best` é sempre um checkpoint íntegro). Um checkpoint deste modelo leva
+o expert de vídeo de 5B inteiro; o laço nativo do LeRobot não tem noção de
+"melhor" e nunca apaga o antigo, então salvar a cada `save_freq` encheria o
+disco antes do fim das 20 mil steps. Por isso `save_freq` tem que ser múltiplo
+de `eval_steps` — é o que garante um eval fresco para comparar em todo step de
+save.
 
 Ablação (mesmo YAML, três corridas):
 
@@ -173,7 +214,20 @@ treino):
 - corte temporal do latente na inferência (o expert de vídeo só vê o primeiro
   quadro);
 - erro levantado quando a profundidade falta;
-- ampliação do `patch_embedding` no carregamento de checkpoint.
+- ampliação do `patch_embedding` no carregamento de checkpoint;
+- `set_dataset_feature_metadata` com o `meta/info.json` real do dataset, nos
+  três modos, mais os casos de dataset legado (profundidade em 3 canais) e de
+  dataset sem nenhuma câmera de cor;
+- batch de verdade saído do `LeRobotDataset` (episódio 0, 9 quadros): depth
+  `[1,9,1,480,848]` em milímetros (10–1792), normalizado para 0–0,777, mosaico
+  `[1,3,9,224,448]` alinhado ao de cor, fatia da cabeça com geometria e a do
+  pulso zerada;
+- política de checkpoint: salva no primeiro eval, pula o pior, republica no
+  melhor, e o disco fica só com `best` e o link `last`.
+
+Na athena, com o checkpoint real de 5B, o enxerto reportou:
+
+    [FastWAM-D] patch_embedding 48 → 96 canais (novos em zero, treináveis=True)
 
 **Falta rodar na athena:** um treino de verdade. Em especial, se o VAE do Wan
 produz latente útil para um mapa de profundidade em cinza (a aposta da decisão

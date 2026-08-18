@@ -8,9 +8,11 @@ como a profundidade entra no modelo. Ver `README.md` para o desenho.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from lerobot.configs import PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
+from lerobot.utils.constants import OBS_STATE
 
 # Modos de fusão da profundidade, do mais forte ao mais barato.
 DEPTH_MODE_LATENT = "latent"
@@ -110,6 +112,71 @@ class FastWAMDepthConfig(FastWAMConfig):
         """
         dono = depth_key.removesuffix("_depth")
         return dono if dono in self.input_features else None
+
+    def set_dataset_feature_metadata(self, dataset_features: dict[str, Any]) -> None:
+        """Reconstrói as features visuais a partir das chaves reais do dataset.
+
+        O `make_policy` chama este gancho assim que conhece o dataset e ele
+        DESCARTA o `input_features` do YAML. O de origem
+        (`FastWAMConfig.set_dataset_feature_metadata`) trata toda chave
+        `observation.images.*` como câmera de cor: reparte a largura do mosaico
+        entre TODAS elas e declara cada uma com 3 canais. Com o mapa de
+        profundidade no dataset isso erra duas vezes — a profundidade nasceria
+        com 3 canais e 149 px de largura, e as duas câmeras de cor passariam a
+        somar 298 em vez de 448 (é o `ValueError` que estoura ao criar a
+        política).
+
+        Aqui a largura é repartida SÓ entre as câmeras de cor, e a profundidade
+        entra na resolução nativa dela, com os canais que o dataset gravou —
+        ela não ocupa largura no mosaico de cor, viaja pelo latente (ver
+        `README.md`). Os canais vêm do dataset em vez de fixos em 1 de
+        propósito: um dataset antigo, gravado quando a profundidade era imagem
+        de 8 bits em 3 canais, tem que estourar no `validate_features` com a
+        mensagem que diz o que houve, e não ser silenciosamente redeclarado
+        como se fosse métrico.
+        """
+        chaves_imagem = sorted(
+            chave
+            for chave, feature in dataset_features.items()
+            if chave.startswith("observation.images.") and feature.get("dtype") in ("video", "image")
+        )
+        if not chaves_imagem:
+            return
+
+        chaves_depth = [k for k in chaves_imagem if k.endswith("depth")]
+        chaves_rgb = [k for k in chaves_imagem if not k.endswith("depth")]
+        if not chaves_rgb:
+            raise ValueError(
+                "O dataset só tem câmeras de profundidade "
+                f"({chaves_depth}). O FastWAM-D é um enxerto no vídeo de COR: "
+                "sem uma câmera de cor não há mosaico onde encaixar a geometria."
+            )
+
+        altura, largura_total = self.image_size
+        largura_camera = largura_total // len(chaves_rgb)
+        novas: dict[str, PolicyFeature] = {
+            chave: PolicyFeature(type=FeatureType.VISUAL, shape=(3, altura, largura_camera))
+            for chave in chaves_rgb
+        }
+
+        for chave in chaves_depth:
+            forma = tuple(dataset_features[chave].get("shape") or ())
+            if len(forma) != 3:
+                raise ValueError(
+                    f"Feature de profundidade `{chave}` com shape {forma} no dataset; "
+                    "esperava (H, W, C)."
+                )
+            h_depth, w_depth, c_depth = (int(v) for v in forma)
+            # A resolução nativa é preservada: quem redimensiona é o
+            # `monta_video_profundidade`, que precisa da fatia do mosaico e não
+            # da largura por câmera declarada aqui.
+            novas[chave] = PolicyFeature(type=FeatureType.VISUAL, shape=(c_depth, h_depth, w_depth))
+
+        if self.proprio_dim is not None and OBS_STATE in dataset_features:
+            novas[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(self.proprio_dim,))
+
+        self.input_features = novas
+        self.validate_features()
 
     def validate_features(self) -> None:
         """Valida as features de cor com a regra do FastWAM, ignorando a profundidade.
