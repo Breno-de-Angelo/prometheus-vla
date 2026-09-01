@@ -80,9 +80,15 @@ conda env config vars set -n prometheus-vla OMP_NUM_THREADS=1   # §2.11
 pip install flask pytest
 pip install "transformers>=5.4.0,<5.6.0"   # só se algum passo trouxe fora do range
 
+# ── 8b. opencv COM interface gráfica, POR CIMA do headless ──────────────────
+#    O lerobot depende do headless, compilado com GUI: NONE — com ele, nenhum
+#    `--v`/`--v-attn`/`--v-debug` abre janela. Os dois pacotes escrevem o mesmo
+#    cv2 e vence quem instala por último, então este passo vem no fim. Ver §2.12.
+pip install --no-deps "opencv-python>=4.9.0,<4.14.0"
+
 # ── 9. opcional: simulação MuJoCo ───────────────────────────────────────────
-#    NÃO use unitree-g1-mujoco/requirements.txt: ele pede opencv-python
-#    (não-headless) e reintroduz o conflito de dois cv2 do §2.1.
+#    NÃO use unitree-g1-mujoco/requirements.txt: o `opencv-python>=4.8.0` dele é
+#    sem teto e pode reverter o passo 8b (§2.12), além de remexer no numpy.
 pip install mujoco loguru msgpack msgpack-numpy matplotlib
 
 # ── 10. conferir ────────────────────────────────────────────────────────────
@@ -130,7 +136,7 @@ tag e no que está instalado no env `g1`:
 | **huggingface-hub** | `<0.36` | `>=1.6.0,<2.0.0` | Major bump |
 | **draccus** | `==0.10.0` | `>=0.11.6,<0.12.0` | Precisa subir |
 | **params-proto** | 2.13.2 | — (dep do vuer) | Armadilha — ver §2.2 |
-| **opencv** | `opencv-python` 4.11 **e** `-headless` 4.12 | `-headless>=4.9,<4.14` | Dois `cv2` — ver §2.1 |
+| **opencv** | `opencv-python` 4.11 **e** `-headless` 4.12 | `-headless>=4.9,<4.14` | Os dois convivem, mas a ORDEM decide — ver §2.12 |
 
 Dois pontos que não são óbvios e explicam a dor de cabeça atual:
 
@@ -189,9 +195,14 @@ execução** (§2.4).
 
 Junto veio uma segunda correção: o televuer pedia `opencv-python` sem teto, que resolvia
 para a **5.0.0.93**, enquanto o lerobot depende de `opencv-python-headless>=4.9,<4.14`.
-Os dois pacotes instalam o **mesmo módulo `cv2`** — ter ambos é conflito de binários (o
-env `g1` tem exatamente isso: 4.11 e 4.12 lado a lado). O televuer só usa `cvtColor` e
-`resize`, nunca `imshow`/`waitKey`, então headless serve e alinha com o lerobot.
+Os dois pacotes instalam o **mesmo módulo `cv2`**, e o 5.x que o televuer resolvia ficava
+fora do range do lerobot. O televuer só usa `cvtColor` e `resize`, nunca
+`imshow`/`waitKey`, então declarar o headless serve e alinha com o lerobot.
+
+> O que mudou depois: o env final tem os **dois** pacotes de propósito, porque as
+> janelas de debug precisam do build com GUI. Não é o conflito descrito aqui — é ordem
+> de instalação, e está no §2.12. O que continua valendo é o pin do televuer: ele nunca
+> deve ser quem escolhe a versão do `cv2`.
 
 O estado atual do arquivo:
 
@@ -415,10 +426,11 @@ install_requires=["cyclonedds==0.10.2", "numpy", "opencv-python"]
 
   Isso interrompe a instalação inteira — foi o que travou a primeira máquina nova. O
   **11.0.1 tem wheel** para py3.12 e é a versão do env validado.
-- **`opencv-python`** é o não-headless, e instala o mesmo módulo `cv2` do
-  `opencv-python-headless` de que o lerobot depende: dois binários disputando o mesmo
-  import, resolvido por ordem de instalação (§2.1). Esta é a via mais comum de o
-  problema do §2.1 voltar depois de resolvido.
+- **`opencv-python`** instala o mesmo módulo `cv2` do `opencv-python-headless` de que o
+  lerobot depende, e sem teto de versão. Não é que o não-headless seja indesejado — o
+  passo 8b instala ele de propósito (§2.12) —, é que instalado **aqui** ele entra antes
+  do lerobot, que reverte tudo para o headless no passo seguinte, e numa versão que
+  ninguém escolheu.
 - `numpy` é inofensiva, e já vem pelo torch/lerobot.
 
 Como nenhuma das três precisa vir daqui, a instalação correta é:
@@ -433,8 +445,8 @@ O `-e ./unitree_sdk2_python` (submódulo) em vez de
 sozinho, e o SHA que testamos é o que está registrado no submódulo. O `install.sh` fazia
 o clone direto do GitHub até isto ser corrigido.
 
-O passo 9 do §5 confere as duas coisas — falha se o `cyclonedds` não importar e falha se
-`opencv-python` reaparecer ao lado do headless.
+A verificação do `install.sh` (passo 10) confere as duas coisas — falha se o `cyclonedds`
+não importar e falha se o `cv2` resultante for o headless (`GUI: NONE`).
 
 ### 2.11 pinocchio + casadi vêm do conda-forge, e o IK exige `OMP_NUM_THREADS=1`
 
@@ -495,6 +507,52 @@ conda activate prometheus-vla   # só passa a valer na próxima ativação
 O `install.sh` grava a variável e avisa (sem falhar) se ela não estiver valendo na
 sessão da verificação — o que é esperado logo após a instalação, já que o env ainda não
 foi reativado.
+
+### 2.12 opencv: o headless é dependência, o com-GUI é o que fica por cima
+
+O core do lerobot depende de `opencv-python-headless`, um build compilado com
+`GUI: NONE`. Nele `cv2.imshow`/`namedWindow` existem como símbolo mas estouram na
+primeira chamada:
+
+```
+cv2.error: The function is not implemented. Rebuild the library with Windows, GTK+ 2.x
+or Cocoa support.
+```
+
+Ou seja: com só o headless, **nenhuma janela deste repo abre** — nem o `--v` da
+teleoperação, nem o `--v-attn` da inferência, nem o `--v-debug` do FastWAM-D.
+
+`opencv-python` e `opencv-python-headless` escrevem o **mesmo** `site-packages/cv2/`, com
+nomes de distribuição diferentes — a mesma armadilha silenciosa do `pin` × `pinocchio`
+(§2.11). Nenhum pip vê o outro, e **vence quem instalou por último**. Como o headless é
+dependência declarada do lerobot e não dá para removê-lo sem quebrar o requisito, a
+solução é deixar os dois instalados e garantir a ordem:
+
+```bash
+pip install --no-deps "opencv-python>=4.9.0,<4.14.0"   # por último, sempre
+```
+
+O `--no-deps` é para o resolvedor não remexer no numpy por causa disto.
+
+Portanto, **ver os dois pacotes no `pip list` é o estado correto**, não um problema:
+
+```
+opencv-python            4.13.0.92
+opencv-python-headless   4.13.0.92
+```
+
+O que importa não é a lista, é o build que sobrou. A verificação do §5 e do `install.sh`
+checa exatamente isso:
+
+```bash
+python -c "import cv2; print([l for l in cv2.getBuildInformation().splitlines() if l.strip().startswith('GUI:')])"
+# esperado: GUI: QT5 (ou GTK3) — se vier NONE, o headless ficou por cima
+```
+
+Quem costuma desfazer isto: `unitree_sdk2py` sem `--no-deps` (§2.10),
+`unitree-g1-mujoco/requirements.txt` (§8.1) e qualquer reinstalação do lerobot. Em todos
+os casos, o conserto é uma linha — rodar o `pip install` acima de novo, com
+`--force-reinstall` se a versão já estiver registrada.
 
 ---
 
@@ -857,8 +915,8 @@ Estes pontos não dá para verificar sem o robô e sem o rebase concluído:
 
 - **`mujoco` 3.11.0 instalado e validado** (`pip install mujoco loguru msgpack
   msgpack-numpy matplotlib`). Não instale o `unitree-g1-mujoco/requirements.txt` inteiro:
-  ele pede `opencv-python` (não-headless), que reintroduz o conflito de dois `cv2` do
-  §2.1. O que foi verificado: os módulos de `unitree-g1-mujoco/sim/` importam, e
+  ele pede `opencv-python>=4.8.0` sem teto, que pode desfazer o passo 8b (§2.12) e ainda
+  remexe no numpy. O que foi verificado: os módulos de `unitree-g1-mujoco/sim/` importam, e
   `scene_43dof.xml` carrega e roda 500 passos de física (nq=57, nv=55) com qpos finito.
   **A renderização não foi testada** — precisa de display; nesta máquina, headless, o
   backend `osmesa` não está disponível. A física, que é o que a simulação usa, não

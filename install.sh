@@ -171,8 +171,16 @@ if [[ $SO_VERIFICAR -eq 0 ]]; then
     # há por que deixar o resolvedor remexer em numpy por causa disto).
     #
     # Confira com:  python -c "import cv2; print(cv2.getBuildInformation())" | grep GUI
+    # Detalhes em docs/INSTALL.md §2.12 (inclusive o que costuma desfazer isto).
     passo "8b/10  opencv-python (build com GUI, por cima do headless)"
-    pip install --no-deps "opencv-python>=4.9.0,<4.14.0"
+    # Numa reexecução o pip vê o opencv-python já satisfeito e não reescreve nada — mas
+    # o passo 5 pode ter reinstalado o headless por cima nesse meio-tempo. Por isso a
+    # decisão é pelo build de fato, não pela lista de pacotes.
+    if python -c "import cv2,sys; sys.exit(0 if any(l.strip().startswith('GUI:') and l.split(':',1)[1].strip() not in ('','NONE') for l in cv2.getBuildInformation().splitlines()) else 1)" 2>/dev/null; then
+        echo "  cv2 já é o build com GUI — nada a fazer"
+    else
+        pip install --no-deps --force-reinstall "opencv-python>=4.9.0,<4.14.0"
+    fi
 
     # ── 9. MuJoCo (opcional) ─────────────────────────────────────────────────
     if [[ $COM_MUJOCO -eq 1 ]]; then
@@ -229,15 +237,24 @@ try:
 except Exception as e:
     falhas.append(f"cyclonedds: {e}. Use `pip install cyclonedds==11.0.1` (passo 4).")
 
-# opencv-python e opencv-python-headless instalam o MESMO módulo cv2; ter os dois é
-# não-determinístico (§2.1). O SDK da Unitree puxa o não-headless se instalado sem
-# --no-deps, que é justamente como isso costuma entrar.
-from importlib.metadata import distributions
-_cv = sorted(d.metadata["Name"] for d in distributions()
-             if (d.metadata["Name"] or "").startswith("opencv"))
-if "opencv-python" in _cv:
-    falhas.append(f"opencv duplicado: {_cv}. Só opencv-python-headless — "
-                  "`pip uninstall -y opencv-python` (§2.1).")
+# opencv-python e opencv-python-headless instalam o MESMO módulo cv2, então os dois
+# lado a lado é o estado ESPERADO desde o passo 8b: o headless entra como dependência
+# do lerobot e o com-GUI é reinstalado por cima. Quem vence é quem gravou os arquivos
+# por último, e é só isso que importa — o nome das distribuições não diz nada. Por
+# isso a verificação é do build de fato: com o headless por cima, `GUI: NONE` e toda
+# janela deste repo (`--v`, `--v-attn`, `--v-debug`) morre em cv2.error na primeira
+# chamada de imshow.
+import cv2
+_gui = next((l.split(":", 1)[1].strip()
+             for l in cv2.getBuildInformation().splitlines()
+             if l.strip().startswith("GUI:")), "?")
+if _gui in ("NONE", "?"):
+    falhas.append(f"cv2 {cv2.__version__} sem GUI (GUI: {_gui}) — o build headless ficou "
+                  "por cima. Reinstale o com-GUI por último: "
+                  "`pip install --no-deps --force-reinstall \"opencv-python>=4.9.0,<4.14.0\"` "
+                  "(passo 8b).")
+else:
+    print(f"  cv2          {cv2.__version__}   (GUI: {_gui})")
 
 # Os dois forks precisam vir do REPO, não do PyPI. A versão não distingue — só o
 # caminho, e no televuer um parâmetro que só o fork tem.
@@ -266,12 +283,14 @@ modulos = [
     "teleop.robot_control.hand_retargeting",
     "flask",
 ]
+_falhas_import = 0
 for m in modulos:
     try:
         importlib.import_module(m)
     except Exception as e:
+        _falhas_import += 1
         falhas.append(f"import {m}: {type(e).__name__}: {e}")
-print(f"  imports      {len(modulos) - len(falhas)}/{len(modulos)}")
+print(f"  imports      {len(modulos) - _falhas_import}/{len(modulos)}")
 
 # Não é falha: o passo 6 grava a variável no env, e ela só passa a valer no próximo
 # `conda activate`. Nesta sessão o script exporta na mão.
