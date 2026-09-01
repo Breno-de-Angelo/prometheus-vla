@@ -141,19 +141,28 @@ def _instala_eval_representativo() -> None:
 
     subset_original = tud.Subset
 
-    class SubsetUniforme(subset_original):
-        def __init__(self, dataset, indices):
-            n = len(indices)
-            total = len(dataset)
-            if 0 < n < total:
-                indices = np.linspace(0, total - 1, n).round().astype(int).tolist()
-                logging.info(
-                    "[FastWAM-D] validação: %d amostras espaçadas uniformemente sobre %d "
-                    "quadros held-out (em vez dos %d primeiros).", n, total, n
-                )
-            super().__init__(dataset, indices)
+    def subset_uniforme(dataset, indices):
+        n = len(indices)
+        total = len(dataset)
+        if 0 < n < total:
+            indices = np.linspace(0, total - 1, n).round().astype(int).tolist()
+            logging.info(
+                "[FastWAM-D] validação: %d amostras espaçadas uniformemente sobre %d "
+                "quadros held-out (em vez dos %d primeiros).", n, total, n
+            )
+        return subset_original(dataset, indices)
 
-    tud.Subset = SubsetUniforme
+    # Função que devolve um `Subset` de verdade, e não uma subclasse. O
+    # DataLoader de validação roda com `num_workers` em contexto "spawn", que
+    # PICKLA o dataset para mandar aos workers — e uma classe definida dentro de
+    # uma função não tem nome qualificado para o pickle achar:
+    #
+    #   AttributeError: Can't get local object
+    #   '_instala_eval_representativo.<locals>.SubsetUniforme'
+    #
+    # O treino morria no primeiro eval, uns 10 minutos depois de subir. Devolvendo
+    # a classe original com os índices trocados, não existe tipo novo para picklar.
+    tud.Subset = subset_uniforme
 
 
 def _instala_handler() -> None:
