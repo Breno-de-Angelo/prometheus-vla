@@ -1,0 +1,192 @@
+# ==========================================================
+# π0.5 SEM PROFUNDIDADE — mesma tarefa e mesmo held-out das corridas FastWAM-D
+#
+# Existe para responder UMA pergunta: a arquitetura muda o resultado?
+#
+# O que veio antes (02/09): o FastWAM-D com LoRA chegou a eval 0,3301 no step
+# 4250 e, no laço fechado, TRAVA. No robô real, com a pose de partida correta,
+# a primeira ação é boa e as seguintes convergem para a média — cada ação leva o
+# corpo um pouco para fora do que foi demonstrado, o estado seguinte fica mais
+# fora, e o modelo não tem comportamento de recuperação. Medido: a MESMA imagem
+# com estado zerado dá 566 de 928 valores fora da faixa; com a pose gravada, 2.
+#
+# Isso é erro que se acumula, e é uma propriedade de clonagem de comportamento
+# com 21 demonstrações — não é específico do FastWAM. O π0.5 pode se sair
+# melhor (é pré-treinado em muito mais dado de robô e o flow matching costuma
+# ser mais estável fora da trajetória), mas isso é hipótese, não previsão.
+#
+# ── O que foi mantido igual de propósito ──────────────────────────────────
+# Episódios de treino e de validação são EXATAMENTE os das corridas do
+# FastWAM-D (21 / 3, held-out = 22, 23, 24). Sem isso o número que sair daqui
+# não pode ser comparado com o 0,3301, e a corrida perde o sentido.
+#
+# ── O que MUDA e não dá para comparar direto ──────────────────────────────
+# O `val_loss` do π0.5 é flow matching; o `eval_loss` do FastWAM-D é outro
+# objetivo. Os números NÃO são comparáveis entre si. O que compara é o
+# comportamento no robô: quanto tempo até travar, e se trava.
+# ==========================================================
+
+# ==========================================================
+# 1. DATASET DE TREINAMENTO
+# ==========================================================
+dataset:
+  repo_id: Mrwlker/white_cup_on_dripper_2026-08-11
+  root: /data/mrwlker/meu_dataset/white_cup_on_dripper_2026-08-11
+  # O 0 e o 25 saíram na revisão de 20/08 por serem demonstrações ruins; o 26
+  # tem 6 quadros (tomada abortada). O 22, 23 e 24 vão para a validação abaixo.
+  episodes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+
+  # A augmentation fica em ColorJitter e só. As quatro transformações novas
+  # (MotionBlur, GaussianNoise, RandomShadow, GammaCorrection) NÃO RODAM sobre
+  # uint8: elas têm guarda `is_floating_point()` e devolvem a imagem intacta, em
+  # silêncio, e o dataset de treino é construído com `return_uint8=True`.
+  # Descoberto em 02/09 analisando por que duas corridas com augmentation
+  # diferente deram curvas idênticas. Enquanto isso não for consertado,
+  # declarar as outras aqui só faria o ColorJitter cair em menos amostras.
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      ColorJitter:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+# ==========================================================
+# 2. DATASET DE VALIDAÇÃO
+# ==========================================================
+# Este trainer usa `val_dataset` + `eval_freq`, e NÃO o `eval_split` do
+# LeRobot — são dois mecanismos diferentes no mesmo repo. Os episódios aqui são
+# os mesmos três que o `eval_split: 0.12` separa nas corridas do FastWAM-D
+# (ele pega os últimos ceil(24 * 0,12) = 3 da lista).
+val_dataset:
+  repo_id: Mrwlker/white_cup_on_dripper_2026-08-11
+  root: /data/mrwlker/meu_dataset/white_cup_on_dripper_2026-08-11
+  episodes: [22, 23, 24]
+
+# ==========================================================
+# 3. ARQUITETURA
+# ==========================================================
+policy:
+  type: pi05depth
+  push_to_hub: false
+
+  # Sem profundidade: é o ponto da corrida. Com `false`, a chave de
+  # profundidade some das `input_features` abaixo e o PointNet nem é montado.
+  use_depth_3d: false
+
+  # O dataset TEM os sensores de pressão (`observation.left_hand_pressure` e
+  # `right_hand_pressure`, 33 valores cada), mas eles ficam de fora: o objetivo
+  # da corrida é comparar arquitetura com as mesmas entradas do FastWAM-D, e
+  # ligar a pressão aqui acrescentaria uma segunda variável a explicar. O padrão
+  # do config é `true`, e sem as features declaradas ele levanta
+  # "use_pressure=True mas as features de pressão não estão em input_features".
+  use_pressure: false
+
+  paligemma_variant: "gemma_2b"
+  action_expert_variant: "gemma_300m"
+  image_resolution: [224, 224]
+  max_state_dim: 32
+
+  # A frase da tarefa é a MESMA string do dataset (`meta/tasks.parquet`, índice
+  # 0). Não traduzir: o dataset tem uma tarefa só, e trocar o texto aqui faria o
+  # modelo condicionar numa frase que nunca apareceu no treino.
+  override_task: "place the white cup on the dripper"
+
+  # Gate de incerteza desligado — ligar antes de saber se o treino básico
+  # converge só adiciona uma variável a mais para explicar um resultado ruim.
+  scene_uncertainty_threshold: 0.0
+  n_samples_uncertainty: 1
+
+  # As DUAS câmeras de cor, como nas corridas do FastWAM-D. A da cabeça é
+  # 848x480 no dataset; a de pulso é 224x224 e é ela que mostra a xícara de
+  # perto no momento da pega.
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 480, 848]
+    observation.images.right_wrist_camera:
+      type: VISUAL
+      shape: [3, 224, 224]
+    observation.state:
+      type: STATE
+      shape: [29]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [29]
+
+  # 50 ações por chunk contra as 32 do FastWAM-D — é o horizonte nativo do
+  # π0.5 e não há motivo para encurtar.
+  chunk_size: 50
+  n_action_steps: 50
+  n_obs_steps: 1
+
+  optimizer_lr: 2.5e-5
+  optimizer_weight_decay: 0.01
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 40000
+
+  train_expert_only: false
+  freeze_vision_encoder: false
+
+  # ── Memória ────────────────────────────────────────────────────────────
+  # A primeira tentativa estourou os 79 GB da A100 no primeiro forward. O
+  # config antigo do π0.5 rodava com UMA câmera; aqui são duas, e o padrão
+  # desta política é `dtype: float32` com `gradient_checkpointing: false` —
+  # o oposto do que o FastWAM-D usa (`torch_dtype: bfloat16` e
+  # `use_gradient_checkpointing: true`).
+  #
+  # Ligar os dois não é só conveniência: deixa as duas corridas na MESMA
+  # precisão e com a mesma troca memória/computação, que é o que torna a
+  # comparação de arquitetura honesta.
+  dtype: bfloat16
+  gradient_checkpointing: true
+
+# ==========================================================
+# 4. TREINAMENTO
+# ==========================================================
+output_dir: "/data/mrwlker/train_output/pi05_white_cup_nodepth"
+# 20 mil, e não os 100 mil do config antigo: são 10.783 quadros. Com batch 8
+# isso é ~15 épocas, e o FastWAM-D já achava o fundo em 1,5. O ponto é ter
+# espaço para o mínimo aparecer, não rodar até o fim.
+steps: 20000
+batch_size: 8
+num_workers: 8
+
+log_freq: 100
+# 2000, e não 500: cada checkpoint do π0.5 tem 13,9 GB. A cada 500 steps seriam
+# 40 checkpoints e ~556 GB no /data, que é disco compartilhado do laboratório.
+# A cada 2000 são 10, e o `best_val_checkpoint` — que é o que interessa — é
+# salvo à parte, sempre que a validação melhora.
+save_freq: 2000
+save_checkpoint: true
+# Salva em `output_dir/best_val_checkpoint/` sempre que o val_loss melhora.
+save_best_checkpoint: true
+neutral_position_loss_weight: 0.0
+
+# ==========================================================
+# 5. VALIDAÇÃO E LOGS
+# ==========================================================
+# 250 para casar com o `eval_steps` das corridas do FastWAM-D — a curva fica
+# com a mesma resolução e dá para comparar o formato, ainda que não o valor.
+eval_freq: 250
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  # SÓ TELEMETRIA. Sem isto o wandb sobe cada checkpoint como artefato, e o
+  # caminho dele passa por uma CÓPIA em `~/.local/share/wandb/artifacts/staging`
+  # — no home, que fica no disco de sistema da athena, o que vive perto de 100%.
+  # O checkpoint do π0.5 tem 13,9 GB: em 02/09 isso encheu o disco no step 500 e
+  # matou o treino com `OSError: [Errno 28] No space left on device`, depois de
+  # o checkpoint já ter sido salvo com sucesso no /data. O erro aponta para o
+  # wandb, não para o treino, e é fácil ler como falha de disco do dataset.
+  #
+  # O que interessa comparar são as curvas, e elas continuam subindo normalmente.
+  disable_artifact: true

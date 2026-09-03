@@ -1,0 +1,183 @@
+# ==========================================================
+# TREINO — FastWAM-D com LoRA e augmentation de câmera
+#
+# Roda pelo `athena/launch_fastwamd_lora.sh`, que é quem passa os argumentos do
+# PEFT (o alvo dos adaptadores é uma regex que não cabe bem em YAML, e o
+# comentário de por que ele é aquele mora lá).
+#
+#   CONFIG=config/train/fastwamdepth_lora_aug.yaml \
+#   bash athena/launch_fastwamd_lora.sh 2
+#
+# ── O que muda em relação ao `fastwamdepth_white_cup_on_dripper.yaml` ──────
+#
+# 1. AUGMENTATION DE VERDADE (seção 1). O YAML base tinha só ColorJitter, com
+#    `max_num_transforms: 1`. Aqui entram desfoque de movimento, ruído de
+#    sensor, sombra e gama — as degradações que a câmera do robô realmente
+#    produz e que o dataset, gravado numa sessão só, não contém.
+#
+# 2. STEPS (seção 3). A corrida LoRA de 20/08 parou no 2500 com o eval AINDA
+#    CAINDO (0.8097 → 0.4139, sem sinal de mínimo). Ela não convergiu; ela
+#    acabou. 15.000 steps dão espaço para achar o mínimo de verdade.
+#
+# Por isso é um arquivo NOVO e não uma edição do base: o base é o que as três
+# corridas da ablação (latent/token/off) usam, e mexer nele tornaria aquelas
+# corridas incomparáveis com as que já rodaram.
+# ==========================================================
+
+dataset:
+  repo_id: Mrwlker/white_cup_on_dripper_2026-08-11
+  # Cópia própria, em disco que o usuário do treino possui. A original vive no
+  # home do `hercules` e depende das permissões dele — que já falharam uma vez:
+  # os 8 arquivos de vídeo estavam em `600` e o treino de outro login morria
+  # com `PermissionError` no primeiro quadro. Sobrescrevível com `ROOT=`.
+  root: /data/mrwlker/meu_dataset/white_cup_on_dripper_2026-08-11
+  # O 26 tem 6 quadros (tomada abortada). O 0 e o 25 saíram na revisão de 20/08
+  # por serem demonstrações ruins — o 25 era held-out das corridas 1 e 2, então
+  # o eval delas foi medido em parte contra uma demonstração mal executada.
+  episodes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+  eval_split: 0.12
+
+  # ── Augmentation ────────────────────────────────────────
+  # A PROFUNDIDADE NÃO É TOCADA, e isso é garantido pelo LeRobot, não por nós:
+  # o `dataset_reader.py:339` pula as chaves de profundidade antes de aplicar
+  # qualquer transformação. Se não pulasse, um ColorJitter sobre um mapa em
+  # milímetros destruiria a escala métrica em silêncio — o modelo continuaria
+  # treinando e a geometria estaria errada.
+  #
+  # `max_num_transforms: 2` — no máximo duas por amostra. Três ou mais
+  # empilhadas produzem imagens que a câmera nunca gera, e o custo disso aqui é
+  # maior que o normal: o expert de vídeo está CONGELADO e foi pré-treinado em
+  # vídeo limpo. Degradar demais empurra a entrada para fora da distribuição do
+  # Wan, e não há como ajustá-lo para compensar. Por isso as faixas abaixo são
+  # deliberadamente moderadas.
+  image_transforms:
+    enable: true
+    max_num_transforms: 2
+    tfs:
+      cor:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+          contrast: [0.8, 1.2]
+          saturation: [0.5, 1.5]
+          hue: [-0.05, 0.05]
+
+      # O braço se move e a cabeça se move junto: quadro borrado é o caso
+      # comum durante a aproximação, não a exceção.
+      desfoque:
+        type: MotionBlur
+        weight: 0.7
+        kwargs:
+          kernel_size: [3, 7]
+
+      # Ruído de leitura do sensor, que cresce com pouca luz. A faixa é em
+      # escala 0–255 e o transform converte sozinho (`std / 255.0`).
+      ruido:
+        type: GaussianNoise
+        weight: 0.7
+        kwargs:
+          std: [3.0, 12.0]
+
+      # A bancada do café tem luminária lateral; o braço projeta sombra sobre a
+      # própria cena quando passa por cima dela.
+      sombra:
+        type: RandomShadow
+        weight: 0.5
+
+      # Exposição da RealSense mudando entre sessões. É a diferença mais
+      # provável entre o dia da gravação e o dia em que o robô roda.
+      gama:
+        type: GammaCorrection
+        weight: 0.5
+
+policy:
+  type: fastwamdepth
+  push_to_hub: false
+
+  depth_mode: latent
+  depth_unit: mm
+  depth_min: 0.05
+  depth_max: 5.0
+  depth_use_log: true
+  depth_train_patch_embedding: true
+
+  action_dim: 29
+  proprio_dim: 29
+  action_horizon: 32
+  n_action_steps: 32
+
+  num_video_frames: 33
+  action_video_freq_ratio: 4
+  image_size: [224, 448]
+
+  input_features:
+    observation.images.head_camera:
+      type: VISUAL
+      shape: [3, 224, 224]
+    observation.images.right_wrist_camera:
+      type: VISUAL
+      shape: [3, 224, 224]
+    observation.images.head_camera_depth:
+      type: VISUAL
+      shape: [1, 480, 848]
+    observation.state:
+      type: STATE
+      shape: [29]
+
+  output_features:
+    action:
+      type: ACTION
+      shape: [29]
+
+  # O expert de vídeo continua congelado, e aqui isso é mais importante do que
+  # era: é ele que carrega o grounding de linguagem que medimos em 01/09 (a
+  # palavra `robot` aterrissa no braço, `white cup` na xícara). Destravá-lo
+  # destruiria a única capacidade de linguagem que este modelo tem — nosso
+  # dataset, com UMA string de tarefa, não ensina nenhuma.
+  freeze_video_expert: true
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+  use_gradient_checkpointing: true
+
+  torch_dtype: bfloat16
+  num_inference_steps: 10
+  optimizer_lr: 1.0e-4
+  optimizer_weight_decay: 1.0e-2
+
+# ==========================================================
+# TREINAMENTO
+# ==========================================================
+# O `output_dir` é sobrescrito pelo launcher: o `/data/train_output` é do
+# `hercules` e outros logins não escrevem lá.
+output_dir: "/data/train_output/fastwamd_lora_aug"
+steps: 15000
+batch_size: 4
+num_workers: 8
+
+log_freq: 50
+save_checkpoint: true
+
+# `save_freq` tem que ser MÚLTIPLO de `eval_steps`: o `run_train.py` só grava
+# quando o `eval_loss` melhora, e um step de save sem eval fresco cai no
+# caminho do aviso e escreve sem critério. Isso já custou um checkpoint: na
+# corrida `off`, o mínimo real (0.3247 no step 1250) não foi salvo porque 1250
+# não é múltiplo de 500 — o que ficou guardado foi o 0.3372 do step 3000.
+eval_steps: 250
+max_eval_samples: 200
+save_freq: 250
+
+job_name: fastwamd_lora_aug
+
+wandb:
+  enable: true
+  project: prometheus_g1
+  # A chave vem do `~/.wandb_key` pelo launcher, NÃO do `wandb login`. O
+  # `wandb login` grava no `~/.netrc`, e a conta `hercules` tem um `.netrc` com
+  # a chave de outra pessoa — as corridas subiriam na conta errada em silêncio.
+  # O `WANDB_API_KEY` tem precedência sobre o `.netrc`.
+  #
+  # Sem artefato: cada checkpoint carrega o expert de vídeo de 5 B, e subir isso
+  # a cada save é lento e sem uso — o que interessa comparar são as curvas.
+  disable_artifact: true
